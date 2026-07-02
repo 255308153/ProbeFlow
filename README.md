@@ -163,16 +163,106 @@ Raw Documents
 - `KnowledgeChunk` 保存可检索片段，是 RAG 召回、引用溯源、反馈调权的最小单位。
 - `Embedding` 用于语义召回，但不会替代结构化元数据。
 
+### RAG 文本分割策略
+
+ProbeFlow 的文本分割不能只按固定字数切，因为接口测试文档里经常包含标题、表格、错误码、步骤、代码块和接口路径。如果切片破坏语义，后续 embedding 和召回都会变差。
+
+分割时主要考虑两个因素：
+
+- embedding 模型的 token 限制，避免超长内容被模型截断。
+- 语义完整性，保证一个 chunk 尽量表达完整规则、流程或说明。
+
+默认采用“结构优先 + 递归兜底 + 父子索引”的组合策略：
+
+```text
+Raw Document
+-> Structural Splitting
+-> Recursive Character Splitting
+-> Parent / Child Chunk Indexing
+-> Metadata Enrichment
+-> Embedding
+```
+
+#### 结构化分割
+
+如果文档是 Markdown、接口文档、PRD 或代码说明，优先按结构切分，而不是当普通纯文本处理：
+
+- Markdown 按 `#`、`##`、`###` 标题层级切分。
+- 表格按完整表格块切分，避免把错误码、字段说明切散。
+- 代码块按完整 block 保留。
+- 接口说明按 path、method、request、response、error code 等结构保留。
+
+结构化分割会把标题路径写入 metadata，例如：
+
+```text
+content: 部署命令是 docker-compose up -d
+metadata: {
+  docType: env_guide,
+  header1: 部署指南,
+  header2: Linux 环境,
+  module: payment
+}
+```
+
+这样即使 chunk 本身很短，Agent 也知道它属于哪个模块、哪个章节、哪个业务背景。
+
+#### 递归字符分割
+
+对于 Word、PDF、TXT 抽取后的纯文本，采用递归字符分割作为通用兜底策略：
+
+```text
+先按段落 \n\n 切
+-> 再按换行 \n 切
+-> 再按句号、问号、感叹号切
+-> 最后才按固定长度切
+```
+
+这样可以尽量保留段落和句子的完整语义。固定长度分割只作为最后兜底，不作为首选策略。
+
+#### 父子索引
+
+ProbeFlow 的 RAG 推荐使用 Small-to-Big，也就是父子索引：
+
+```text
+Parent Chunk: 800-1200 tokens，保留完整段落或章节上下文
+Child Chunk: 128-256 tokens，用于 embedding 和精准检索
+```
+
+检索时用 child chunk 匹配 query，因为小切片语义更聚焦；真正喂给 Agent 时返回 parent chunk 或 parent 摘要，因为大切片上下文更完整。
+
+```text
+Query
+-> 命中 Child Chunk
+-> 找到 parentChunkId
+-> 返回 Parent Chunk + 命中的 Child Chunk + metadata
+```
+
+这样可以同时解决两个问题：
+
+- 切片太小，模型看不懂上下文。
+- 切片太大，向量检索不精准。
+
+#### Chunk 参数建议
+
+初始建议：
+
+- `childChunkSize`: 128-256 tokens
+- `childChunkOverlap`: 20-50 tokens
+- `parentChunkSize`: 800-1200 tokens
+- `parentChunkOverlap`: 100-150 tokens
+- `maxContextChunk`: 根据当前任务 token budget 动态裁剪
+
+对于错误码表、字段表、接口参数表，不强行按 token 切断，优先保持表格行或一个错误码说明的完整性。
+
 ### RAG 检索链路
 
-RAG 的读取链路采用“阶段化 query + 混合召回 + 重排 + 压缩组装”：
+RAG 的读取链路采用“query 改写 + 阶段化 query + 多路召回 + rerank + 压缩组装”：
 
 ```text
 Current Task / ApiSpec / FailureInfo
 -> KnowledgeQueryBuilder
--> Structure Filter
--> Tag Filter
--> Semantic Recall
+-> Query Rewriter
+-> Multi-Channel Retrieval
 -> KnowledgeReranker
 -> KnowledgeContextBuilder
 -> ContextBundle
@@ -184,13 +274,93 @@ Current Task / ApiSpec / FailureInfo
 - `CASE_GENERATION_PROFILE`：用例生成阶段，优先召回测试规范、业务规则、历史事故、接口说明。
 - `FAILURE_ANALYSIS_PROFILE`：失败分析阶段，优先召回错误码说明、事故复盘、环境文档、相似接口说明。
 
-RAG 不只靠向量相似度，而是组合多种信号：
+### Query 改写
+
+用户问题或内部任务输入通常不适合直接用于检索。ProbeFlow 会先通过 `KnowledgeQueryBuilder` 和 `QueryRewriter` 生成多种检索 query：
+
+- 原始 query：保留用户或任务原始意图。
+- 结构 query：抽取 `system`、`module`、`apiPath`、`httpMethod`、`errorCode`、`bizEntity`。
+- 语义 query：把任务目标改写成适合 embedding 的自然语言描述。
+- 关键词 query：提取接口名、字段名、错误码、业务名、风险标签。
+- 阶段 query：根据当前阶段补充检索意图，例如“测试规范”“错误原因”“业务前置条件”。
+
+例子：
+
+```text
+当前任务：为 POST /api/order/{id}/pay 生成支付接口测试用例
+
+结构 query:
+  apiPath=/api/order/{id}/pay
+  method=POST
+  module=order/payment
+
+语义 query:
+  支付接口的业务规则、前置订单状态、金额边界、鉴权要求、失败场景
+
+关键词 query:
+  order pay payment amount status token signature
+```
+
+如果使用 BGE 类 embedding 模型，查询侧需要按模型说明添加 instruction prefix；入库侧通常不加。这个细节必须封装在 `EmbeddingClient`，避免业务代码忘记加前缀导致召回效果明显下降。
+
+### 多路召回
+
+RAG 不只靠向量相似度，而是组合多条召回通道：
 
 - 结构过滤：`system`、`module`、`apiPath`、`httpMethod`、`bizEntity`、`docType`。
 - 标签过滤：`auth`、`payment`、`order`、`risk`、`error-code`、`test-spec` 等。
-- 语义召回：根据 query embedding 查找语义相似 chunk。
-- 权威性增强：官方文档、近期更新、人工确认过的文档权重更高。
-- 阶段适配：同一个 chunk 在用例生成阶段有用，不代表失败分析阶段也应该靠前。
+- 关键词召回：BM25 / full-text search，适合接口路径、字段名、错误码、枚举值。
+- 语义召回：根据 query embedding 查找语义相似 child chunk。
+- 父子召回：命中 child chunk 后回填 parent chunk。
+- 历史有效召回：优先考虑过去在同类任务中贡献度高的 chunk。
+- 权威性召回：官方文档、近期更新、人工确认过的文档权重更高。
+
+多路召回的意义是避免单一路径失效：
+
+- 向量召回容易漏掉精确错误码。
+- 关键词召回不理解语义近似。
+- 结构过滤能缩小范围，但不能判断相关性。
+- 父子索引能让检索精准，同时让上下文完整。
+
+### Rerank 重排
+
+多路召回后会先合并去重，再进入 rerank。Rerank 不只看相似度，而是综合考虑：
+
+- query 与 chunk 的语义相关性。
+- chunk 所属文档的权威性。
+- 文档更新时间和版本状态。
+- chunk 是否适用于当前任务阶段。
+- chunk 是否命中接口路径、模块、业务实体、错误码。
+- chunk 历史命中后的成功贡献度。
+- child chunk 命中强度与 parent chunk 上下文完整度。
+
+一个默认评分思路：
+
+```text
+finalScore =
+  0.25 * semanticScore
+  + 0.20 * structureScore
+  + 0.15 * keywordScore
+  + 0.15 * authorityScore
+  + 0.10 * freshnessScore
+  + 0.10 * stageFitScore
+  + 0.05 * successContribution
+```
+
+失败分析阶段会动态调整：
+
+```text
+finalScore =
+  0.20 * semanticScore
+  + 0.15 * structureScore
+  + 0.20 * errorCodeMatch
+  + 0.15 * incidentMatch
+  + 0.10 * environmentMatch
+  + 0.10 * authorityScore
+  + 0.10 * successContribution
+```
+
+Rerank 输出 Top N 后，`KnowledgeContextBuilder` 会再次压缩和分组，避免把重复内容、低价值原文和过长 parent chunk 全部塞进上下文。
 
 召回结果不会把原文整段塞给模型，而是先整理成结构化上下文：
 
@@ -204,6 +374,19 @@ KnowledgeContext {
   citedChunks: [...]
 }
 ```
+
+### Embedding 模型选型原则
+
+Embedding 模型先按工程可控性选，不盲目追求最大维度：
+
+- 中文和中英混合文档优先考虑 BGE-M3 或 `bge-large-zh-v1.5`。
+- 轻量部署可考虑 M3E-base。
+- 避免早期 `text2vec` 系列作为长期方案。
+- 百万级以下数据，768-1024 维通常已经足够，过高维度会增加存储和检索成本。
+- 必须确认模型 sequence length，避免 chunk 超长后被截断。
+- BGE 等模型的 query instruction prefix 要由统一 embedding adapter 处理。
+
+落地时可以分阶段实现：第一阶段先做结构化分割、metadata、embedding、语义召回和简单 rerank；第二阶段补 BM25、多路召回和 query 改写；第三阶段再上父子索引、跨任务反馈调权和阶段化动态 rerank。
 
 知识库主要解决的是：
 
