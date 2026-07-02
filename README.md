@@ -116,7 +116,17 @@ API 分析系统负责让 Agent 知道“项目里有哪些接口、接口长什
 
 ## 知识库系统
 
-知识库系统保存的是“项目原本就知道的东西”。它面向人类文档，例如：
+知识库系统，也就是 ProbeFlow 里的 RAG 系统，保存的是“项目原本就知道的东西”。它面向人类已经写好的稳定文档，而不是 Agent 运行后产生的经验。
+
+一句话说清楚：
+
+```text
+RAG 不是记忆。
+RAG 管文档知识：业务规则、接口说明、测试规范、错误码说明、环境说明。
+Memory 管运行经验：历史失败模式、用户偏好、测试策略、项目踩坑经验。
+```
+
+知识库面向的输入包括：
 
 - PRD
 - 业务流程文档
@@ -127,20 +137,73 @@ API 分析系统负责让 Agent 知道“项目里有哪些接口、接口长什
 - 环境说明
 - 事故复盘
 
-知识库不是简单把文档丢进向量库，而是按以下流程治理：
+RAG 的核心价值不是“存文档”，而是把这些文档变成 Agent 在不同任务阶段可以精准消费的上下文。比如生成测试用例时，它要召回测试规范、业务规则、接口说明；失败分析时，它要召回错误码文档、事故复盘、环境说明。
+
+### RAG 写入链路
+
+知识库不是简单把文档丢进向量库，而是先治理再索引：
 
 ```text
 Raw Documents
 -> KnowledgeIngestService
 -> KnowledgeChunker
 -> KnowledgeMetadataExtractor
+-> KnowledgeDocument / KnowledgeDocumentRevision
+-> KnowledgeChunk
+-> Embedding
 -> KnowledgeIndex
--> KnowledgeRetriever
--> KnowledgeReranker
--> KnowledgeContextBuilder
 ```
 
-它会给文档补充结构化元数据，例如系统名、模块名、文档类型、业务实体、适用阶段、权威等级、更新时间等。召回时同时使用结构化过滤、标签过滤、语义召回和重排，而不是只靠 embedding 相似度。
+写入时会做几件事：
+
+- `KnowledgeIngestService` 负责接收 Markdown、PRD、Wiki 导出、接口说明、测试规范、事故复盘等文档。
+- `KnowledgeChunker` 按标题、段落、表格、列表等语义结构切块，尽量保证一个 chunk 是完整的业务含义。
+- `KnowledgeMetadataExtractor` 提取系统名、模块名、接口路径、业务实体、错误码、文档类型、适用阶段、标签、权威等级、更新时间。
+- `KnowledgeDocumentRevision` 保存文档版本，避免文档更新后无法追溯当时 Agent 用的是哪一版知识。
+- `KnowledgeChunk` 保存可检索片段，是 RAG 召回、引用溯源、反馈调权的最小单位。
+- `Embedding` 用于语义召回，但不会替代结构化元数据。
+
+### RAG 检索链路
+
+RAG 的读取链路采用“阶段化 query + 混合召回 + 重排 + 压缩组装”：
+
+```text
+Current Task / ApiSpec / FailureInfo
+-> KnowledgeQueryBuilder
+-> Structure Filter
+-> Tag Filter
+-> Semantic Recall
+-> KnowledgeReranker
+-> KnowledgeContextBuilder
+-> ContextBundle
+```
+
+不同阶段会使用不同的召回策略：
+
+- `API_ANALYSIS_PROFILE`：接口分析阶段，优先召回业务流程、接口补充说明、领域规则、环境说明。
+- `CASE_GENERATION_PROFILE`：用例生成阶段，优先召回测试规范、业务规则、历史事故、接口说明。
+- `FAILURE_ANALYSIS_PROFILE`：失败分析阶段，优先召回错误码说明、事故复盘、环境文档、相似接口说明。
+
+RAG 不只靠向量相似度，而是组合多种信号：
+
+- 结构过滤：`system`、`module`、`apiPath`、`httpMethod`、`bizEntity`、`docType`。
+- 标签过滤：`auth`、`payment`、`order`、`risk`、`error-code`、`test-spec` 等。
+- 语义召回：根据 query embedding 查找语义相似 chunk。
+- 权威性增强：官方文档、近期更新、人工确认过的文档权重更高。
+- 阶段适配：同一个 chunk 在用例生成阶段有用，不代表失败分析阶段也应该靠前。
+
+召回结果不会把原文整段塞给模型，而是先整理成结构化上下文：
+
+```text
+KnowledgeContext {
+  businessRules: [...]
+  apiNotes: [...]
+  testSpecs: [...]
+  errorCodeGuides: [...]
+  incidentHints: [...]
+  citedChunks: [...]
+}
+```
 
 知识库主要解决的是：
 
@@ -151,9 +214,20 @@ Raw Documents
 - 哪些测试规范必须遵守。
 - 失败分析时应该参考哪些历史事故或规则。
 
+### RAG 反馈调权
+
+RAG 会接收任务反馈，但它不会把反馈直接写成长期记忆。它主要调整已有文档 chunk 的统计权重：
+
+- 某个 chunk 经常被召回且帮助生成了有效用例，提升 `successContribution`。
+- 某个 chunk 被召回后经常被用户忽略，降低排序权重。
+- 某个文档过期导致错误建议，降低 authority 或标记 stale。
+- 某个错误码说明多次解释失败原因，失败分析阶段权重提高。
+
+所以 RAG 的反馈目标是“让文档知识更好用”，不是“从执行结果中学习经验”。从执行结果中学习经验，是记忆系统的职责。
+
 ## 记忆系统
 
-记忆系统保存的是“Agent 后来学到的东西”。它和知识库是平级关系，不互相替代。
+记忆系统保存的是“Agent 后来学到的东西”。它和知识库是平级关系，不互相替代。它不是文档检索系统，而是经验沉淀系统。
 
 一句话区分：
 
@@ -162,13 +236,20 @@ Raw Documents
 记忆系统回答：Agent 在运行中学会了什么？
 ```
 
+举例：
+
+- 文档里写着“支付接口 sign 字段必须参与签名”，这是 RAG 知识。
+- Agent 多次执行发现“测试环境里 sign 字段必须放在 body 最后，否则返回 401”，这是 Memory 经验。
+- 文档里写着“订单创建后才能支付”，这是 RAG 知识。
+- Agent 多次失败后总结出“支付接口失败时优先检查订单状态是否仍为 INIT”，这是 Memory 经验。
+
 ProbeFlow 的记忆系统分为五层：
 
 - `Session Memory`：当前会话的短期上下文。
 - `Task Memory`：当前任务中的持续状态和执行事实。
 - `Memory Refinery`：记忆提纯层，负责抽取、分类、去重、合并和压缩。
 - `Refined Long-term Memory`：跨任务可复用的长期经验。
-- `Unified Context Builder`：按任务阶段召回并组装上下文。
+- `Memory Retriever`：按任务阶段召回长期经验。
 
 可选还会有 `Team Knowledge Memory`，用于承载团队人工维护的规范、项目说明和复盘材料。
 
@@ -180,6 +261,17 @@ Session Memory 保存当前会话内的短期信息，例如当前目标、最�
 
 Task Memory 保存当前任务的结构化事实，例如需求摘要、接口摘要、已生成用例、执行记录、断言结果、失败样本、分析结论和下一步建议。它服务于任务恢复、断点续跑和多轮 Agent Loop。
 
+Task Memory 通常按 `taskId` 精确查询，不需要复杂检索。它回答的是：
+
+- 当前任务已经做到哪一步。
+- 哪些接口已经分析过。
+- 哪些用例已经生成。
+- 哪些请求已经执行。
+- 哪些断言失败了。
+- 下一步为什么要继续或停止。
+
+Task Memory 是任务内事实，不等于长期经验。任务结束后，只有经过 Memory Refinery 判断有复用价值的内容，才会进入 Long-term Memory。
+
 ### Memory Refinery
 
 Memory Refinery 是所有长期记忆写入的入口。原始对话、工具输出和错误日志不会直接进入长期记忆，而是先经过：
@@ -187,6 +279,25 @@ Memory Refinery 是所有长期记忆写入的入口。原始对话、工具输�
 ```text
 extract -> classify -> deduplicate -> merge -> compress -> tag -> embed
 ```
+
+它的写入链路更完整地说是：
+
+```text
+Observation / Task Memory / 用户修订 / 执行失败
+-> MemoryCandidate
+-> Value Judgment
+-> Memory Refinery
+-> Deduplicate or Merge
+-> Long-term Memory
+```
+
+Memory Refinery 会先判断一个候选内容是否值得沉淀：
+
+- 是否跨任务可复用。
+- 是否能帮助后续生成、执行或失败分析。
+- 是否能归纳成稳定模式。
+- 是否能被标签化、检索和解释。
+- 是否不是一次性噪声。
 
 适合沉淀成长期记忆的信息包括：
 
@@ -198,6 +309,35 @@ extract -> classify -> deduplicate -> merge -> compress -> tag -> embed
 
 不适合直接沉淀的信息包括一次性日志全文、临时推理过程、低价值工具输出和无法泛化的对话片段。
 
+### Memory 提纯示例
+
+原始执行事实可能是：
+
+```text
+POST /api/pay 返回 401。
+请求体中 sign 字段放在 amount 前面。
+同样参数把 sign 移到 body 最后后请求成功。
+用户确认这是测试环境网关的签名校验限制。
+```
+
+提纯后的长期记忆应该是：
+
+```text
+type: project_knowledge
+title: 支付接口 body 签名字段顺序约束
+summary: 支付相关接口在测试环境中要求 sign 字段位于 body 最后位置，否则可能返回 401。
+scope: project/payment
+tags: [payment, signature, test-env, 401, body-order]
+trigger: 生成或执行支付相关接口用例时
+confidence: 0.85
+```
+
+这条记忆后续会影响：
+
+- 用例生成：生成支付接口请求模板时把 sign 放在最后。
+- 执行前准备：检查请求体字段顺序。
+- 失败分析：遇到 401 时优先提示签名字段顺序风险。
+
 ### Long-term Memory
 
 长期记忆存储跨任务仍然有价值的经验，典型类型包括：
@@ -208,7 +348,78 @@ extract -> classify -> deduplicate -> merge -> compress -> tag -> embed
 - `preference`
 - `domain_rule`
 
-长期记忆建议使用 PostgreSQL + pgvector 存储，同时支持结构化过滤和向量召回。每条记忆需要记录类型、标题、摘要、适用范围、来源任务、触发条件、标签、重要性和最近使用时间。
+长期记忆建议使用 PostgreSQL + pgvector 存储，同时支持结构化过滤、标签召回和向量召回。每条记忆需要记录类型、标题、摘要、完整内容、适用范围、来源任务、触发条件、标签、重要性、置信度、命中次数、贡献度和最近使用时间。
+
+长期记忆的召回不是“拿最像的文本”，而是按任务阶段组合评分：
+
+```text
+生成 case：testing_pattern + project_knowledge + preference
+执行前：project_knowledge + failure_pattern + auth/env 相关经验
+失败分析：failure_pattern + errorCode + apiPath + 相似响应摘要
+报告生成：高贡献 failure_pattern + 本次任务新增经验
+```
+
+一个默认的排序思路是：
+
+```text
+finalScore =
+  structure_match
+  + tag_match
+  + vector_similarity
+  + importance
+  + successContribution
+  - stalenessPenalty
+```
+
+失败分析阶段会额外提高 `failure_match`、`errorCode_match`、`response_pattern_match` 的权重。
+
+### Memory 生命周期
+
+记忆需要持续治理，否则长期记忆会变成噪声库：
+
+- 新记忆进入 `ACTIVE` 状态。
+- 相似记忆会被合并，增加版本号，而不是无限新增重复项。
+- 长期没有命中、贡献度低、置信度低的记忆会降权。
+- 被证明过期或错误的记忆会变成 `INACTIVE` 或 `ARCHIVED`。
+- 用户明确修正过的记忆会提高置信度，并保留修订来源。
+
+记忆系统的目标不是越记越多，而是越记越准。
+
+## RAG 与 Memory 的协同关系
+
+RAG 和 Memory 会在同一个任务里同时被使用，但职责完全不同：
+
+```text
+            写入来源                  保存内容                 主要用途
+RAG         人类文档                  稳定知识                 补业务背景、规范、错误码、流程
+Memory      执行结果和用户行为         运行经验                 复用失败模式、测试策略、偏好
+TaskMemory  当前任务过程               当前事实                 恢复任务、驱动下一步编排
+Session     当前会话                   短期上下文               保持最近决策连续性
+```
+
+一次失败分析中，它们会这样配合：
+
+```text
+ExecutionRecord 显示 /api/pay 返回 401
+-> RAG 召回错误码文档：401 可能是签名错误或 token 过期
+-> Memory 召回历史经验：支付接口 sign 字段顺序错误也会导致 401
+-> Task Memory 提供本次请求体和断言失败摘要
+-> Unified Context Builder 合并成失败分析上下文
+-> Agent 输出更可信的失败原因和下一步建议
+```
+
+一次用例生成中，它们会这样配合：
+
+```text
+ApiSpec 显示 POST /api/order/{id}/pay
+-> RAG 召回业务流程：订单必须 CREATED 后才能支付
+-> RAG 召回测试规范：金额字段必须测 0、负数、超限、小数精度
+-> Memory 召回项目经验：支付接口 sign 字段必须放在 body 最后
+-> Memory 召回团队偏好：每个关键业务接口至少生成正例、鉴权失败、业务状态非法三类 case
+-> Case Generation System 生成更贴合项目的 TestCaseDraft
+```
+
+这就是 ProbeFlow 区别于普通 RAG 应用的地方：它不是只查文档，也不是只记历史，而是把“文档知识”和“运行经验”分别治理，再在具体任务里合并使用。
 
 ## 统一上下文构建器
 
@@ -230,6 +441,23 @@ Unified Context Builder 是 ProbeFlow 的读路径核心。它不负责存储，
 - 历史执行记录
 - 当前环境配置
 
+最终输出不是一段散文，而是分区后的结构化上下文：
+
+```text
+ContextBundle {
+  taskGoal: 当前任务目标
+  apiContext: ApiSpec + CodeContext
+  taskState: 当前 Task 状态和已完成步骤
+  sessionContext: 最近会话决策
+  taskMemory: 当前任务事实
+  knowledgeContext: RAG 召回的文档知识
+  longTermMemoryContext: Memory 召回的长期经验
+  executionContext: 环境、变量、鉴权、执行配置
+  constraints: 本轮必须遵守的规则
+  citations: 文档 chunk 和 memory item 来源
+}
+```
+
 不同阶段需要不同上下文。例如：
 
 - 生成测试用例时，需要接口结构、字段约束、业务规则、历史测试模式。
@@ -237,7 +465,15 @@ Unified Context Builder 是 ProbeFlow 的读路径核心。它不负责存储，
 - 分析失败时，需要原始请求响应、断言结果、历史失败模式、相关文档说明。
 - 生成报告时，需要任务目标、执行摘要、失败分类、风险建议和可复用结论。
 
-这个模块避免把所有历史信息一股脑塞给模型，而是按阶段、按目标、按预算构造刚好够用的上下文。
+合并时遵循几个规则：
+
+- 当前任务事实优先于长期记忆，因为 Task Memory 反映的是本次真实执行。
+- 官方文档优先于低置信度记忆，但高置信度历史失败模式会作为风险提示保留。
+- RAG 输出必须带文档来源，Memory 输出必须带来源任务、置信度和适用范围。
+- 如果 RAG 和 Memory 冲突，不直接静默覆盖，而是在 ContextBundle 中标记 conflict，交给 Planner 或分析器决策。
+- 上下文有 token 预算，先保留当前任务事实，再保留高权威 RAG，最后保留高贡献 Memory。
+
+这个模块避免把所有历史信息一股脑塞给模型，而是按阶段、按目标、按预算构造刚好够用、可追溯、可解释的上下文。
 
 ## 测试用例生成系统
 
