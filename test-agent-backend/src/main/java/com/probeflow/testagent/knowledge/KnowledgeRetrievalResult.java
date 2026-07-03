@@ -5,6 +5,7 @@ import java.util.List;
 public record KnowledgeRetrievalResult(
     String rawQuery,
     List<KnowledgeRetrievalHit> hits,
+    KnowledgeContext knowledgeContext,
     double coverage,
     int totalCandidates,
     int totalTokens,

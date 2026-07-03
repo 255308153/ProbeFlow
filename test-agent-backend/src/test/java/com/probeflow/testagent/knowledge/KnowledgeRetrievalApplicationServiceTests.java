@@ -2,6 +2,10 @@ package com.probeflow.testagent.knowledge;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.probeflow.testagent.apispec.ApiSpec;
+import com.probeflow.testagent.apispec.ApiSpecRepository;
+import com.probeflow.testagent.apispec.ApiSpecSourceType;
+import com.probeflow.testagent.apispec.HttpMethod;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -21,6 +25,9 @@ class KnowledgeRetrievalApplicationServiceTests {
     @Autowired
     private KnowledgeRetrievalApplicationService knowledgeRetrieval;
 
+    @Autowired
+    private ApiSpecRepository apiSpecs;
+
     @Test
     void returnsEmptySuccessfulResultWhenKnowledgeBaseIsEmpty() {
         var result = knowledgeRetrieval.retrieve(new KnowledgeQuery(
@@ -38,6 +45,9 @@ class KnowledgeRetrievalApplicationServiceTests {
         ));
 
         assertThat(result.isEmpty()).isTrue();
+        assertThat(result.knowledgeContext().isEmpty()).isTrue();
+        assertThat(result.knowledgeContext().lowConfidence()).isTrue();
+        assertThat(result.knowledgeContext().lowCoverage()).isTrue();
         assertThat(result.coverage()).isZero();
         assertThat(result.totalCandidates()).isZero();
         assertThat(result.totalTokens()).isZero();
@@ -125,6 +135,14 @@ class KnowledgeRetrievalApplicationServiceTests {
         assertThat(result.hits().getFirst().documentType()).isEqualTo(DocumentType.API_NOTE);
         assertThat(result.hits().getFirst().tags()).contains("auth", "payment");
         assertThat(result.hits().getFirst().applicableStages()).contains("api_analysis");
+        assertThat(result.knowledgeContext().apiNotes()).hasSize(1);
+        assertThat(result.knowledgeContext().apiNotes().getFirst().chunkId()).isEqualTo(result.hits().getFirst().chunkId());
+        assertThat(result.knowledgeContext().apiNotes().getFirst().documentRevisionId()).isEqualTo(latest.documentRevisionId());
+        assertThat(result.knowledgeContext().apiNotes().getFirst().sourceRef()).isEqualTo("wiki/payment-api-guide.md");
+        assertThat(result.knowledgeContext().apiNotes().getFirst().evidenceType()).isEqualTo("api-note");
+        assertThat(result.knowledgeContext().citedChunks()).hasSize(1);
+        assertThat(result.knowledgeContext().lowConfidence()).isFalse();
+        assertThat(result.knowledgeContext().lowCoverage()).isFalse();
     }
 
     @Test
@@ -204,6 +222,209 @@ class KnowledgeRetrievalApplicationServiceTests {
         assertThat(result.totalTokens()).isLessThanOrEqualTo(9);
     }
 
+    @Test
+    void assemblesKnowledgeContextIntoTypedGroupsWithCitations() {
+        knowledgeIngest.ingest(markdownRequest(
+            "Order placement rules",
+            """
+                # Preconditions
+
+                Orders must be created before payment can start.
+                """,
+            "wiki/order-rules.md",
+            DocumentType.DOMAIN_RULE,
+            List.of("order"),
+            List.of("case_generation")
+        ));
+        knowledgeIngest.ingest(markdownRequest(
+            "Payment API notes",
+            """
+                # Endpoint
+
+                POST /api/orders/{orderId}/pay requires an idempotency key.
+                """,
+            "wiki/payment-api.md",
+            DocumentType.API_NOTE,
+            List.of("payment"),
+            List.of("api_analysis")
+        ));
+        knowledgeIngest.ingest(markdownRequest(
+            "Payment test spec",
+            """
+                # Assertions
+
+                Validate status and gateway trace id on successful payment.
+                """,
+            "wiki/payment-test-spec.md",
+            DocumentType.TEST_SPEC,
+            List.of("payment"),
+            List.of("case_generation")
+        ));
+        knowledgeIngest.ingest(markdownRequest(
+            "PAY-401 guide",
+            """
+                # Error codes
+
+                PAY_401 means the auth signature is invalid.
+                """,
+            "wiki/payment-errors.md",
+            DocumentType.ERROR_CODE_GUIDE,
+            List.of("payment", "error"),
+            List.of("failure_analysis")
+        ));
+        knowledgeIngest.ingest(markdownRequest(
+            "Payment environment notes",
+            """
+                # Sandbox
+
+                Sandbox requires the gateway clock to stay within 30 seconds.
+                """,
+            "wiki/payment-env.md",
+            DocumentType.ENV_GUIDE,
+            List.of("payment", "sandbox"),
+            List.of("failure_analysis")
+        ));
+        knowledgeIngest.ingest(markdownRequest(
+            "Payment incident hints",
+            """
+                # Failure recap
+
+                Past failures often started with expired idempotency keys.
+                """,
+            "wiki/payment-incident.md",
+            DocumentType.INCIDENT_POSTMORTEM,
+            List.of("payment", "incident"),
+            List.of("failure_analysis")
+        ));
+
+        var result = knowledgeRetrieval.retrieve(new KnowledgeQuery(
+            "payment api case error sandbox failure",
+            "order-platform",
+            "payment",
+            null,
+            null,
+            "order",
+            null,
+            null,
+            List.of("payment"),
+            10,
+            400
+        ));
+
+        assertThat(result.knowledgeContext().businessRules()).hasSize(1);
+        assertThat(result.knowledgeContext().apiNotes()).hasSize(1);
+        assertThat(result.knowledgeContext().testSpecs()).hasSize(1);
+        assertThat(result.knowledgeContext().errorCodeGuides()).hasSize(1);
+        assertThat(result.knowledgeContext().environmentNotes()).hasSize(1);
+        assertThat(result.knowledgeContext().incidentHints()).hasSize(1);
+        assertThat(result.knowledgeContext().citedChunks()).hasSize(6);
+        assertThat(result.knowledgeContext().citedChunks())
+            .extracting(KnowledgeContextEntry::sourceRef)
+            .contains(
+                "wiki/order-rules.md",
+                "wiki/payment-api.md",
+                "wiki/payment-test-spec.md",
+                "wiki/payment-errors.md",
+                "wiki/payment-env.md",
+                "wiki/payment-incident.md"
+            );
+        assertThat(result.knowledgeContext().citedChunks())
+            .extracting(KnowledgeContextEntry::documentRevisionId)
+            .doesNotContainNull();
+    }
+
+    @Test
+    void marksLowConfidenceContextExplicitlyWhenOnlyWeakSparseMatchExists() {
+        knowledgeIngest.ingest(markdownRequest(
+            "Generic operations note",
+            """
+                # Internal note
+
+                Operators monitor background workloads during maintenance windows.
+                """,
+            "wiki/ops-note.md",
+            DocumentType.API_NOTE,
+            List.of("ops"),
+            List.of("api_analysis")
+        ));
+
+        var result = knowledgeRetrieval.retrieve(new KnowledgeQuery(
+            "payment auth failure",
+            "order-platform",
+            "payment",
+            null,
+            null,
+            "order",
+            null,
+            null,
+            List.of(),
+            5,
+            200
+        ));
+
+        assertThat(result.isEmpty()).isFalse();
+        assertThat(result.lowConfidence()).isTrue();
+        assertThat(result.knowledgeContext().lowConfidence()).isTrue();
+        assertThat(result.coverage()).isLessThan(0.5d);
+    }
+
+    @Test
+    void apiSpecReadinessTurnsTrueOnlyWhenUsefulContextIsFound() {
+        knowledgeIngest.ingest(markdownRequest(
+            "Payment API note",
+            """
+                # Endpoint
+
+                POST /api/orders/{orderId}/pay requires an auth token and idempotency key.
+                """,
+            "wiki/payment-api-ready.md",
+            DocumentType.API_NOTE,
+            List.of("payment", "auth"),
+            List.of("api_analysis")
+        ));
+
+        var apiSpec = apiSpecs.save(newApiSpec("/api/orders/{orderId}/pay", HttpMethod.POST));
+
+        var result = knowledgeRetrieval.retrieveForApiSpec(apiSpec.getApiSpecId(), new KnowledgeQuery(
+            "payment auth api",
+            null,
+            null,
+            null,
+            null,
+            "order",
+            DocumentType.API_NOTE,
+            "api_analysis",
+            List.of("payment", "auth"),
+            5,
+            200
+        ));
+
+        assertThat(result.knowledgeContext().apiNotes()).hasSize(1);
+        assertThat(apiSpecs.findById(apiSpec.getApiSpecId()).orElseThrow().isKnowledgeContextReady()).isTrue();
+    }
+
+    @Test
+    void apiSpecReadinessStaysFalseWhenRetrievalFindsNoUsefulContext() {
+        var apiSpec = apiSpecs.save(newApiSpec("/api/orders/{orderId}/pay", HttpMethod.POST));
+
+        var result = knowledgeRetrieval.retrieveForApiSpec(apiSpec.getApiSpecId(), new KnowledgeQuery(
+            "payment auth api",
+            null,
+            null,
+            null,
+            null,
+            "order",
+            DocumentType.API_NOTE,
+            "api_analysis",
+            List.of("payment", "auth"),
+            5,
+            200
+        ));
+
+        assertThat(result.knowledgeContext().isEmpty()).isTrue();
+        assertThat(apiSpecs.findById(apiSpec.getApiSpecId()).orElseThrow().isKnowledgeContextReady()).isFalse();
+    }
+
     private KnowledgeIngestRequest markdownRequest(
         String title,
         String content,
@@ -227,5 +448,25 @@ class KnowledgeRetrievalApplicationServiceTests {
             applicableStages,
             Map.of()
         );
+    }
+
+    private ApiSpec newApiSpec(String path, HttpMethod httpMethod) {
+        var apiSpec = new ApiSpec();
+        apiSpec.setSystemName("order-platform");
+        apiSpec.setModuleName("payment");
+        apiSpec.setHttpMethod(httpMethod);
+        apiSpec.setPath(path);
+        apiSpec.setSummary("Pay order");
+        apiSpec.setDescription("Pay an order by id.");
+        apiSpec.setOperationId("payOrder");
+        apiSpec.setParameters(Map.of());
+        apiSpec.setConstraints(Map.of());
+        apiSpec.setAuth(Map.of("required", true));
+        apiSpec.setSourceType(ApiSpecSourceType.OPENAPI);
+        apiSpec.setSourceRef("orders-openapi.yaml");
+        apiSpec.setSourceLocation(Map.of("line", 12));
+        apiSpec.setKnowledgeContextReady(false);
+        apiSpec.setPresentInLatestAnalysis(true);
+        return apiSpec;
     }
 }

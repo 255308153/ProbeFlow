@@ -1,5 +1,7 @@
 package com.probeflow.testagent.knowledge;
 
+import com.probeflow.testagent.apispec.ApiSpecRepository;
+import com.probeflow.testagent.apispec.HttpMethod;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -28,15 +30,18 @@ public class KnowledgeRetrievalApplicationService {
     private final KnowledgeChunkRepository chunks;
     private final KnowledgeDocumentRepository documents;
     private final EmbeddingService embeddingService;
+    private final ApiSpecRepository apiSpecs;
 
     public KnowledgeRetrievalApplicationService(
         KnowledgeChunkRepository chunks,
         KnowledgeDocumentRepository documents,
-        EmbeddingService embeddingService
+        EmbeddingService embeddingService,
+        ApiSpecRepository apiSpecs
     ) {
         this.chunks = chunks;
         this.documents = documents;
         this.embeddingService = embeddingService;
+        this.apiSpecs = apiSpecs;
     }
 
     @Transactional(readOnly = true)
@@ -71,14 +76,43 @@ public class KnowledgeRetrievalApplicationService {
         var deduplicated = deduplicate(ranked);
         var constrained = applyLimitAndTokenBudget(deduplicated, normalized.limit(), normalized.tokenBudget());
         var lowConfidence = constrained.isEmpty() || constrained.getFirst().lowConfidence();
+        var coverage = constrained.isEmpty() ? 0.0d : (lowConfidence ? 0.4d : 1.0d);
+        var context = assembleKnowledgeContext(constrained, coverage, lowConfidence);
         return new KnowledgeRetrievalResult(
             normalized.rawQuery(),
             constrained,
-            constrained.isEmpty() ? 0.0d : (lowConfidence ? 0.4d : 1.0d),
+            context,
+            coverage,
             filtered.size(),
             constrained.stream().mapToInt(KnowledgeRetrievalHit::tokenCount).sum(),
             lowConfidence
         );
+    }
+
+    @Transactional
+    public KnowledgeRetrievalResult retrieveForApiSpec(String apiSpecId, KnowledgeQuery query) {
+        requireNonBlank(apiSpecId, "apiSpecId must not be blank");
+        var apiSpec = apiSpecs.findById(apiSpecId)
+            .orElseThrow(() -> new IllegalArgumentException("ApiSpec not found: " + apiSpecId));
+
+        var scopedQuery = new KnowledgeQuery(
+            query.rawQuery(),
+            firstNonBlank(query.systemName(), apiSpec.getSystemName()),
+            firstNonBlank(query.moduleName(), apiSpec.getModuleName()),
+            firstNonBlank(query.apiPath(), apiSpec.getPath()),
+            query.httpMethod() != null ? query.httpMethod() : httpMethodValue(apiSpec.getHttpMethod()),
+            query.bizEntity(),
+            query.documentType(),
+            query.applicableStage(),
+            query.tags(),
+            query.limit(),
+            query.tokenBudget()
+        );
+
+        var result = retrieve(scopedQuery);
+        apiSpec.setKnowledgeContextReady(hasUsefulContext(result.knowledgeContext(), result.coverage()));
+        apiSpecs.save(apiSpec);
+        return result;
     }
 
     private void validate(KnowledgeQuery query) {
@@ -442,7 +476,89 @@ public class KnowledgeRetrievalApplicationService {
     }
 
     private KnowledgeRetrievalResult emptyResult(String rawQuery) {
-        return new KnowledgeRetrievalResult(rawQuery, List.of(), 0.0d, 0, 0, true);
+        return new KnowledgeRetrievalResult(rawQuery, List.of(), KnowledgeContext.empty(true, true), 0.0d, 0, 0, true);
+    }
+
+    private KnowledgeContext assembleKnowledgeContext(
+        List<KnowledgeRetrievalHit> hits,
+        double coverage,
+        boolean lowConfidence
+    ) {
+        if (hits.isEmpty()) {
+            return KnowledgeContext.empty(lowConfidence, coverage < 0.5d);
+        }
+
+        var businessRules = new ArrayList<KnowledgeContextEntry>();
+        var apiNotes = new ArrayList<KnowledgeContextEntry>();
+        var testSpecs = new ArrayList<KnowledgeContextEntry>();
+        var errorCodeGuides = new ArrayList<KnowledgeContextEntry>();
+        var environmentNotes = new ArrayList<KnowledgeContextEntry>();
+        var incidentHints = new ArrayList<KnowledgeContextEntry>();
+        var citedChunks = new ArrayList<KnowledgeContextEntry>();
+
+        for (var hit : hits) {
+            var entry = toContextEntry(hit);
+            citedChunks.add(entry);
+            switch (hit.documentType()) {
+                case BUSINESS_FLOW, DOMAIN_RULE -> businessRules.add(entry);
+                case API_NOTE -> apiNotes.add(entry);
+                case TEST_SPEC -> testSpecs.add(entry);
+                case ERROR_CODE_GUIDE -> errorCodeGuides.add(entry);
+                case ENV_GUIDE -> environmentNotes.add(entry);
+                case INCIDENT_POSTMORTEM -> incidentHints.add(entry);
+            }
+        }
+
+        return new KnowledgeContext(
+            List.copyOf(businessRules),
+            List.copyOf(apiNotes),
+            List.copyOf(testSpecs),
+            List.copyOf(errorCodeGuides),
+            List.copyOf(environmentNotes),
+            List.copyOf(incidentHints),
+            List.copyOf(citedChunks),
+            lowConfidence,
+            coverage < 0.5d
+        );
+    }
+
+    private KnowledgeContextEntry toContextEntry(KnowledgeRetrievalHit hit) {
+        return new KnowledgeContextEntry(
+            hit.chunkId(),
+            hit.documentId(),
+            hit.documentRevisionId(),
+            hit.chunkTitle(),
+            hit.score(),
+            evidenceType(hit.documentType()),
+            hit.sourceRef(),
+            hit.metadata(),
+            hit.matchReasons(),
+            hit.lowConfidence()
+        );
+    }
+
+    private String evidenceType(DocumentType documentType) {
+        return switch (documentType) {
+            case BUSINESS_FLOW, DOMAIN_RULE -> "business-rule";
+            case API_NOTE -> "api-note";
+            case TEST_SPEC -> "test-spec";
+            case ERROR_CODE_GUIDE -> "error-code-guide";
+            case ENV_GUIDE -> "environment-note";
+            case INCIDENT_POSTMORTEM -> "incident-hint";
+        };
+    }
+
+    private boolean hasUsefulContext(KnowledgeContext context, double coverage) {
+        return !context.isEmpty() && !context.lowConfidence() && coverage >= 0.5d;
+    }
+
+    private String firstNonBlank(String preferred, String fallback) {
+        var normalizedPreferred = normalizeNullable(preferred);
+        return normalizedPreferred != null ? normalizedPreferred : normalizeNullable(fallback);
+    }
+
+    private String httpMethodValue(HttpMethod httpMethod) {
+        return httpMethod == null ? null : httpMethod.name();
     }
 
     private void requireNonBlank(String value, String message) {
