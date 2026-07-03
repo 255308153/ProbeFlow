@@ -107,6 +107,116 @@ class TestCaseGenerationApplicationServiceTests {
         assertThat(metadata).containsEntry("contextBudgetRequested", 300);
     }
 
+    @Test
+    void singleModePlansContractNegativeBoundaryAndAuthScenarioDraftsDeterministically() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+
+        var result = generationService.generate(new TestCaseGenerationRequest(
+            task.getTaskId(),
+            "phase5-session-02",
+            List.of(apiSpec.getApiSpecId()),
+            TestCaseGenerationMode.SINGLE,
+            List.of(),
+            500
+        ));
+
+        entityManager.flush();
+        entityManager.clear();
+
+        assertThat(result.createdDraftIds()).hasSize(6);
+        assertThat(result.generatedCategories()).containsExactly(
+            ScenarioCategory.HAPPY_PATH,
+            ScenarioCategory.MISSING_REQUIRED,
+            ScenarioCategory.INVALID_VALUE,
+            ScenarioCategory.BOUNDARY_VALUE,
+            ScenarioCategory.AUTHENTICATION_FAILURE,
+            ScenarioCategory.PERMISSION_FAILURE
+        );
+        assertThat(result.skippedCategories()).isEmpty();
+        assertThat(result.unsupportedCategories()).isEmpty();
+        assertThat(result.counts().created()).isEqualTo(6);
+
+        var persistedDrafts = result.createdDraftIds().stream()
+            .map(draftId -> drafts.findById(draftId).orElseThrow())
+            .toList();
+
+        assertThat(persistedDrafts).extracting(draft -> draft.getDraftContent().get("scenarioCategory"))
+            .containsExactly(
+                "HAPPY_PATH",
+                "MISSING_REQUIRED",
+                "INVALID_VALUE",
+                "BOUNDARY_VALUE",
+                "AUTHENTICATION_FAILURE",
+                "PERMISSION_FAILURE"
+            );
+        assertThat(persistedDrafts).extracting("expectedStatusCode")
+            .containsExactly(201, 400, 400, 400, 401, 403);
+
+        var missingRequired = persistedDrafts.stream()
+            .filter(draft -> draft.getDraftContent().get("scenarioCategory").equals("MISSING_REQUIRED"))
+            .findFirst()
+            .orElseThrow();
+        assertThat(missingRequired.getDraftContent().get("validationHints")).asList()
+            .anySatisfy(hint -> assertThat(hint).asString().contains("Missing parameter"));
+        assertThat(missingRequired.getDraftContent()).containsEntry("priorityHint", "P1");
+        assertThat(missingRequired.getDraftContent()).containsEntry("riskHint", "HIGH");
+
+        @SuppressWarnings("unchecked")
+        var boundaryShape = (Map<String, Object>) persistedDrafts.stream()
+            .filter(draft -> draft.getDraftContent().get("scenarioCategory").equals("BOUNDARY_VALUE"))
+            .findFirst()
+            .orElseThrow()
+            .getDraftContent()
+            .get("requestShape");
+        assertThat(boundaryShape).containsKey("mutation");
+
+        @SuppressWarnings("unchecked")
+        var authTags = (List<String>) persistedDrafts.stream()
+            .filter(draft -> draft.getDraftContent().get("scenarioCategory").equals("AUTHENTICATION_FAILURE"))
+            .findFirst()
+            .orElseThrow()
+            .getDraftContent()
+            .get("tags");
+        assertThat(authTags).contains("security", "authentication-failure");
+
+        @SuppressWarnings("unchecked")
+        var intentMetadata = (Map<String, Object>) ((Map<String, Object>) missingRequired.getDraftContent().get("generationMetadata"))
+            .get("scenarioIntent");
+        assertThat(intentMetadata).containsEntry("category", "MISSING_REQUIRED");
+        assertThat(intentMetadata.get("intentKey")).asString().startsWith("missing-required-");
+    }
+
+    @Test
+    void singleModeReportsSkippedAndUnsupportedScenarioCategories() {
+        var apiSpec = apiSpecs.save(newMinimalApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+
+        var result = generationService.generate(new TestCaseGenerationRequest(
+            task.getTaskId(),
+            "phase5-session-02-sparse",
+            List.of(apiSpec.getApiSpecId()),
+            TestCaseGenerationMode.SINGLE,
+            List.of(
+                ScenarioCategory.MISSING_REQUIRED,
+                ScenarioCategory.BOUNDARY_VALUE,
+                ScenarioCategory.AUTHENTICATION_FAILURE,
+                ScenarioCategory.PERMISSION_FAILURE
+            ),
+            500
+        ));
+
+        assertThat(result.createdDraftIds()).isEmpty();
+        assertThat(result.generatedCategories()).isEmpty();
+        assertThat(result.skippedCategories()).containsKeys(ScenarioCategory.MISSING_REQUIRED, ScenarioCategory.BOUNDARY_VALUE);
+        assertThat(result.unsupportedCategories()).containsKeys(
+            ScenarioCategory.AUTHENTICATION_FAILURE,
+            ScenarioCategory.PERMISSION_FAILURE
+        );
+        assertThat(result.counts().created()).isZero();
+        assertThat(result.counts().skipped()).isEqualTo(4);
+    }
+
     private ApiSpec newApiSpec() {
         var apiSpec = new ApiSpec();
         apiSpec.setSystemName("order-platform");
@@ -127,7 +237,8 @@ class TestCaseGenerationApplicationServiceTests {
         ));
         apiSpec.setAuth(Map.of(
             "type", "bearer",
-            "header", "Authorization"
+            "header", "Authorization",
+            "roles", List.of("ORDER_MANAGER")
         ));
         apiSpec.setSourceType(ApiSpecSourceType.OPENAPI);
         apiSpec.setSourceRef("openapi://orders.yaml#/paths/~1api~1orders/post");
@@ -138,6 +249,29 @@ class TestCaseGenerationApplicationServiceTests {
         apiSpec.setDtoExpanded(true);
         apiSpec.setValidationReady(true);
         apiSpec.setAuthReady(true);
+        apiSpec.setKnowledgeContextReady(false);
+        return apiSpec;
+    }
+
+    private ApiSpec newMinimalApiSpec() {
+        var apiSpec = new ApiSpec();
+        apiSpec.setSystemName("order-platform");
+        apiSpec.setModuleName("catalog");
+        apiSpec.setHttpMethod(HttpMethod.GET);
+        apiSpec.setPath("/api/catalog/ping");
+        apiSpec.setSummary("Catalog ping");
+        apiSpec.setParameters(Map.of());
+        apiSpec.setConstraints(Map.of());
+        apiSpec.setAuth(Map.of());
+        apiSpec.setSourceType(ApiSpecSourceType.MANUAL);
+        apiSpec.setSourceRef("manual://catalog-ping");
+        apiSpec.setSourceLocation(Map.of());
+        apiSpec.setVersion(1);
+        apiSpec.setRouteReady(true);
+        apiSpec.setBasicParamReady(true);
+        apiSpec.setDtoExpanded(false);
+        apiSpec.setValidationReady(false);
+        apiSpec.setAuthReady(false);
         apiSpec.setKnowledgeContextReady(false);
         return apiSpec;
     }
