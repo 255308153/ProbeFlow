@@ -418,6 +418,103 @@ class ApiAnalysisApplicationServiceTests {
     }
 
     @Test
+    void springSourceDirectoryEnrichesDtoValidationAndAuthHints() throws Exception {
+        var sourceRoot = tempDir.resolve("spring-enriched-source");
+        var controllerDir = sourceRoot.resolve("src/main/java/com/example/inventory");
+        Files.createDirectories(controllerDir);
+        Files.writeString(controllerDir.resolve("InventoryController.java"), """
+            package com.example.inventory;
+
+            import jakarta.validation.constraints.Max;
+            import jakarta.validation.constraints.Min;
+            import jakarta.validation.constraints.NotBlank;
+            import jakarta.validation.constraints.Pattern;
+            import jakarta.validation.constraints.Size;
+            import org.springframework.http.ResponseEntity;
+            import org.springframework.security.access.prepost.PreAuthorize;
+            import org.springframework.web.bind.annotation.PostMapping;
+            import org.springframework.web.bind.annotation.RequestBody;
+            import org.springframework.web.bind.annotation.RequestMapping;
+            import org.springframework.web.bind.annotation.RestController;
+
+            @RestController
+            @RequestMapping("/api/inventory")
+            class InventoryController {
+
+                @PostMapping
+                @PreAuthorize("hasAuthority('inventory:create')")
+                ResponseEntity<CreateInventoryResponse> createInventory(@RequestBody CreateInventoryRequest request) {
+                    return null;
+                }
+            }
+
+            class CreateInventoryRequest {
+                @NotBlank
+                private String skuId;
+
+                @Min(1)
+                @Max(99)
+                private int quantity;
+
+                @Size(max = 32)
+                private String channel;
+
+                @Pattern(regexp = "^[A-Z]+$")
+                private String warehouseCode;
+            }
+
+            class CreateInventoryResponse {
+                private String inventoryId;
+                private String status;
+            }
+            """);
+
+        var result = apiAnalysis.analyze(ApiAnalysisRequest.createMaterial(
+            MaterialType.SOURCE_DIRECTORY,
+            "spring-enriched-source",
+            sourceRoot.toString(),
+            sourceRoot.toString(),
+            "tester"
+        ));
+
+        assertThat(result.succeeded()).isTrue();
+        var spec = apiSpecs.findBySourceMaterialIdOrderByPathAscHttpMethodAsc(result.materialId()).getFirst();
+
+        @SuppressWarnings("unchecked")
+        var requestBody = (java.util.Map<String, Object>) spec.getParameters().get("requestBody");
+        assertThat(requestBody).containsEntry("type", "CreateInventoryRequest");
+        assertThat(requestBody.get("fields").toString()).contains("skuId", "quantity", "warehouseCode");
+
+        @SuppressWarnings("unchecked")
+        var responseBody = (java.util.Map<String, Object>) spec.getParameters().get("responseBody");
+        assertThat(responseBody).containsEntry("type", "CreateInventoryResponse");
+        assertThat(responseBody.get("fields").toString()).contains("inventoryId", "status");
+
+        @SuppressWarnings("unchecked")
+        var required = (java.util.List<String>) spec.getConstraints().get("required");
+        assertThat(required).contains("requestBody.skuId");
+
+        @SuppressWarnings("unchecked")
+        var validations = (java.util.Map<String, Object>) spec.getConstraints().get("validations");
+        @SuppressWarnings("unchecked")
+        var quantityValidation = (java.util.Map<String, Object>) validations.get("requestBody.quantity");
+        assertThat(quantityValidation).containsEntry("minimum", 1).containsEntry("maximum", 99);
+        @SuppressWarnings("unchecked")
+        var channelValidation = (java.util.Map<String, Object>) validations.get("requestBody.channel");
+        assertThat(channelValidation).containsEntry("maxLength", 32);
+        @SuppressWarnings("unchecked")
+        var warehouseValidation = (java.util.Map<String, Object>) validations.get("requestBody.warehouseCode");
+        assertThat(warehouseValidation).containsEntry("pattern", "^[A-Z]+$");
+
+        assertThat(spec.getAuth()).containsEntry("required", true);
+        assertThat(spec.getAuth().toString()).contains("PreAuthorize", "inventory:create");
+        assertThat(spec.isDtoExpanded()).isTrue();
+        assertThat(spec.isValidationReady()).isTrue();
+        assertThat(spec.isAuthReady()).isTrue();
+        assertThat(spec.isKnowledgeContextReady()).isFalse();
+    }
+
+    @Test
     void invalidMaterialPathFailsWithoutCreatingApiSpecs() {
         var missingFile = tempDir.resolve("missing.yaml");
 

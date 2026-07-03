@@ -313,9 +313,9 @@ public class ApiAnalysisApplicationService {
         apiSpec.setSourceMaterialId(material.getMaterialId());
         apiSpec.setRouteReady(true);
         apiSpec.setBasicParamReady(true);
-        apiSpec.setDtoExpanded(false);
-        apiSpec.setValidationReady(false);
-        apiSpec.setAuthReady(false);
+        apiSpec.setDtoExpanded(true);
+        apiSpec.setValidationReady(true);
+        apiSpec.setAuthReady(true);
         apiSpec.setKnowledgeContextReady(false);
         apiSpec.setPresentInLatestAnalysis(true);
         return changed;
@@ -374,24 +374,30 @@ public class ApiAnalysisApplicationService {
         var sourceRoot = Path.of(material.getStoragePath());
         var parser = new JavaParser(new ParserConfiguration());
         var operations = new ArrayList<ParsedSpringOperation>();
+        var javaFiles = new ArrayList<ParsedJavaFile>();
         var errors = new ArrayList<String>();
 
         try (var paths = Files.walk(sourceRoot)) {
-            var javaFiles = paths
+            var sourceFiles = paths
                 .filter(path -> Files.isRegularFile(path) && path.toString().endsWith(".java"))
                 .sorted()
                 .toList();
 
-            for (var javaFile : javaFiles) {
+            for (var javaFile : sourceFiles) {
                 var parseResult = parser.parse(javaFile);
                 if (parseResult.getResult().isEmpty()) {
                     errors.add(javaFile + ": " + parseResult.getProblems());
                     continue;
                 }
-                operations.addAll(extractSpringOperations(material, sourceRoot, javaFile, parseResult.getResult().orElseThrow()));
+                javaFiles.add(new ParsedJavaFile(javaFile, parseResult.getResult().orElseThrow()));
             }
         } catch (IOException exception) {
             return SpringSourceParseOutcome.failure("SPRING_SOURCE_NOT_READABLE", exception.getMessage());
+        }
+
+        var dtoIndex = dtoIndex(javaFiles);
+        for (var javaFile : javaFiles) {
+            operations.addAll(extractSpringOperations(material, sourceRoot, javaFile.path(), javaFile.compilationUnit(), dtoIndex));
         }
 
         if (operations.isEmpty()) {
@@ -408,7 +414,8 @@ public class ApiAnalysisApplicationService {
         SourceMaterial material,
         Path sourceRoot,
         Path javaFile,
-        CompilationUnit compilationUnit
+        CompilationUnit compilationUnit,
+        Map<String, DtoShape> dtoIndex
     ) {
         var operations = new ArrayList<ParsedSpringOperation>();
         for (var controller : compilationUnit.findAll(ClassOrInterfaceDeclaration.class)) {
@@ -439,7 +446,8 @@ public class ApiAnalysisApplicationService {
                                 method,
                                 httpMethod,
                                 combinePaths(classPath, methodPath),
-                                moduleName
+                                moduleName,
+                                dtoIndex
                             ));
                         }
                     }
@@ -457,7 +465,8 @@ public class ApiAnalysisApplicationService {
         MethodDeclaration method,
         HttpMethod httpMethod,
         String path,
-        String moduleName
+        String moduleName,
+        Map<String, DtoShape> dtoIndex
     ) {
         var sourceLocation = new LinkedHashMap<String, Object>();
         sourceLocation.put("materialId", material.getMaterialId());
@@ -474,9 +483,9 @@ public class ApiAnalysisApplicationService {
             controller.getNameAsString() + "#" + method.getNameAsString(),
             null,
             controller.getNameAsString() + "#" + method.getNameAsString(),
-            springParameters(method),
-            new LinkedHashMap<>(),
-            new LinkedHashMap<>(),
+            springParameters(method, dtoIndex),
+            springConstraints(method, dtoIndex),
+            springAuth(controller, method),
             sourceLocation,
             controller.getNameAsString(),
             method.getNameAsString()
@@ -557,9 +566,9 @@ public class ApiAnalysisApplicationService {
         apiSpec.setVersion(1);
         apiSpec.setRouteReady(true);
         apiSpec.setBasicParamReady(true);
-        apiSpec.setDtoExpanded(false);
-        apiSpec.setValidationReady(false);
-        apiSpec.setAuthReady(false);
+        apiSpec.setDtoExpanded(true);
+        apiSpec.setValidationReady(true);
+        apiSpec.setAuthReady(true);
         apiSpec.setKnowledgeContextReady(false);
         apiSpec.setPresentInLatestAnalysis(true);
         return apiSpec;
@@ -779,7 +788,34 @@ public class ApiAnalysisApplicationService {
         return separator == -1 ? name : name.substring(separator + 1);
     }
 
-    private Map<String, Object> springParameters(MethodDeclaration method) {
+    private Map<String, DtoShape> dtoIndex(List<ParsedJavaFile> javaFiles) {
+        var dtoIndex = new LinkedHashMap<String, DtoShape>();
+        for (var javaFile : javaFiles) {
+            for (var classDeclaration : javaFile.compilationUnit().findAll(ClassOrInterfaceDeclaration.class)) {
+                var fields = classDeclaration.getFields().stream()
+                    .flatMap(field -> field.getVariables().stream().map(variable -> dtoFieldShape(field.getAnnotations(), variable.getNameAsString(), variable.getTypeAsString())))
+                    .toList();
+                if (!fields.isEmpty()) {
+                    dtoIndex.put(classDeclaration.getNameAsString(), new DtoShape(classDeclaration.getNameAsString(), fields));
+                }
+            }
+        }
+        return dtoIndex;
+    }
+
+    private Map<String, Object> dtoFieldShape(List<AnnotationExpr> annotations, String name, String type) {
+        var shape = new LinkedHashMap<String, Object>();
+        var validations = validationHints(annotations);
+        shape.put("name", name);
+        shape.put("type", type);
+        shape.put("required", hasRequiredValidation(annotations));
+        if (!validations.isEmpty()) {
+            shape.put("validations", validations);
+        }
+        return shape;
+    }
+
+    private Map<String, Object> springParameters(MethodDeclaration method, Map<String, DtoShape> dtoIndex) {
         var parameters = new LinkedHashMap<String, Object>();
         for (var parameter : method.getParameters()) {
             for (var annotation : parameter.getAnnotations()) {
@@ -787,12 +823,13 @@ public class ApiAnalysisApplicationService {
                     case "PathVariable" -> parameterBucket(parameters, "path").add(parameterShape(annotation, parameter, true));
                     case "RequestParam" -> parameterBucket(parameters, "query").add(parameterShape(annotation, parameter, required(annotation, true)));
                     case "RequestHeader" -> parameterBucket(parameters, "header").add(parameterShape(annotation, parameter, required(annotation, true)));
-                    case "RequestBody" -> parameters.put("requestBody", requestBodyShape(annotation, parameter));
+                    case "RequestBody" -> parameters.put("requestBody", requestBodyShape(annotation, parameter, dtoIndex));
                     default -> {
                     }
                 }
             }
         }
+        responseBodyShape(method, dtoIndex).ifPresent(responseBody -> parameters.put("responseBody", responseBody));
         return parameters;
     }
 
@@ -815,12 +852,119 @@ public class ApiAnalysisApplicationService {
         return shape;
     }
 
-    private Map<String, Object> requestBodyShape(AnnotationExpr annotation, com.github.javaparser.ast.body.Parameter parameter) {
+    private Map<String, Object> requestBodyShape(
+        AnnotationExpr annotation,
+        com.github.javaparser.ast.body.Parameter parameter,
+        Map<String, DtoShape> dtoIndex
+    ) {
         var body = new LinkedHashMap<String, Object>();
+        var typeName = simpleTypeName(parameter.getTypeAsString());
         body.put("name", parameter.getNameAsString());
-        body.put("type", parameter.getTypeAsString());
+        body.put("type", typeName);
         body.put("required", required(annotation, true));
+        var dto = dtoIndex.get(typeName);
+        if (dto != null) {
+            body.put("fields", dto.fields());
+        }
         return body;
+    }
+
+    private Optional<Map<String, Object>> responseBodyShape(MethodDeclaration method, Map<String, DtoShape> dtoIndex) {
+        var typeName = responseTypeName(method.getTypeAsString());
+        if (typeName.isBlank() || "void".equals(typeName) || "Void".equals(typeName)) {
+            return Optional.empty();
+        }
+
+        var body = new LinkedHashMap<String, Object>();
+        body.put("type", typeName);
+        var dto = dtoIndex.get(typeName);
+        if (dto != null) {
+            body.put("fields", dto.fields());
+        }
+        return Optional.of(body);
+    }
+
+    private Map<String, Object> springConstraints(MethodDeclaration method, Map<String, DtoShape> dtoIndex) {
+        var constraints = new LinkedHashMap<String, Object>();
+        for (var parameter : method.getParameters()) {
+            for (var annotation : parameter.getAnnotations()) {
+                var annotationName = annotationName(annotation);
+                if ("RequestBody".equals(annotationName)) {
+                    addDtoConstraints("requestBody", simpleTypeName(parameter.getTypeAsString()), dtoIndex, constraints);
+                } else if ("RequestParam".equals(annotationName)) {
+                    addParameterConstraints("query." + parameterName(annotation, parameter), parameter.getAnnotations(), constraints);
+                } else if ("RequestHeader".equals(annotationName)) {
+                    addParameterConstraints("header." + parameterName(annotation, parameter), parameter.getAnnotations(), constraints);
+                } else if ("PathVariable".equals(annotationName)) {
+                    addParameterConstraints("path." + parameterName(annotation, parameter), parameter.getAnnotations(), constraints);
+                }
+            }
+        }
+        return constraints;
+    }
+
+    private void addDtoConstraints(
+        String prefix,
+        String typeName,
+        Map<String, DtoShape> dtoIndex,
+        Map<String, Object> constraints
+    ) {
+        var dto = dtoIndex.get(typeName);
+        if (dto == null) {
+            return;
+        }
+        for (var field : dto.fields()) {
+            var fieldName = (String) field.get("name");
+            if (Boolean.TRUE.equals(field.get("required"))) {
+                requiredList(constraints).add(prefix + "." + fieldName);
+            }
+            @SuppressWarnings("unchecked")
+            var validations = (Map<String, Object>) field.get("validations");
+            if (validations != null && !validations.isEmpty()) {
+                validationsMap(constraints).put(prefix + "." + fieldName, validations);
+            }
+        }
+    }
+
+    private void addParameterConstraints(
+        String parameterPath,
+        List<AnnotationExpr> annotations,
+        Map<String, Object> constraints
+    ) {
+        if (hasRequiredValidation(annotations)) {
+            requiredList(constraints).add(parameterPath);
+        }
+        var validations = validationHints(annotations);
+        if (!validations.isEmpty()) {
+            validationsMap(constraints).put(parameterPath, validations);
+        }
+    }
+
+    private Map<String, Object> springAuth(ClassOrInterfaceDeclaration controller, MethodDeclaration method) {
+        var annotations = new ArrayList<Map<String, Object>>();
+        controller.getAnnotations().forEach(annotation -> addAuthAnnotation(annotation, annotations));
+        method.getAnnotations().forEach(annotation -> addAuthAnnotation(annotation, annotations));
+
+        var auth = new LinkedHashMap<String, Object>();
+        auth.put("required", !annotations.isEmpty());
+        if (!annotations.isEmpty()) {
+            auth.put("annotations", annotations);
+        }
+        return auth;
+    }
+
+    private void addAuthAnnotation(AnnotationExpr annotation, List<Map<String, Object>> annotations) {
+        var name = annotationName(annotation);
+        if (!List.of("PreAuthorize", "PostAuthorize", "Secured", "RolesAllowed").contains(name)) {
+            return;
+        }
+        var authAnnotation = new LinkedHashMap<String, Object>();
+        authAnnotation.put("name", name);
+        annotationMember(annotation, "value")
+            .map(this::annotationValue)
+            .filter(value -> !value.isEmpty())
+            .ifPresent(value -> authAnnotation.put("value", value));
+        annotations.add(authAnnotation);
     }
 
     private Optional<String> annotationStringValue(AnnotationExpr annotation, String memberName) {
@@ -834,6 +978,88 @@ public class ApiAnalysisApplicationService {
             .filter(Expression::isBooleanLiteralExpr)
             .map(value -> value.asBooleanLiteralExpr().getValue())
             .orElse(defaultValue);
+    }
+
+    private String parameterName(AnnotationExpr annotation, com.github.javaparser.ast.body.Parameter parameter) {
+        return annotationStringValue(annotation, "name")
+            .or(() -> annotationStringValue(annotation, "value"))
+            .orElse(parameter.getNameAsString());
+    }
+
+    private boolean hasRequiredValidation(List<AnnotationExpr> annotations) {
+        return annotations.stream()
+            .map(this::annotationName)
+            .anyMatch(name -> List.of("NotNull", "NotBlank", "NotEmpty").contains(name));
+    }
+
+    private Map<String, Object> validationHints(List<AnnotationExpr> annotations) {
+        var validations = new LinkedHashMap<String, Object>();
+        for (var annotation : annotations) {
+            switch (annotationName(annotation)) {
+                case "Size" -> {
+                    annotationIntegerValue(annotation, "min").ifPresent(value -> validations.put("minLength", value));
+                    annotationIntegerValue(annotation, "max").ifPresent(value -> validations.put("maxLength", value));
+                }
+                case "Min" -> annotationIntegerValue(annotation, "value").ifPresent(value -> validations.put("minimum", value));
+                case "Max" -> annotationIntegerValue(annotation, "value").ifPresent(value -> validations.put("maximum", value));
+                case "Pattern" -> annotationStringValue(annotation, "regexp")
+                    .or(() -> annotationStringValue(annotation, "value"))
+                    .ifPresent(value -> validations.put("pattern", value));
+                default -> {
+                }
+            }
+        }
+        return validations;
+    }
+
+    private Optional<Integer> annotationIntegerValue(AnnotationExpr annotation, String memberName) {
+        return annotationMember(annotation, memberName).flatMap(this::integerValue);
+    }
+
+    private Optional<Integer> integerValue(Expression expression) {
+        try {
+            if (expression.isIntegerLiteralExpr()) {
+                return Optional.of(Integer.parseInt(expression.asIntegerLiteralExpr().asNumber().toString()));
+            }
+            if (expression.isLongLiteralExpr()) {
+                return Optional.of(Integer.parseInt(expression.asLongLiteralExpr().asNumber().toString()));
+            }
+        } catch (NumberFormatException ignored) {
+            return Optional.empty();
+        }
+        return Optional.empty();
+    }
+
+    private String annotationValue(Expression expression) {
+        if (expression.isStringLiteralExpr()) {
+            return expression.asStringLiteralExpr().asString();
+        }
+        if (expression instanceof ArrayInitializerExpr arrayInitializer) {
+            return arrayInitializer.getValues().stream()
+                .map(this::annotationValue)
+                .filter(value -> !value.isBlank())
+                .toList()
+                .toString();
+        }
+        return expression.toString();
+    }
+
+    private String responseTypeName(String rawType) {
+        var typeName = rawType.trim();
+        if (typeName.startsWith("ResponseEntity<") && typeName.endsWith(">")) {
+            return simpleTypeName(typeName.substring("ResponseEntity<".length(), typeName.length() - 1));
+        }
+        return simpleTypeName(typeName);
+    }
+
+    private String simpleTypeName(String rawType) {
+        var typeName = rawType.trim();
+        var genericStart = typeName.indexOf('<');
+        if (genericStart > 0) {
+            typeName = typeName.substring(0, genericStart);
+        }
+        var packageSeparator = typeName.lastIndexOf('.');
+        return packageSeparator == -1 ? typeName : typeName.substring(packageSeparator + 1);
     }
 
     private String combinePaths(String classPath, String methodPath) {
@@ -1193,5 +1419,11 @@ public class ApiAnalysisApplicationService {
     }
 
     private record SpringMapping(List<String> paths, List<HttpMethod> httpMethods) {
+    }
+
+    private record ParsedJavaFile(Path path, CompilationUnit compilationUnit) {
+    }
+
+    private record DtoShape(String type, List<Map<String, Object>> fields) {
     }
 }
