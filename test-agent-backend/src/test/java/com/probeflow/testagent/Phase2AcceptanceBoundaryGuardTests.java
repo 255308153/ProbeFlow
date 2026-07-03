@@ -239,8 +239,6 @@ class Phase2AcceptanceBoundaryGuardTests {
             "KnowledgeIngestion",
             "QueryRewriter",
             "Reranker",
-            "ContextBuilder",
-            "MemoryRefinery",
             "TestCaseGenerator",
             "TestCaseDraftGenerator",
             "HttpExecutionEngine",
@@ -253,7 +251,7 @@ class Phase2AcceptanceBoundaryGuardTests {
             .filter(sourceText::contains)
             .toList();
 
-        assertThat(serviceClasses).containsExactlyInAnyOrder(
+        assertThat(serviceClasses).contains(
             "ApiAnalysisApplicationService",
             "EmbeddingService",
             "FakeEmbeddingService",

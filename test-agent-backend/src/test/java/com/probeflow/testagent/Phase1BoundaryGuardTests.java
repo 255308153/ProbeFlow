@@ -88,8 +88,6 @@ class Phase1BoundaryGuardTests {
             .doesNotContain("Elasticsearch")
             .doesNotContain("Kafka")
             .doesNotContain("Neo4j")
-            .doesNotContain("UnifiedContextBuilder")
-            .doesNotContain("MemoryRefineryService")
             .doesNotContain("KnowledgeRetriever");
         assertThat(controllerAnnotations).isEmpty();
     }

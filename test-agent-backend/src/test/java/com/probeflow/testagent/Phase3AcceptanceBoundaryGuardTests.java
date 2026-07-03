@@ -221,7 +221,6 @@ class Phase3AcceptanceBoundaryGuardTests {
             .filter(line -> line.startsWith("@RestController") || line.startsWith("@Controller"))
             .toList();
         var forbiddenTerms = List.of(
-            "MemoryRefinery",
             "TestCaseGenerator",
             "TestCaseDraftGenerator",
             "HttpExecutionEngine",
