@@ -7,5 +7,6 @@ public enum CoverageStatus {
     UNSUPPORTED,
     INCOMPLETE,
     MISSING,
+    FAILED,
     BLOCKED
 }

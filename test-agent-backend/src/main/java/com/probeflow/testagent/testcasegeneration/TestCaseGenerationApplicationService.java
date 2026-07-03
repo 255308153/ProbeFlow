@@ -59,7 +59,7 @@ public class TestCaseGenerationApplicationService {
         return switch (request.generationMode()) {
             case SINGLE -> generateSingle(request, task.getTaskId(), task.getPromotionMode());
             case SUITE -> generateSuite(request, task.getTaskId(), task.getPromotionMode());
-            case BATCH -> throw new IllegalArgumentException("BATCH generation is not implemented until issue 07");
+            case BATCH -> generateBatch(request, task.getTaskId(), task.getPromotionMode());
         };
     }
 
@@ -68,18 +68,30 @@ public class TestCaseGenerationApplicationService {
         String taskId,
         PromotionMode promotionMode
     ) {
+        var requestedCategories = requestedCategories(request);
         var apiSpecId = request.targetApiSpecIds().getFirst();
         var apiSpec = apiSpecs.findById(apiSpecId)
             .orElseThrow(() -> new IllegalArgumentException("ApiSpec not found: " + apiSpecId));
-        var requestedCategories = requestedCategories(request);
+        var outcome = generateSingleTarget(taskId, request.sessionId(), promotionMode, apiSpec, requestedCategories, tokenBudget(request));
+        return resultFromSingleOutcome(request, taskId, outcome);
+    }
+
+    private SingleGenerationOutcome generateSingleTarget(
+        String taskId,
+        String sessionId,
+        PromotionMode promotionMode,
+        ApiSpec apiSpec,
+        List<ScenarioCategory> requestedCategories,
+        int tokenBudget
+    ) {
         var structuralDiagnostics = structuralDiagnostics(apiSpec);
         if (!structuralDiagnostics.isEmpty()) {
-            return incompleteResult(request, apiSpec, requestedCategories, structuralDiagnostics);
+            return incompleteOutcome(apiSpec, requestedCategories, structuralDiagnostics);
         }
 
         var context = unifiedContextBuilder.build(new UnifiedContextQuery(
             taskId,
-            request.sessionId(),
+            sessionId,
             apiSpec.getApiSpecId(),
             null,
             STAGE_PROFILE,
@@ -89,7 +101,7 @@ public class TestCaseGenerationApplicationService {
             apiSpec.getPath(),
             null,
             contextTags(apiSpec, requestedCategories),
-            tokenBudget(request)
+            tokenBudget
         ));
 
         var plan = planScenarioIntents(apiSpec, context, requestedCategories);
@@ -99,7 +111,7 @@ public class TestCaseGenerationApplicationService {
         var protectedSkipped = 0;
         var coverageByCategory = new LinkedHashMap<ScenarioCategory, ScenarioCoverage>();
         for (var intent : plan.intents()) {
-            var persistence = persistDraft(taskId, promotionMode, apiSpec, context, tokenBudget(request), intent);
+            var persistence = persistDraft(taskId, promotionMode, apiSpec, context, tokenBudget, intent);
             switch (persistence.action()) {
                 case CREATED -> {
                     createdDraftIds.add(persistence.draftId());
@@ -160,22 +172,20 @@ public class TestCaseGenerationApplicationService {
             ));
         }
         var resultWarnings = warnings(context);
-        return new TestCaseGenerationResult(
-            taskId,
-            request.sessionId(),
-            request.generationMode(),
-            List.of(apiSpec.getApiSpecId()),
+        return new SingleGenerationOutcome(
+            apiSpec.getApiSpecId(),
             List.copyOf(createdDraftIds),
+            List.copyOf(updatedDraftIds),
             plan.intents().stream().map(ScenarioIntent::category).toList(),
             plan.skippedCategories(),
             plan.unsupportedCategories(),
-            List.of(new TargetCoverageSummary(
+            new TargetCoverageSummary(
                 apiSpec.getApiSpecId(),
                 targetStatus(coverageByCategory),
                 orderedCoverage(requestedCategories, coverageByCategory),
                 resultWarnings,
                 List.of()
-            )),
+            ),
             resultWarnings,
             new TestCaseGenerationCounts(
                 createdDraftIds.size(),
@@ -183,6 +193,26 @@ public class TestCaseGenerationApplicationService {
                 plan.skippedCategories().size() + plan.unsupportedCategories().size() + protectedSkipped,
                 duplicateSuppressed
             )
+        );
+    }
+
+    private TestCaseGenerationResult resultFromSingleOutcome(
+        TestCaseGenerationRequest request,
+        String taskId,
+        SingleGenerationOutcome outcome
+    ) {
+        return new TestCaseGenerationResult(
+            taskId,
+            request.sessionId(),
+            request.generationMode(),
+            List.of(outcome.apiSpecId()),
+            outcome.createdDraftIds(),
+            outcome.generatedCategories(),
+            outcome.skippedCategories(),
+            outcome.unsupportedCategories(),
+            List.of(outcome.coverage()),
+            outcome.warnings(),
+            outcome.counts()
         );
     }
 
@@ -285,6 +315,86 @@ public class TestCaseGenerationApplicationService {
         );
     }
 
+    private TestCaseGenerationResult generateBatch(
+        TestCaseGenerationRequest request,
+        String taskId,
+        PromotionMode promotionMode
+    ) {
+        var requestedCategories = requestedCategories(request);
+        var targetApiSpecIds = new ArrayList<String>();
+        var createdDraftIds = new ArrayList<String>();
+        var generatedCategories = new ArrayList<ScenarioCategory>();
+        var skippedCategories = new LinkedHashMap<ScenarioCategory, String>();
+        var unsupportedCategories = new LinkedHashMap<ScenarioCategory, String>();
+        var coverage = new ArrayList<TargetCoverageSummary>();
+        var warnings = new ArrayList<String>();
+        var created = 0;
+        var updated = 0;
+        var skipped = 0;
+        var duplicateSuppressed = 0;
+
+        for (var apiSpecId : request.targetApiSpecIds()) {
+            targetApiSpecIds.add(apiSpecId);
+            var apiSpec = apiSpecs.findById(apiSpecId);
+            if (apiSpec.isEmpty()) {
+                var reason = "ApiSpec not found: " + apiSpecId;
+                coverage.add(failedTargetCoverage(apiSpecId, requestedCategories, reason));
+                warnings.add("FAILED_APISPEC: " + reason);
+                skipped += requestedCategories.size();
+                continue;
+            }
+            var outcome = generateSingleTarget(
+                taskId,
+                request.sessionId(),
+                promotionMode,
+                apiSpec.get(),
+                requestedCategories,
+                tokenBudget(request)
+            );
+            createdDraftIds.addAll(outcome.createdDraftIds());
+            generatedCategories.addAll(outcome.generatedCategories());
+            skippedCategories.putAll(outcome.skippedCategories());
+            unsupportedCategories.putAll(outcome.unsupportedCategories());
+            coverage.add(outcome.coverage());
+            warnings.addAll(outcome.warnings());
+            created += outcome.counts().created();
+            updated += outcome.counts().updated();
+            skipped += outcome.counts().skipped();
+            duplicateSuppressed += outcome.counts().duplicateSuppressed();
+        }
+
+        return new TestCaseGenerationResult(
+            taskId,
+            request.sessionId(),
+            request.generationMode(),
+            List.copyOf(targetApiSpecIds),
+            List.copyOf(createdDraftIds),
+            List.copyOf(generatedCategories),
+            Map.copyOf(skippedCategories),
+            Map.copyOf(unsupportedCategories),
+            List.copyOf(coverage),
+            warnings.stream().distinct().toList(),
+            new TestCaseGenerationCounts(created, updated, skipped, duplicateSuppressed)
+        );
+    }
+
+    private TargetCoverageSummary failedTargetCoverage(
+        String apiSpecId,
+        List<ScenarioCategory> requestedCategories,
+        String reason
+    ) {
+        var scenarios = requestedCategories.stream()
+            .map(category -> new ScenarioCoverage(category, CoverageStatus.FAILED, reason, null))
+            .toList();
+        return new TargetCoverageSummary(
+            apiSpecId,
+            CoverageStatus.FAILED,
+            scenarios,
+            List.of("FAILED_APISPEC: " + reason),
+            List.of(reason)
+        );
+    }
+
     private TestCaseGenerationResult incompleteSuiteResult(
         TestCaseGenerationRequest request,
         List<ApiSpec> apiSpecTargets,
@@ -323,8 +433,7 @@ public class TestCaseGenerationApplicationService {
         );
     }
 
-    private TestCaseGenerationResult incompleteResult(
-        TestCaseGenerationRequest request,
+    private SingleGenerationOutcome incompleteOutcome(
         ApiSpec apiSpec,
         List<ScenarioCategory> requestedCategories,
         List<String> diagnostics
@@ -340,22 +449,20 @@ public class TestCaseGenerationApplicationService {
         var warnings = diagnostics.stream()
             .map(diagnostic -> "INCOMPLETE_APISPEC: " + diagnostic)
             .toList();
-        return new TestCaseGenerationResult(
-            request.taskId(),
-            request.sessionId(),
-            request.generationMode(),
-            List.of(apiSpec.getApiSpecId()),
+        return new SingleGenerationOutcome(
+            apiSpec.getApiSpecId(),
+            List.of(),
             List.of(),
             List.of(),
             Map.of(),
             Map.of(),
-            List.of(new TargetCoverageSummary(
+            new TargetCoverageSummary(
                 apiSpec.getApiSpecId(),
                 CoverageStatus.INCOMPLETE,
                 coverage,
                 warnings,
                 diagnostics
-            )),
+            ),
             warnings,
             new TestCaseGenerationCounts(0, 0, requestedCategories.size(), 0)
         );
@@ -1258,6 +1365,19 @@ public class TestCaseGenerationApplicationService {
         List<ScenarioIntent> intents,
         Map<ScenarioCategory, String> skippedCategories,
         Map<ScenarioCategory, String> unsupportedCategories
+    ) {
+    }
+
+    private record SingleGenerationOutcome(
+        String apiSpecId,
+        List<String> createdDraftIds,
+        List<String> updatedDraftIds,
+        List<ScenarioCategory> generatedCategories,
+        Map<ScenarioCategory, String> skippedCategories,
+        Map<ScenarioCategory, String> unsupportedCategories,
+        TargetCoverageSummary coverage,
+        List<String> warnings,
+        TestCaseGenerationCounts counts
     ) {
     }
 

@@ -620,6 +620,64 @@ class TestCaseGenerationApplicationServiceTests {
         assertThat(drafts.findAll()).hasSize(1);
     }
 
+    @Test
+    void batchModeGeneratesPerApiSpecCoverageAndResumesWithoutDuplicates() {
+        var createOrder = apiSpecs.save(newApiSpec());
+        var readOrder = apiSpecs.save(newReadOrderApiSpec());
+        var incomplete = newMinimalApiSpec();
+        incomplete.setRouteReady(false);
+        incomplete = apiSpecs.save(incomplete);
+        var missingApiSpecId = "missing-api-spec-id";
+        var task = tasks.save(newTask(createOrder.getApiSpecId(), readOrder.getApiSpecId(), incomplete.getApiSpecId()));
+        var request = new TestCaseGenerationRequest(
+            task.getTaskId(),
+            "phase5-session-07-batch",
+            List.of(createOrder.getApiSpecId(), readOrder.getApiSpecId(), incomplete.getApiSpecId(), missingApiSpecId),
+            TestCaseGenerationMode.BATCH,
+            List.of(ScenarioCategory.HAPPY_PATH),
+            700
+        );
+
+        var first = generationService.generate(request);
+        var second = generationService.generate(request);
+
+        assertThat(first.generationMode()).isEqualTo(TestCaseGenerationMode.BATCH);
+        assertThat(first.targetApiSpecIds()).containsExactly(
+            createOrder.getApiSpecId(),
+            readOrder.getApiSpecId(),
+            incomplete.getApiSpecId(),
+            missingApiSpecId
+        );
+        assertThat(first.createdDraftIds()).hasSize(2);
+        assertThat(first.counts().created()).isEqualTo(2);
+        assertThat(first.counts().skipped()).isEqualTo(2);
+        assertThat(first.coverage()).extracting(TargetCoverageSummary::status)
+            .containsExactly(
+                CoverageStatus.GENERATED,
+                CoverageStatus.GENERATED,
+                CoverageStatus.INCOMPLETE,
+                CoverageStatus.FAILED
+            );
+        assertThat(first.coverage().get(2).diagnostics())
+            .anySatisfy(diagnostic -> assertThat(diagnostic).asString().contains("not ready"));
+        assertThat(first.coverage().get(3).diagnostics())
+            .containsExactly("ApiSpec not found: " + missingApiSpecId);
+        assertThat(first.warnings()).anySatisfy(warning -> assertThat(warning).asString().contains("FAILED_APISPEC"));
+
+        assertThat(second.createdDraftIds()).isEmpty();
+        assertThat(second.counts().created()).isZero();
+        assertThat(second.counts().duplicateSuppressed()).isEqualTo(2);
+        assertThat(second.counts().skipped()).isEqualTo(2);
+        assertThat(second.coverage()).extracting(TargetCoverageSummary::status)
+            .containsExactly(
+                CoverageStatus.SKIPPED,
+                CoverageStatus.SKIPPED,
+                CoverageStatus.INCOMPLETE,
+                CoverageStatus.FAILED
+            );
+        assertThat(drafts.findAll()).hasSize(2);
+    }
+
     private ApiSpec newApiSpec() {
         var apiSpec = new ApiSpec();
         apiSpec.setSystemName("order-platform");
