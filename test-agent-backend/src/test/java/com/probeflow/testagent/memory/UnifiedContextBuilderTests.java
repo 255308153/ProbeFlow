@@ -224,6 +224,179 @@ class UnifiedContextBuilderTests {
         assertThat(bundle.budget().requestedTokenBudget()).isEqualTo(200);
     }
 
+    @Test
+    void detectsConflictsBetweenKnowledgeAndMemoryAndPreservesBothSides() {
+        var apiSpec = apiSpecs.save(newApiSpec("/api/orders/{orderId}/pay", HttpMethod.POST));
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+
+        knowledgeIngest.ingest(new KnowledgeIngestRequest(
+            "Payment bootstrap rule",
+            KnowledgeContentFormat.MARKDOWN,
+            """
+                # Bootstrap rule
+
+                POST /api/orders/{orderId}/pay requires tenant bootstrap before payment auth.
+                """,
+            DocumentSourceType.WIKI,
+            "wiki/payment-bootstrap-rule.md",
+            DocumentType.API_NOTE,
+            DocumentAuthority.HIGH,
+            "order-platform",
+            "payment",
+            "order",
+            List.of("payment", "tenant", "auth"),
+            List.of("failure_analysis"),
+            Map.of()
+        ));
+
+        taskMemoryService.writeTaskMemory(new TaskMemoryWriteRequest(
+            task.getTaskId(),
+            MemoryScopeType.PROJECT_KNOWLEDGE,
+            "Task note says bootstrap is not required",
+            "Tenant bootstrap is not required before payment auth for this observed task path.",
+            List.of("payment", "tenant", "auth"),
+            MemorySourceType.OBSERVATION,
+            "task-conflict-1",
+            0.84f,
+            "failure_analysis",
+            Map.of("module", "payment", "apiPath", "/api/orders/{orderId}/pay"),
+            null
+        ));
+
+        var bundle = unifiedContextBuilder.build(new UnifiedContextQuery(
+            task.getTaskId(),
+            null,
+            apiSpec.getApiSpecId(),
+            null,
+            "failure_analysis",
+            "tenant bootstrap payment auth",
+            null,
+            null,
+            null,
+            null,
+            List.of("payment", "tenant", "auth"),
+            300
+        ));
+
+        assertThat(bundle.conflicts()).hasSize(1);
+        var conflict = bundle.conflicts().getFirst();
+        assertThat(conflict.conflictType()).isEqualTo("requirement-conflict");
+        assertThat(conflict.preferredSourceType()).isEqualTo("task_memory");
+        assertThat(conflict.knowledgeSide().sourceRef()).isEqualTo("wiki/payment-bootstrap-rule.md");
+        assertThat(conflict.memorySide().sourceRef()).isEqualTo("task-conflict-1");
+        assertThat(conflict.knowledgeSide().sourceId()).isNotBlank();
+        assertThat(conflict.memorySide().sourceId()).isNotBlank();
+    }
+
+    @Test
+    void prunesContextDeterministicallyByPriorityWhenBudgetIsTight() {
+        var apiSpec = apiSpecs.save(newApiSpec("/api/orders/{orderId}/pay", HttpMethod.POST));
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+
+        taskMemoryService.writeTaskMemory(new TaskMemoryWriteRequest(
+            task.getTaskId(),
+            MemoryScopeType.FAILURE_PATTERN,
+            "PAY_401 observed",
+            "Current task observed PAY_401 after skipping tenant bootstrap.",
+            List.of("payment", "tenant", "auth"),
+            MemorySourceType.OBSERVATION,
+            "task-prune-1",
+            0.93f,
+            "failure_analysis",
+            Map.of("module", "payment", "errorCode", "PAY_401"),
+            null
+        ));
+
+        sessionMemoryService.writeSessionMemory(new SessionMemoryWriteRequest(
+            "phase4-session-07",
+            MemoryScopeType.PREFERENCE,
+            "Very long session preference",
+            "Keep the analysis narrative extremely detailed with multiple historical notes and extra explanation that should be pruned first.",
+            List.of("report", "preference"),
+            MemorySourceType.USER_FEEDBACK,
+            "session-prune-1",
+            0.78f,
+            Map.of("module", "payment"),
+            3600L
+        ));
+
+        knowledgeIngest.ingest(new KnowledgeIngestRequest(
+            "Payment auth rule",
+            KnowledgeContentFormat.MARKDOWN,
+            """
+                # Rule
+
+                POST /api/orders/{orderId}/pay requires tenant bootstrap before pay.
+                """,
+            DocumentSourceType.WIKI,
+            "wiki/payment-auth-rule.md",
+            DocumentType.API_NOTE,
+            DocumentAuthority.HIGH,
+            "order-platform",
+            "payment",
+            "order",
+            List.of("payment", "tenant", "auth"),
+            List.of("failure_analysis"),
+            Map.of()
+        ));
+
+        memoryRefineryService.refine(new MemoryCandidateRequest(
+            "PAY_401 risk hint",
+            "PAY_401 means tenant bootstrap skipped.",
+            MemorySourceType.OBSERVATION,
+            "ltm-risk-1",
+            task.getTaskId(),
+            List.of("payment", "tenant", "auth"),
+            0.91f,
+            "PAY_401 failure pattern.",
+            Map.of(
+                "systemName", "order-platform",
+                "module", "payment",
+                "apiPath", "/api/orders/{orderId}/pay",
+                "errorCode", "PAY_401"
+            )
+        ));
+        memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Low-signal project note",
+            "General reminder for payment team documentation cleanup and naming consistency across several unrelated notes.",
+            MemorySourceType.MANUAL,
+            "ltm-risk-2",
+            task.getTaskId(),
+            List.of("payment"),
+            0.60f,
+            "Low-signal project knowledge note.",
+            Map.of(
+                "systemName", "order-platform",
+                "module", "payment",
+                "apiPath", "/api/orders/{orderId}/pay"
+            )
+        ));
+
+        var bundle = unifiedContextBuilder.build(new UnifiedContextQuery(
+            task.getTaskId(),
+            "phase4-session-07",
+            apiSpec.getApiSpecId(),
+            null,
+            "failure_analysis",
+            "payment auth tenant bootstrap",
+            null,
+            null,
+            null,
+            "PAY_401",
+            List.of("payment", "tenant", "auth"),
+            20
+        ));
+
+        assertThat(bundle.taskMemory()).hasSize(1);
+        assertThat(bundle.knowledgeContext().apiNotes()).hasSize(1);
+        assertThat(bundle.sessionContext()).isEmpty();
+        assertThat(bundle.longTermMemoryContext().hits()).extracting(LongTermMemoryRetrievalHit::scopeType)
+            .containsOnly(MemoryScopeType.FAILURE_PATTERN);
+        assertThat(bundle.budget().pruned()).isTrue();
+        assertThat(bundle.budget().originalEstimatedTokens()).isGreaterThan(bundle.budget().totalEstimatedTokens());
+        assertThat(bundle.budget().totalEstimatedTokens()).isLessThanOrEqualTo(bundle.budget().requestedTokenBudget());
+    }
+
     private Task newTask(String apiSpecId) {
         var task = new Task();
         task.setTaskType(TaskType.API_TEST);

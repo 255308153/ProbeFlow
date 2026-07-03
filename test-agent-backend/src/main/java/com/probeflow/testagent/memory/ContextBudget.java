@@ -7,6 +7,8 @@ public record ContextBudget(
     int taskMemoryTokens,
     int knowledgeTokens,
     int longTermMemoryTokens,
-    int totalEstimatedTokens
+    int totalEstimatedTokens,
+    int originalEstimatedTokens,
+    boolean pruned
 ) {
 }

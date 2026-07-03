@@ -13,6 +13,7 @@ public record ContextBundle(
     LongTermMemoryRetrievalResult longTermMemoryContext,
     Map<String, Object> constraints,
     List<ContextCitation> citations,
+    List<ContextConflict> conflicts,
     ContextCoverage coverage,
     ContextBudget budget
 ) {
