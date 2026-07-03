@@ -32,7 +32,7 @@ class Phase1BoundaryGuardTests {
     }
 
     @Test
-    void phase1BackendKeepsOnlyStorageFoundationPackages() throws Exception {
+    void backendKeepsStorageFoundationAndApiAnalysisPackagesOnly() throws Exception {
         var packageRoot = PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent");
         var immediatePackages = Files.list(packageRoot)
             .filter(Files::isDirectory)
@@ -40,6 +40,7 @@ class Phase1BoundaryGuardTests {
             .collect(Collectors.toSet());
 
         assertThat(immediatePackages).isEqualTo(Set.of(
+            "analysis",
             "apispec",
             "changelog",
             "executionrecord",
@@ -63,6 +64,10 @@ class Phase1BoundaryGuardTests {
             .filter(path -> path.toString().endsWith(".java"))
             .map(this::readUnchecked)
             .collect(Collectors.joining("\n"));
+        var controllerAnnotations = sourceText.lines()
+            .map(String::trim)
+            .filter(line -> line.startsWith("@RestController") || line.startsWith("@Controller"))
+            .toList();
 
         assertThat(pom)
             .doesNotContain("bun")
@@ -77,8 +82,6 @@ class Phase1BoundaryGuardTests {
         assertThat(sourceText)
             .doesNotContain("AGI-saber-java")
             .doesNotContain("ClaudeCode")
-            .doesNotContain("@RestController")
-            .doesNotContain("@Controller")
             .doesNotContain("WebDriver")
             .doesNotContain("Playwright")
             .doesNotContain("Milvus")
@@ -88,6 +91,7 @@ class Phase1BoundaryGuardTests {
             .doesNotContain("UnifiedContextBuilder")
             .doesNotContain("MemoryRefineryService")
             .doesNotContain("KnowledgeRetriever");
+        assertThat(controllerAnnotations).isEmpty();
     }
 
     private String readUnchecked(Path path) {
