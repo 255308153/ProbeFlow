@@ -13,6 +13,8 @@ record ScenarioIntent(
     List<String> validationHints,
     List<String> tags,
     String priorityHint,
-    String riskHint
+    String riskHint,
+    String constraintSource,
+    List<Map<String, Object>> contextCitations
 ) {
 }

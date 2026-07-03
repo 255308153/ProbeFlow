@@ -4,8 +4,14 @@ import com.probeflow.testagent.apispec.ApiSpec;
 import com.probeflow.testagent.apispec.ApiSpecRepository;
 import com.probeflow.testagent.apispec.HttpMethod;
 import com.probeflow.testagent.memory.ContextBundle;
+import com.probeflow.testagent.memory.ContextCitation;
+import com.probeflow.testagent.memory.LongTermMemoryRetrievalHit;
+import com.probeflow.testagent.memory.MemoryScopeType;
+import com.probeflow.testagent.memory.SessionMemoryView;
+import com.probeflow.testagent.memory.TaskMemoryView;
 import com.probeflow.testagent.memory.UnifiedContextBuilder;
 import com.probeflow.testagent.memory.UnifiedContextQuery;
+import com.probeflow.testagent.knowledge.KnowledgeContextEntry;
 import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.testcase.CaseSource;
 import com.probeflow.testagent.testcasedraft.DraftStatus;
@@ -72,7 +78,7 @@ public class TestCaseGenerationApplicationService {
             tokenBudget(request)
         ));
 
-        var plan = planScenarioIntents(apiSpec, requestedCategories);
+        var plan = planScenarioIntents(apiSpec, context, requestedCategories);
         var createdDraftIds = new ArrayList<String>();
         for (var intent : plan.intents()) {
             var draft = drafts.save(draftFromIntent(task.getTaskId(), task.getPromotionMode(), apiSpec, context, tokenBudget(request), intent));
@@ -87,6 +93,7 @@ public class TestCaseGenerationApplicationService {
             plan.intents().stream().map(ScenarioIntent::category).toList(),
             plan.skippedCategories(),
             plan.unsupportedCategories(),
+            warnings(context),
             new TestCaseGenerationCounts(createdDraftIds.size(), 0, plan.skippedCategories().size() + plan.unsupportedCategories().size(), 0)
         );
     }
@@ -164,24 +171,39 @@ public class TestCaseGenerationApplicationService {
         content.put("validationHints", intent.validationHints());
         content.put("priorityHint", intent.priorityHint());
         content.put("riskHint", intent.riskHint());
-        content.put("generationMetadata", Map.of(
-            "mode", TestCaseGenerationMode.SINGLE.name(),
-            "generator", "deterministic-baseline",
-            "stageProfile", STAGE_PROFILE,
-            "apiSpecVersion", apiSpec.getVersion(),
-            "contextBuilt", context.apiContext() != null,
-            "contextBudgetRequested", tokenBudget,
-            "source", CaseSource.STRUCTURE.name(),
-            "scenarioIntent", Map.of(
-                "category", intent.category().name(),
-                "intentKey", intent.intentKey(),
-                "expectedStatus", intent.expectedStatus()
-            )
-        ));
+        content.put("constraintSource", intent.constraintSource());
+        content.put("contextCitations", intent.contextCitations());
+        content.put("contextWarnings", warnings(context));
+        content.put("generationMetadata", generationMetadata(apiSpec, context, tokenBudget, intent));
         return content;
     }
 
-    private ScenarioPlan planScenarioIntents(ApiSpec apiSpec, List<ScenarioCategory> requestedCategories) {
+    private Map<String, Object> generationMetadata(
+        ApiSpec apiSpec,
+        ContextBundle context,
+        int tokenBudget,
+        ScenarioIntent intent
+    ) {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("mode", TestCaseGenerationMode.SINGLE.name());
+        metadata.put("generator", "deterministic-baseline");
+        metadata.put("stageProfile", STAGE_PROFILE);
+        metadata.put("apiSpecVersion", apiSpec.getVersion());
+        metadata.put("contextBuilt", context.apiContext() != null);
+        metadata.put("contextBudgetRequested", tokenBudget);
+        metadata.put("contextLowConfidence", context.coverage().lowConfidence());
+        metadata.put("contextConflictCount", context.conflicts().size());
+        metadata.put("constraintSource", intent.constraintSource());
+        metadata.put("source", CaseSource.STRUCTURE.name());
+        metadata.put("scenarioIntent", Map.of(
+            "category", intent.category().name(),
+            "intentKey", intent.intentKey(),
+            "expectedStatus", intent.expectedStatus()
+        ));
+        return metadata;
+    }
+
+    private ScenarioPlan planScenarioIntents(ApiSpec apiSpec, ContextBundle context, List<ScenarioCategory> requestedCategories) {
         var intents = new ArrayList<ScenarioIntent>();
         var skipped = new LinkedHashMap<ScenarioCategory, String>();
         var unsupported = new LinkedHashMap<ScenarioCategory, String>();
@@ -229,6 +251,32 @@ public class TestCaseGenerationApplicationService {
                         unsupported.put(category, "No role, permission, or scope hints are represented for this ApiSpec");
                     }
                 }
+                case BUSINESS_RULE -> {
+                    var entry = firstKnowledgeEntry(context);
+                    if (entry != null) {
+                        intents.add(businessRuleIntent(apiSpec, entry, context));
+                    } else {
+                        skipped.put(category, "No Knowledge context entries are available for business-rule planning");
+                    }
+                }
+                case HISTORICAL_FAILURE -> {
+                    var memory = firstFailureMemory(context);
+                    if (memory != null) {
+                        intents.add(historicalFailureIntent(apiSpec, memory, context));
+                    } else {
+                        skipped.put(category, "No failure-pattern memory is available for historical-failure planning");
+                    }
+                }
+                case REGRESSION_RISK -> {
+                    var memory = firstRegressionMemory(context);
+                    if (memory != null) {
+                        intents.add(regressionRiskIntent(apiSpec, memory, context));
+                    } else if (!context.knowledgeContext().incidentHints().isEmpty()) {
+                        intents.add(regressionRiskIntent(apiSpec, context.knowledgeContext().incidentHints().getFirst(), context));
+                    } else {
+                        skipped.put(category, "No Memory or incident context is available for regression-risk planning");
+                    }
+                }
             }
         }
 
@@ -250,7 +298,9 @@ public class TestCaseGenerationApplicationService {
             List.of("Expect a successful response body"),
             tags(apiSpec, ScenarioCategory.HAPPY_PATH),
             "P1",
-            "MEDIUM"
+            "MEDIUM",
+            "API_CONTRACT",
+            List.of()
         );
     }
 
@@ -271,7 +321,9 @@ public class TestCaseGenerationApplicationService {
             List.of("Required parameter should be validated before business processing", "Missing parameter: " + parameter.name()),
             tags(apiSpec, ScenarioCategory.MISSING_REQUIRED),
             "P1",
-            "HIGH"
+            "HIGH",
+            "API_CONTRACT",
+            List.of()
         );
     }
 
@@ -293,7 +345,9 @@ public class TestCaseGenerationApplicationService {
             List.of("Invalid value should produce a contract validation error", "Parameter under test: " + parameter.name()),
             tags(apiSpec, ScenarioCategory.INVALID_VALUE),
             "P1",
-            "HIGH"
+            "HIGH",
+            "API_CONTRACT",
+            List.of()
         );
     }
 
@@ -315,7 +369,9 @@ public class TestCaseGenerationApplicationService {
             List.of("Exercise min/max or length boundary from ApiSpec constraints", "Parameter under test: " + parameter.name()),
             tags(apiSpec, ScenarioCategory.BOUNDARY_VALUE),
             "P2",
-            "MEDIUM"
+            "MEDIUM",
+            "API_CONTRACT",
+            List.of()
         );
     }
 
@@ -332,7 +388,9 @@ public class TestCaseGenerationApplicationService {
             List.of("Authentication metadata should cause unauthenticated requests to be rejected"),
             tags(apiSpec, ScenarioCategory.AUTHENTICATION_FAILURE),
             "P1",
-            "HIGH"
+            "HIGH",
+            "API_CONTRACT",
+            List.of()
         );
     }
 
@@ -349,7 +407,102 @@ public class TestCaseGenerationApplicationService {
             List.of("Permission metadata should cause under-privileged requests to be rejected"),
             tags(apiSpec, ScenarioCategory.PERMISSION_FAILURE),
             "P1",
-            "HIGH"
+            "HIGH",
+            "API_CONTRACT",
+            List.of()
+        );
+    }
+
+    private ScenarioIntent businessRuleIntent(ApiSpec apiSpec, KnowledgeContextEntry entry, ContextBundle context) {
+        var shape = requestShape(apiSpec);
+        shape.put("contextRule", Map.of(
+            "sourceType", "knowledge",
+            "sourceId", entry.chunkId(),
+            "sourceRef", entry.sourceRef(),
+            "evidenceType", entry.evidenceType()
+        ));
+        return new ScenarioIntent(
+            ScenarioCategory.BUSINESS_RULE,
+            "business-rule-" + entry.chunkId(),
+            apiSpec.getHttpMethod() + " " + apiSpec.getPath() + " documented business rule",
+            "Verify documented behavior from Knowledge context: " + entry.title() + ".",
+            successStatus(apiSpec.getHttpMethod()),
+            shape,
+            List.of("Knowledge-derived business constraint should be reflected in the test plan", "Knowledge source: " + entry.sourceRef()),
+            tags(apiSpec, ScenarioCategory.BUSINESS_RULE),
+            "P2",
+            entry.lowConfidence() ? "MEDIUM" : "HIGH",
+            "KNOWLEDGE",
+            citationsByType(context, "knowledge_chunk")
+        );
+    }
+
+    private ScenarioIntent historicalFailureIntent(ApiSpec apiSpec, MemoryEvidence memory, ContextBundle context) {
+        var shape = requestShape(apiSpec);
+        shape.put("contextMemory", Map.of(
+            "sourceType", memory.sourceType(),
+            "sourceId", memory.sourceId(),
+            "sourceRef", memory.sourceRef()
+        ));
+        return new ScenarioIntent(
+            ScenarioCategory.HISTORICAL_FAILURE,
+            "historical-failure-" + memory.sourceId(),
+            apiSpec.getHttpMethod() + " " + apiSpec.getPath() + " historical failure guard",
+            "Verify the API covers known historical failure pattern: " + memory.summary() + ".",
+            400,
+            shape,
+            List.of("Memory-derived historical failure should remain covered", "Memory source: " + memory.sourceRef()),
+            tags(apiSpec, ScenarioCategory.HISTORICAL_FAILURE),
+            "P1",
+            "HIGH",
+            "MEMORY",
+            memoryCitations(context)
+        );
+    }
+
+    private ScenarioIntent regressionRiskIntent(ApiSpec apiSpec, MemoryEvidence memory, ContextBundle context) {
+        var shape = requestShape(apiSpec);
+        shape.put("contextMemory", Map.of(
+            "sourceType", memory.sourceType(),
+            "sourceId", memory.sourceId(),
+            "sourceRef", memory.sourceRef()
+        ));
+        return new ScenarioIntent(
+            ScenarioCategory.REGRESSION_RISK,
+            "regression-risk-" + memory.sourceId(),
+            apiSpec.getHttpMethod() + " " + apiSpec.getPath() + " regression risk",
+            "Verify the API preserves behavior related to remembered risk: " + memory.summary() + ".",
+            successStatus(apiSpec.getHttpMethod()),
+            shape,
+            List.of("Memory-derived regression risk should be reviewed before promotion", "Memory source: " + memory.sourceRef()),
+            tags(apiSpec, ScenarioCategory.REGRESSION_RISK),
+            "P2",
+            "MEDIUM",
+            "MEMORY",
+            memoryCitations(context)
+        );
+    }
+
+    private ScenarioIntent regressionRiskIntent(ApiSpec apiSpec, KnowledgeContextEntry entry, ContextBundle context) {
+        var shape = requestShape(apiSpec);
+        shape.put("contextIncident", Map.of(
+            "sourceType", "knowledge",
+            "sourceId", entry.chunkId(),
+            "sourceRef", entry.sourceRef()
+        ));
+        return new ScenarioIntent(
+            ScenarioCategory.REGRESSION_RISK,
+            "regression-risk-" + entry.chunkId(),
+            apiSpec.getHttpMethod() + " " + apiSpec.getPath() + " incident regression risk",
+            "Verify incident-derived risk from Knowledge context: " + entry.title() + ".",
+            successStatus(apiSpec.getHttpMethod()),
+            shape,
+            List.of("Incident context should be reviewed as regression coverage", "Knowledge source: " + entry.sourceRef()),
+            tags(apiSpec, ScenarioCategory.REGRESSION_RISK),
+            "P2",
+            "MEDIUM",
+            "KNOWLEDGE",
+            citationsByType(context, "knowledge_chunk")
         );
     }
 
@@ -371,6 +524,12 @@ public class TestCaseGenerationApplicationService {
         tags.add(apiSpec.getHttpMethod().name().toLowerCase(Locale.ROOT));
         if (category == ScenarioCategory.AUTHENTICATION_FAILURE || category == ScenarioCategory.PERMISSION_FAILURE) {
             tags.add("security");
+        }
+        if (category == ScenarioCategory.BUSINESS_RULE) {
+            tags.add("knowledge");
+        }
+        if (category == ScenarioCategory.HISTORICAL_FAILURE || category == ScenarioCategory.REGRESSION_RISK) {
+            tags.add("memory");
         }
         return List.copyOf(tags);
     }
@@ -396,12 +555,99 @@ public class TestCaseGenerationApplicationService {
     }
 
     private List<String> contextTags(ApiSpec apiSpec, List<ScenarioCategory> categories) {
-        var tags = new ArrayList<String>();
-        tags.add(apiSpec.getModuleName());
-        categories.stream()
-            .map(category -> category.name().toLowerCase(Locale.ROOT))
-            .forEach(tags::add);
-        return List.copyOf(tags);
+        return List.of(apiSpec.getModuleName());
+    }
+
+    private KnowledgeContextEntry firstKnowledgeEntry(ContextBundle context) {
+        if (!context.knowledgeContext().businessRules().isEmpty()) {
+            return context.knowledgeContext().businessRules().getFirst();
+        }
+        if (!context.knowledgeContext().apiNotes().isEmpty()) {
+            return context.knowledgeContext().apiNotes().getFirst();
+        }
+        if (!context.knowledgeContext().testSpecs().isEmpty()) {
+            return context.knowledgeContext().testSpecs().getFirst();
+        }
+        if (!context.knowledgeContext().errorCodeGuides().isEmpty()) {
+            return context.knowledgeContext().errorCodeGuides().getFirst();
+        }
+        return null;
+    }
+
+    private MemoryEvidence firstFailureMemory(ContextBundle context) {
+        for (var memory : context.taskMemory()) {
+            if (memory.scopeType() == MemoryScopeType.FAILURE_PATTERN) {
+                return MemoryEvidence.from(memory);
+            }
+        }
+        for (var hit : context.longTermMemoryContext().hits()) {
+            if (hit.scopeType() == MemoryScopeType.FAILURE_PATTERN) {
+                return MemoryEvidence.from(hit);
+            }
+        }
+        for (var memory : context.sessionContext()) {
+            if (memory.scopeType() == MemoryScopeType.FAILURE_PATTERN) {
+                return MemoryEvidence.from(memory);
+            }
+        }
+        return null;
+    }
+
+    private MemoryEvidence firstRegressionMemory(ContextBundle context) {
+        if (!context.taskMemory().isEmpty()) {
+            return MemoryEvidence.from(context.taskMemory().getFirst());
+        }
+        if (!context.longTermMemoryContext().hits().isEmpty()) {
+            return MemoryEvidence.from(context.longTermMemoryContext().hits().getFirst());
+        }
+        if (!context.sessionContext().isEmpty()) {
+            return MemoryEvidence.from(context.sessionContext().getFirst());
+        }
+        return null;
+    }
+
+    private List<String> warnings(ContextBundle context) {
+        var warnings = new ArrayList<String>();
+        if (context.coverage().lowConfidence()) {
+            warnings.add("LOW_CONFIDENCE_CONTEXT: generation used sparse or low-confidence context");
+        }
+        for (var conflict : context.conflicts()) {
+            warnings.add("CONTEXT_CONFLICT: "
+                + conflict.conflictType()
+                + " "
+                + conflict.conflictKey()
+                + " preferred="
+                + conflict.preferredSourceType());
+        }
+        return List.copyOf(warnings);
+    }
+
+    private List<Map<String, Object>> citationsByType(ContextBundle context, String citationType) {
+        return context.citations().stream()
+            .filter(citation -> citationType.equals(citation.citationType()))
+            .map(this::citationMap)
+            .toList();
+    }
+
+    private List<Map<String, Object>> memoryCitations(ContextBundle context) {
+        return context.citations().stream()
+            .filter(citation -> !"knowledge_chunk".equals(citation.citationType()))
+            .map(this::citationMap)
+            .toList();
+    }
+
+    private Map<String, Object> citationMap(ContextCitation citation) {
+        var map = new LinkedHashMap<String, Object>();
+        map.put("citationType", citation.citationType());
+        map.put("sourceId", citation.sourceId());
+        map.put("sourceRef", citation.sourceRef());
+        if (citation.confidence() != null) {
+            map.put("confidence", citation.confidence());
+        }
+        if (citation.score() != null) {
+            map.put("score", citation.score());
+        }
+        return map;
     }
 
     private List<ParameterRef> parameters(ApiSpec apiSpec) {
@@ -528,5 +774,19 @@ public class TestCaseGenerationApplicationService {
         Map<ScenarioCategory, String> skippedCategories,
         Map<ScenarioCategory, String> unsupportedCategories
     ) {
+    }
+
+    private record MemoryEvidence(String sourceType, String sourceId, String sourceRef, String summary) {
+        static MemoryEvidence from(TaskMemoryView memory) {
+            return new MemoryEvidence("task_memory", memory.memoryId(), memory.sourceRef(), memory.summary());
+        }
+
+        static MemoryEvidence from(SessionMemoryView memory) {
+            return new MemoryEvidence("session_memory", memory.memoryId(), memory.sourceRef(), memory.summary());
+        }
+
+        static MemoryEvidence from(LongTermMemoryRetrievalHit hit) {
+            return new MemoryEvidence("long_term_memory", hit.memoryId(), hit.sourceRef(), hit.summary());
+        }
     }
 }
