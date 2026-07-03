@@ -2,10 +2,13 @@ package com.probeflow.testagent.knowledge;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Locale;
 import java.util.regex.Pattern;
+import java.util.regex.Matcher;
 import org.springframework.stereotype.Component;
 
 @Component
@@ -15,6 +18,10 @@ public class KnowledgeChunkingService {
     static final int OVERLAP_TOKEN_COUNT = 20;
     private static final Pattern MARKDOWN_HEADING = Pattern.compile("^(#{1,6})\\s+(.+)$");
     private static final Pattern MARKDOWN_LIST = Pattern.compile("^(?:[-*+]\\s+|\\d+\\.\\s+).+");
+    private static final Pattern API_PATH = Pattern.compile("/(?:[A-Za-z0-9._~-]+|\\{[^}]+\\})(?:/(?:[A-Za-z0-9._~-]+|\\{[^}]+\\}))*");
+    private static final Pattern HTTP_METHOD = Pattern.compile("\\b(GET|POST|PUT|PATCH|DELETE)\\b", Pattern.CASE_INSENSITIVE);
+    private static final Pattern SYMBOLIC_ERROR_CODE = Pattern.compile("\\b[A-Z]{2,}_[A-Z0-9]{2,}\\b");
+    private static final Pattern NUMERIC_ERROR_CODE = Pattern.compile("\\b\\d{3,5}\\b");
 
     public List<KnowledgeChunk> chunk(
         String documentId,
@@ -36,9 +43,9 @@ public class KnowledgeChunkingService {
                 chunk.setChunkTitle(segment.title());
                 chunk.setChunkContent(segment.content());
                 chunk.setChunkOrder(order++);
-                chunk.setTags(request.tags());
-                chunk.setApplicableStages(request.applicableStages());
-                chunk.setMetadata(chunkMetadata(request.contentFormat(), segment));
+                chunk.setTags(enrichTags(request, segment));
+                chunk.setApplicableStages(enrichStages(request));
+                chunk.setMetadata(chunkMetadata(request, segment));
                 chunk.setTokenCount(estimateTokenCount(segment.content()));
                 chunk.setEmbedding(zeroEmbedding());
                 chunks.add(chunk);
@@ -231,14 +238,121 @@ public class KnowledgeChunkingService {
         return result;
     }
 
-    private Map<String, Object> chunkMetadata(KnowledgeContentFormat contentFormat, ChunkBlock block) {
+    private Map<String, Object> chunkMetadata(KnowledgeIngestRequest request, ChunkBlock block) {
         var metadata = new LinkedHashMap<String, Object>();
-        metadata.put("contentFormat", contentFormat.name());
-        metadata.put("chunkKind", block.kind().name());
-        metadata.put("headerPath", block.headerPath());
-        metadata.put("parentChunkId", null);
-        metadata.put("childChunkReady", true);
+        metadata.putAll(request.metadata());
+        metadata.putIfAbsent("contentFormat", request.contentFormat().name());
+        metadata.putIfAbsent("chunkKind", block.kind().name());
+        metadata.putIfAbsent("headerPath", block.headerPath());
+        metadata.putIfAbsent("parentChunkId", null);
+        metadata.putIfAbsent("childChunkReady", true);
+        metadata.putIfAbsent("apiPathHints", extractApiPathHints(block));
+        metadata.putIfAbsent("httpMethodHints", extractHttpMethodHints(block));
+        metadata.putIfAbsent("errorCodeHints", extractErrorCodeHints(block));
+        metadata.putIfAbsent("bizEntityHints", extractBizEntityHints(request, block));
+        metadata.putIfAbsent("docTypeTag", docTypeTag(request.documentType()));
+        metadata.putIfAbsent("keywordTags", extractKeywordTags(request, block));
         return metadata;
+    }
+
+    private List<String> enrichTags(KnowledgeIngestRequest request, ChunkBlock block) {
+        var tags = new LinkedHashSet<String>();
+        tags.addAll(request.tags());
+        tags.addAll(extractKeywordTags(request, block));
+        var docTypeTag = docTypeTag(request.documentType());
+        if (docTypeTag != null) {
+            tags.add(docTypeTag);
+        }
+        return tags.stream().sorted().toList();
+    }
+
+    private List<String> enrichStages(KnowledgeIngestRequest request) {
+        var stages = new LinkedHashSet<String>();
+        stages.addAll(request.applicableStages());
+        stages.addAll(defaultStages(request.documentType()));
+        return stages.stream().sorted().toList();
+    }
+
+    private List<String> extractApiPathHints(ChunkBlock block) {
+        return collectMatches(API_PATH, block.searchText());
+    }
+
+    private List<String> extractHttpMethodHints(ChunkBlock block) {
+        if (extractApiPathHints(block).isEmpty()) {
+            return List.of();
+        }
+        return collectMatches(HTTP_METHOD, block.searchText()).stream()
+            .map(value -> value.toUpperCase(Locale.ROOT))
+            .toList();
+    }
+
+    private List<String> extractErrorCodeHints(ChunkBlock block) {
+        var hints = new LinkedHashSet<String>();
+        hints.addAll(collectMatches(SYMBOLIC_ERROR_CODE, block.searchText()));
+        hints.addAll(collectMatches(NUMERIC_ERROR_CODE, block.searchText()));
+        return hints.stream().sorted().toList();
+    }
+
+    private List<String> extractBizEntityHints(KnowledgeIngestRequest request, ChunkBlock block) {
+        var hints = new LinkedHashSet<String>();
+        if (request.bizEntity() != null) {
+            hints.add(request.bizEntity());
+        }
+        var lower = block.searchText().toLowerCase(Locale.ROOT);
+        if (lower.contains("order")) {
+            hints.add("order");
+        }
+        if (lower.contains("payment")) {
+            hints.add("payment");
+        }
+        return hints.stream().sorted().toList();
+    }
+
+    private List<String> extractKeywordTags(KnowledgeIngestRequest request, ChunkBlock block) {
+        var tags = new LinkedHashSet<String>();
+        var lower = (request.title() + "\n" + block.searchText()).toLowerCase(Locale.ROOT);
+        addTagWhen(tags, lower.contains("auth") || lower.contains("signature") || lower.contains("token"), "auth");
+        addTagWhen(tags, lower.contains("payment") || lower.contains("/pay"), "payment");
+        addTagWhen(tags, lower.contains("order"), "order");
+        addTagWhen(tags, lower.contains("risk"), "risk");
+        addTagWhen(tags, !extractErrorCodeHints(block).isEmpty() || request.documentType() == DocumentType.ERROR_CODE_GUIDE, "error-code");
+        addTagWhen(tags, request.documentType() == DocumentType.TEST_SPEC, "test-spec");
+        return tags.stream().sorted().toList();
+    }
+
+    private void addTagWhen(LinkedHashSet<String> tags, boolean condition, String tag) {
+        if (condition) {
+            tags.add(tag);
+        }
+    }
+
+    private List<String> defaultStages(DocumentType documentType) {
+        return switch (documentType) {
+            case BUSINESS_FLOW, API_NOTE, DOMAIN_RULE -> List.of("api_analysis", "case_generation");
+            case TEST_SPEC -> List.of("case_generation");
+            case ENV_GUIDE, ERROR_CODE_GUIDE, INCIDENT_POSTMORTEM -> List.of("failure_analysis");
+        };
+    }
+
+    private String docTypeTag(DocumentType documentType) {
+        return switch (documentType) {
+            case ERROR_CODE_GUIDE -> "error-code";
+            case TEST_SPEC -> "test-spec";
+            case ENV_GUIDE -> "env-guide";
+            case INCIDENT_POSTMORTEM -> "incident";
+            case BUSINESS_FLOW -> "business-flow";
+            case API_NOTE -> "api-note";
+            case DOMAIN_RULE -> "domain-rule";
+        };
+    }
+
+    private List<String> collectMatches(Pattern pattern, String input) {
+        var matches = new LinkedHashSet<String>();
+        var matcher = pattern.matcher(input);
+        while (matcher.find()) {
+            matches.add(matcher.group());
+        }
+        return matches.stream().sorted().toList();
     }
 
     private int estimateTokenCount(String content) {
@@ -334,6 +448,10 @@ public class KnowledgeChunkingService {
     ) {
         private ChunkBlock withContent(String nextContent) {
             return new ChunkBlock(kind, title, nextContent, headerPath);
+        }
+
+        private String searchText() {
+            return String.join("\n", headerPath) + "\n" + content;
         }
     }
 }

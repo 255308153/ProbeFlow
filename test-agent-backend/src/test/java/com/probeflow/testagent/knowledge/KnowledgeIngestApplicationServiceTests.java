@@ -102,8 +102,8 @@ class KnowledgeIngestApplicationServiceTests {
             assertThat(chunk.getChunkStatus()).isEqualTo(ChunkStatus.ACTIVE);
             assertThat(chunk.getChunkTitle()).isEqualTo("Payment rules");
             assertThat(chunk.getTokenCount()).isPositive();
-            assertThat(chunk.getTags()).containsExactly("business-rule", "payment");
-            assertThat(chunk.getApplicableStages()).containsExactly("case_generation", "failure_analysis");
+            assertThat(chunk.getTags()).contains("business-rule", "payment");
+            assertThat(chunk.getApplicableStages()).contains("case_generation", "failure_analysis");
             assertThat(chunk.getMetadata())
                 .containsEntry("contentFormat", "MARKDOWN")
                 .containsEntry("headerPath", List.of("Payment rules"))
@@ -283,8 +283,8 @@ class KnowledgeIngestApplicationServiceTests {
         assertThat(storedChunks).allSatisfy(chunk -> {
             assertThat(chunk.getChunkStatus()).isEqualTo(ChunkStatus.ACTIVE);
             assertThat(chunk.getTokenCount()).isPositive();
-            assertThat(chunk.getTags()).containsExactly("auth", "payment");
-            assertThat(chunk.getApplicableStages()).containsExactly("api_analysis", "case_generation");
+            assertThat(chunk.getTags()).contains("auth", "payment");
+            assertThat(chunk.getApplicableStages()).contains("api_analysis", "case_generation");
             assertThat(chunk.getMetadata()).containsEntry("parentChunkId", null);
         });
         assertThat(storedChunks).anySatisfy(chunk -> {
@@ -370,6 +370,54 @@ class KnowledgeIngestApplicationServiceTests {
         assertThat(fallbackChunks.getFirst().getTokenCount()).isLessThanOrEqualTo(140);
         assertThat(fallbackChunks.get(1).getChunkContent())
             .startsWith(lastWords(fallbackChunks.getFirst().getChunkContent(), 20));
+    }
+
+    @Test
+    void metadataEnrichmentPreservesExplicitHintsAndAddsDerivedRetrievalSignals() {
+        var request = new KnowledgeIngestRequest(
+            "Payment failure guide",
+            KnowledgeContentFormat.MARKDOWN,
+            """
+                # Payment auth risk
+
+                POST /api/orders/{orderId}/pay returns PAY_401 when signature is invalid.
+                """,
+            DocumentSourceType.WIKI,
+            "wiki/payment-failure-guide.md",
+            DocumentType.ERROR_CODE_GUIDE,
+            DocumentAuthority.HIGH,
+            "order-platform",
+            "payment",
+            "order",
+            List.of("custom-tag"),
+            List.of("api_analysis"),
+            Map.of(
+                "apiPathHints", List.of("/manual/path"),
+                "httpMethodHints", List.of("PATCH"),
+                "errorCodeHints", List.of("PAY_MANUAL")
+            )
+        );
+
+        var result = knowledgeIngest.ingest(request);
+
+        entityManager.flush();
+        entityManager.clear();
+
+        var storedChunks = chunks.findByDocumentRevisionIdOrderByChunkOrderAsc(result.documentRevisionId());
+
+        assertThat(storedChunks).hasSize(1);
+        assertThat(storedChunks.getFirst().getTags())
+            .contains("custom-tag", "payment", "order", "auth", "risk", "error-code");
+        assertThat(storedChunks.getFirst().getApplicableStages())
+            .contains("api_analysis", "failure_analysis");
+        assertThat(storedChunks.getFirst().getMetadata())
+            .containsEntry("apiPathHints", List.of("/manual/path"))
+            .containsEntry("httpMethodHints", List.of("PATCH"))
+            .containsEntry("errorCodeHints", List.of("PAY_MANUAL"))
+            .containsEntry("docTypeTag", "error-code")
+            .containsEntry("keywordTags", List.of("auth", "error-code", "order", "payment", "risk"));
+        assertThat((List<String>) storedChunks.getFirst().getMetadata().get("bizEntityHints"))
+            .contains("order");
     }
 
     private KnowledgeIngestRequest baseRequest(String title, String content) {
