@@ -282,6 +282,47 @@ class ApiAnalysisApplicationServiceTests {
     }
 
     @Test
+    void swaggerTwoInputIsExplicitlyRejectedUntilConversionIsSupported() throws Exception {
+        var swaggerFile = tempDir.resolve("swagger-2.yaml");
+        Files.writeString(swaggerFile, """
+            swagger: "2.0"
+            info:
+              title: Legacy Orders
+              version: "1.0"
+            paths:
+              /api/orders:
+                get:
+                  operationId: listOrders
+                  responses:
+                    "200":
+                      description: OK
+            """);
+
+        var result = apiAnalysis.analyze(ApiAnalysisRequest.createMaterial(
+            MaterialType.SWAGGER_FILE,
+            "swagger-2.yaml",
+            swaggerFile.toString(),
+            swaggerFile.toString(),
+            "tester"
+        ));
+
+        assertThat(result.succeeded()).isFalse();
+        assertThat(result.parserRoute()).isEqualTo("swagger");
+        assertThat(result.errorCode()).isEqualTo("SWAGGER_UNSUPPORTED");
+
+        var material = sourceMaterials.findById(result.materialId()).orElseThrow();
+        assertThat(material.getIngestStatus()).isEqualTo(IngestStatus.FAILED);
+
+        var task = tasks.findById(result.taskId()).orElseThrow();
+        assertThat(task.getStatus()).isEqualTo(TaskStatus.FAILED);
+        assertThat(task.getMetadata()).containsEntry("errorCode", "SWAGGER_UNSUPPORTED");
+        assertThat(planSteps.findByTaskIdOrderByStepOrderAsc(result.taskId()))
+            .extracting(step -> step.getStepStatus())
+            .containsExactly(PlanStepStatus.SUCCESS, PlanStepStatus.SUCCESS, PlanStepStatus.FAILED);
+        assertThat(apiSpecs.count()).isZero();
+    }
+
+    @Test
     void invalidMaterialPathFailsWithoutCreatingApiSpecs() {
         var missingFile = tempDir.resolve("missing.yaml");
 

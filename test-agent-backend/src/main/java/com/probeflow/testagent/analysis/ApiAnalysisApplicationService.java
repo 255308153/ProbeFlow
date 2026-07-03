@@ -97,6 +97,9 @@ public class ApiAnalysisApplicationService {
         if (material.getMaterialType() == MaterialType.OPENAPI_FILE) {
             return analyzeOpenApi(material, task, route);
         }
+        if (material.getMaterialType() == MaterialType.SWAGGER_FILE) {
+            return rejectUnsupportedSwagger(material, task, route);
+        }
 
         task.setStatus(TaskStatus.COMPLETED);
         task.setMetadata(Map.of("parserRoute", route, "apiSpecCount", 0));
@@ -107,6 +110,13 @@ public class ApiAnalysisApplicationService {
         sourceMaterials.save(material);
 
         return ApiAnalysisResult.success(material.getMaterialId(), task.getTaskId(), route, List.of());
+    }
+
+    private ApiAnalysisResult rejectUnsupportedSwagger(SourceMaterial material, Task task, String route) {
+        var swaggerStep = createStep(task.getTaskId(), 3, "Reject unsupported Swagger input", material.getStoragePath());
+        var message = "Swagger 2.x input is not supported by API analysis yet";
+        failStep(swaggerStep, "SWAGGER_UNSUPPORTED", message);
+        return failAnalysis(material, task, route, "SWAGGER_UNSUPPORTED", message);
     }
 
     private ApiAnalysisResult analyzeOpenApi(SourceMaterial material, Task task, String route) {
@@ -649,10 +659,13 @@ public class ApiAnalysisApplicationService {
         String errorMessage
     ) {
         task.setStatus(TaskStatus.FAILED);
-        task.setMetadata(Map.of(
-            "errorCode", errorCode,
-            "errorMessage", errorMessage
-        ));
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("errorCode", errorCode);
+        metadata.put("errorMessage", errorMessage);
+        if (parserRoute != null) {
+            metadata.put("parserRoute", parserRoute);
+        }
+        task.setMetadata(metadata);
         tasks.save(task);
 
         material.setIngestStatus(IngestStatus.FAILED);
