@@ -48,14 +48,16 @@ public class ApiAnalysisApplicationService {
         SourceMaterialRepository sourceMaterials,
         ApiSpecRepository apiSpecs,
         TaskRepository tasks,
-        PlanStepRepository planSteps
+        PlanStepRepository planSteps,
+        SpringSourceAnalyzer springSourceAnalyzer,
+        OpenApiSourceAnalyzer openApiSourceAnalyzer
     ) {
         this.sourceMaterials = sourceMaterials;
         this.apiSpecs = apiSpecs;
         this.tasks = tasks;
         this.planSteps = planSteps;
-        this.springSourceAnalyzer = new SpringSourceAnalyzer();
-        this.openApiSourceAnalyzer = new OpenApiSourceAnalyzer();
+        this.springSourceAnalyzer = springSourceAnalyzer;
+        this.openApiSourceAnalyzer = openApiSourceAnalyzer;
     }
 
     @Transactional

@@ -15,7 +15,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import org.springframework.stereotype.Component;
 
+@Component
 class OpenApiSourceAnalyzer {
 
     OpenApiParseOutcome analyze(String storagePath) {
