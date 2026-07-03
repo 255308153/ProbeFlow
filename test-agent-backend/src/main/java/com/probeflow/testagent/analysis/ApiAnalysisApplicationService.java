@@ -1,5 +1,9 @@
 package com.probeflow.testagent.analysis;
 
+import com.probeflow.testagent.apispec.ApiSpec;
+import com.probeflow.testagent.apispec.ApiSpecRepository;
+import com.probeflow.testagent.apispec.ApiSpecSourceType;
+import com.probeflow.testagent.apispec.HttpMethod;
 import com.probeflow.testagent.sourcematerial.IngestStatus;
 import com.probeflow.testagent.sourcematerial.MaterialType;
 import com.probeflow.testagent.sourcematerial.SourceMaterial;
@@ -19,9 +23,19 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import io.swagger.v3.oas.models.OpenAPI;
+import io.swagger.v3.oas.models.Operation;
+import io.swagger.v3.oas.models.PathItem;
+import io.swagger.v3.oas.models.media.Schema;
+import io.swagger.v3.oas.models.parameters.Parameter;
+import io.swagger.v3.oas.models.security.SecurityRequirement;
+import io.swagger.v3.parser.OpenAPIV3Parser;
+import io.swagger.v3.parser.core.models.ParseOptions;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -29,15 +43,18 @@ import org.springframework.transaction.annotation.Transactional;
 public class ApiAnalysisApplicationService {
 
     private final SourceMaterialRepository sourceMaterials;
+    private final ApiSpecRepository apiSpecs;
     private final TaskRepository tasks;
     private final PlanStepRepository planSteps;
 
     public ApiAnalysisApplicationService(
         SourceMaterialRepository sourceMaterials,
+        ApiSpecRepository apiSpecs,
         TaskRepository tasks,
         PlanStepRepository planSteps
     ) {
         this.sourceMaterials = sourceMaterials;
+        this.apiSpecs = apiSpecs;
         this.tasks = tasks;
         this.planSteps = planSteps;
     }
@@ -76,6 +93,10 @@ public class ApiAnalysisApplicationService {
         }
 
         succeedStep(routeStep, "Parser route: " + route);
+        if (material.getMaterialType() == MaterialType.OPENAPI_FILE) {
+            return analyzeOpenApi(material, task, route);
+        }
+
         task.setStatus(TaskStatus.COMPLETED);
         task.setMetadata(Map.of("parserRoute", route, "apiSpecCount", 0));
         task.setTargetApiSpecIds(List.of());
@@ -85,6 +106,126 @@ public class ApiAnalysisApplicationService {
         sourceMaterials.save(material);
 
         return ApiAnalysisResult.success(material.getMaterialId(), task.getTaskId(), route, List.of());
+    }
+
+    private ApiAnalysisResult analyzeOpenApi(SourceMaterial material, Task task, String route) {
+        var parseStep = createStep(task.getTaskId(), 3, "Parse OpenAPI document", material.getStoragePath());
+        var mergeStep = createStep(task.getTaskId(), 4, "Persist ApiSpec operations", material.getMaterialId());
+
+        var parseResult = parseOpenApi(material.getStoragePath());
+        if (!parseResult.succeeded()) {
+            failStep(parseStep, parseResult.errorCode(), parseResult.errorMessage());
+            skipStep(mergeStep, "OpenAPI parse failed");
+            return failAnalysis(material, task, route, parseResult.errorCode(), parseResult.errorMessage());
+        }
+        succeedStep(parseStep, "Parsed OpenAPI operations: " + parseResult.operations().size());
+
+        var savedSpecs = new ArrayList<ApiSpec>();
+        for (var operation : parseResult.operations()) {
+            var apiSpec = toApiSpec(material, parseResult.systemName(), operation);
+            savedSpecs.add(apiSpecs.save(apiSpec));
+        }
+        var apiSpecIds = savedSpecs.stream().map(ApiSpec::getApiSpecId).toList();
+        succeedStep(mergeStep, "Persisted ApiSpec operations: " + apiSpecIds.size());
+
+        task.setStatus(TaskStatus.COMPLETED);
+        task.setTargetApiSpecIds(apiSpecIds);
+        task.setMetadata(Map.of("parserRoute", route, "apiSpecCount", apiSpecIds.size()));
+        tasks.save(task);
+
+        material.setIngestStatus(IngestStatus.READY);
+        sourceMaterials.save(material);
+
+        return ApiAnalysisResult.success(material.getMaterialId(), task.getTaskId(), route, apiSpecIds);
+    }
+
+    private OpenApiParseOutcome parseOpenApi(String storagePath) {
+        var options = new ParseOptions();
+        options.setResolve(true);
+        options.setResolveFully(true);
+
+        var parseResult = new OpenAPIV3Parser().readLocation(storagePath, null, options);
+        var openApi = parseResult.getOpenAPI();
+        if (openApi == null) {
+            var message = parseResult.getMessages() == null || parseResult.getMessages().isEmpty()
+                ? "OpenAPI document could not be parsed"
+                : String.join("; ", parseResult.getMessages());
+            return OpenApiParseOutcome.failure("OPENAPI_PARSE_FAILED", message);
+        }
+
+        var operations = new ArrayList<ParsedOpenApiOperation>();
+        if (openApi.getPaths() != null) {
+            openApi.getPaths().forEach((path, pathItem) -> {
+                if (pathItem != null) {
+                    pathItem.readOperationsMap().forEach((method, operation) -> {
+                        var httpMethod = toHttpMethod(method);
+                        if (httpMethod != null && operation != null) {
+                            operations.add(toParsedOperation(openApi, normalizePath(path), httpMethod, operation));
+                        }
+                    });
+                }
+            });
+        }
+
+        return OpenApiParseOutcome.success(systemName(openApi), operations);
+    }
+
+    private ParsedOpenApiOperation toParsedOperation(
+        OpenAPI openApi,
+        String path,
+        HttpMethod method,
+        Operation operation
+    ) {
+        var parameters = new LinkedHashMap<String, Object>();
+        var constraints = new LinkedHashMap<String, Object>();
+
+        groupParameters(operation.getParameters(), parameters, constraints);
+        putRequestBody(operation, parameters, constraints);
+        putResponses(operation, parameters, constraints);
+
+        var auth = authHints(openApi, operation);
+        var module = operation.getTags() == null || operation.getTags().isEmpty() ? "default" : operation.getTags().getFirst();
+        return new ParsedOpenApiOperation(
+            method,
+            path,
+            module,
+            operation.getSummary(),
+            operation.getDescription(),
+            operation.getOperationId(),
+            parameters,
+            constraints,
+            auth
+        );
+    }
+
+    private ApiSpec toApiSpec(SourceMaterial material, String systemName, ParsedOpenApiOperation operation) {
+        var apiSpec = new ApiSpec();
+        apiSpec.setSystemName(systemName);
+        apiSpec.setModuleName(operation.moduleName());
+        apiSpec.setHttpMethod(operation.httpMethod());
+        apiSpec.setPath(operation.path());
+        apiSpec.setSummary(operation.summary());
+        apiSpec.setDescription(operation.description());
+        apiSpec.setOperationId(operation.operationId());
+        apiSpec.setParameters(operation.parameters());
+        apiSpec.setConstraints(operation.constraints());
+        apiSpec.setAuth(operation.auth());
+        apiSpec.setSourceType(ApiSpecSourceType.OPENAPI);
+        apiSpec.setSourceMaterialId(material.getMaterialId());
+        apiSpec.setSourceRef("openapi://" + material.getMaterialId() + "#/paths/" + jsonPointerPath(operation.path()) + "/" + operation.httpMethod().name().toLowerCase());
+        apiSpec.setSourceLocation(Map.of(
+            "materialId", material.getMaterialId(),
+            "path", operation.path(),
+            "method", operation.httpMethod().name()
+        ));
+        apiSpec.setVersion(1);
+        apiSpec.setRouteReady(true);
+        apiSpec.setBasicParamReady(true);
+        apiSpec.setDtoExpanded(true);
+        apiSpec.setValidationReady(true);
+        apiSpec.setAuthReady(true);
+        apiSpec.setKnowledgeContextReady(false);
+        return apiSpec;
     }
 
     private SourceMaterial resolveMaterial(ApiAnalysisRequest request) {
@@ -175,6 +316,216 @@ public class ApiAnalysisApplicationService {
         };
     }
 
+    private HttpMethod toHttpMethod(PathItem.HttpMethod method) {
+        return switch (method) {
+            case GET -> HttpMethod.GET;
+            case POST -> HttpMethod.POST;
+            case PUT -> HttpMethod.PUT;
+            case DELETE -> HttpMethod.DELETE;
+            case PATCH -> HttpMethod.PATCH;
+            case HEAD, OPTIONS, TRACE -> null;
+        };
+    }
+
+    private String systemName(OpenAPI openApi) {
+        if (openApi.getInfo() != null && openApi.getInfo().getTitle() != null && !openApi.getInfo().getTitle().isBlank()) {
+            return openApi.getInfo().getTitle();
+        }
+        return "default-system";
+    }
+
+    private String normalizePath(String path) {
+        if (path == null || path.isBlank()) {
+            return "/";
+        }
+        var normalized = path.trim().replaceAll("/{2,}", "/");
+        return normalized.startsWith("/") ? normalized : "/" + normalized;
+    }
+
+    private String jsonPointerPath(String path) {
+        return path.replace("~", "~0").replace("/", "~1");
+    }
+
+    private void groupParameters(
+        List<Parameter> openApiParameters,
+        Map<String, Object> parameters,
+        Map<String, Object> constraints
+    ) {
+        if (openApiParameters == null) {
+            return;
+        }
+
+        for (var parameter : openApiParameters) {
+            if (parameter == null || parameter.getIn() == null || parameter.getName() == null) {
+                continue;
+            }
+            @SuppressWarnings("unchecked")
+            var bucket = (List<Map<String, Object>>) parameters.computeIfAbsent(parameter.getIn(), ignored -> new ArrayList<Map<String, Object>>());
+            var parameterShape = new LinkedHashMap<String, Object>();
+            parameterShape.put("name", parameter.getName());
+            parameterShape.put("required", Boolean.TRUE.equals(parameter.getRequired()));
+            parameterShape.put("schema", schemaShape(parameter.getSchema()));
+            bucket.add(parameterShape);
+
+            if (Boolean.TRUE.equals(parameter.getRequired())) {
+                requiredList(constraints).add(parameter.getIn() + "." + parameter.getName());
+            }
+            collectSchemaConstraints(parameter.getName(), parameter.getSchema(), constraints);
+        }
+    }
+
+    private void putRequestBody(
+        Operation operation,
+        Map<String, Object> parameters,
+        Map<String, Object> constraints
+    ) {
+        if (operation.getRequestBody() == null || operation.getRequestBody().getContent() == null) {
+            return;
+        }
+
+        var body = new LinkedHashMap<String, Object>();
+        body.put("required", Boolean.TRUE.equals(operation.getRequestBody().getRequired()));
+        body.put("content", contentShape(operation.getRequestBody().getContent().values()));
+        parameters.put("requestBody", body);
+        operation.getRequestBody().getContent().values().stream()
+            .filter(Objects::nonNull)
+            .map(mediaType -> mediaType.getSchema())
+            .forEach(schema -> collectSchemaConstraints("requestBody", schema, constraints));
+    }
+
+    private void putResponses(
+        Operation operation,
+        Map<String, Object> parameters,
+        Map<String, Object> constraints
+    ) {
+        if (operation.getResponses() == null) {
+            return;
+        }
+
+        var responses = new LinkedHashMap<String, Object>();
+        operation.getResponses().forEach((status, response) -> {
+            var responseShape = new LinkedHashMap<String, Object>();
+            responseShape.put("description", response.getDescription());
+            if (response.getContent() != null) {
+                responseShape.put("content", contentShape(response.getContent().values()));
+                response.getContent().values().stream()
+                    .filter(Objects::nonNull)
+                    .map(mediaType -> mediaType.getSchema())
+                    .forEach(schema -> collectSchemaConstraints("response." + status, schema, constraints));
+            }
+            responses.put(status, responseShape);
+        });
+        parameters.put("responses", responses);
+    }
+
+    private List<Map<String, Object>> contentShape(Collection<io.swagger.v3.oas.models.media.MediaType> mediaTypes) {
+        return mediaTypes.stream()
+            .filter(Objects::nonNull)
+            .<Map<String, Object>>map(mediaType -> {
+                var shape = new LinkedHashMap<String, Object>();
+                shape.put("schema", schemaShape(mediaType.getSchema()));
+                return shape;
+            })
+            .toList();
+    }
+
+    private Map<String, Object> schemaShape(Schema<?> schema) {
+        var shape = new LinkedHashMap<String, Object>();
+        if (schema == null) {
+            return shape;
+        }
+        if (schema.getName() != null) {
+            shape.put("name", schema.getName());
+        }
+        if (schema.get$ref() != null) {
+            shape.put("ref", schema.get$ref());
+        }
+        if (schema.getType() != null) {
+            shape.put("type", schema.getType());
+        }
+        if (schema.getFormat() != null) {
+            shape.put("format", schema.getFormat());
+        }
+        if (schema.getDescription() != null) {
+            shape.put("description", schema.getDescription());
+        }
+        if (schema.getEnum() != null && !schema.getEnum().isEmpty()) {
+            shape.put("enum", schema.getEnum());
+        }
+        if (schema.getRequired() != null && !schema.getRequired().isEmpty()) {
+            shape.put("required", schema.getRequired());
+        }
+        if (schema.getProperties() != null && !schema.getProperties().isEmpty()) {
+            var properties = new LinkedHashMap<String, Object>();
+            schema.getProperties().forEach((name, propertySchema) -> properties.put(name, schemaShape((Schema<?>) propertySchema)));
+            shape.put("properties", properties);
+        }
+        return shape;
+    }
+
+    private void collectSchemaConstraints(String prefix, Schema<?> schema, Map<String, Object> constraints) {
+        if (schema == null) {
+            return;
+        }
+        if (schema.getRequired() != null && !schema.getRequired().isEmpty()) {
+            schema.getRequired().forEach(field -> requiredList(constraints).add(prefix + "." + field));
+        }
+        if (schema.getEnum() != null && !schema.getEnum().isEmpty()) {
+            enumsMap(constraints).put(prefix, schema.getEnum());
+        }
+        if (schema.getMinimum() != null || schema.getMaximum() != null || schema.getMinLength() != null || schema.getMaxLength() != null || schema.getPattern() != null) {
+            var validation = new LinkedHashMap<String, Object>();
+            putIfPresent(validation, "minimum", schema.getMinimum());
+            putIfPresent(validation, "maximum", schema.getMaximum());
+            putIfPresent(validation, "minLength", schema.getMinLength());
+            putIfPresent(validation, "maxLength", schema.getMaxLength());
+            putIfPresent(validation, "pattern", schema.getPattern());
+            validationsMap(constraints).put(prefix, validation);
+        }
+        if (schema.getProperties() != null) {
+            schema.getProperties().forEach((name, propertySchema) -> collectSchemaConstraints(prefix + "." + name, (Schema<?>) propertySchema, constraints));
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> requiredList(Map<String, Object> constraints) {
+        return (List<String>) constraints.computeIfAbsent("required", ignored -> new ArrayList<String>());
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> enumsMap(Map<String, Object> constraints) {
+        return (Map<String, Object>) constraints.computeIfAbsent("enums", ignored -> new LinkedHashMap<String, Object>());
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> validationsMap(Map<String, Object> constraints) {
+        return (Map<String, Object>) constraints.computeIfAbsent("validations", ignored -> new LinkedHashMap<String, Object>());
+    }
+
+    private Map<String, Object> authHints(OpenAPI openApi, Operation operation) {
+        var requirements = operation.getSecurity();
+        if (requirements == null) {
+            requirements = openApi.getSecurity();
+        }
+
+        var auth = new LinkedHashMap<String, Object>();
+        auth.put("required", requirements != null && !requirements.isEmpty());
+        if (requirements != null && !requirements.isEmpty()) {
+            auth.put("schemes", requirements.stream()
+                .flatMap(requirement -> requirement.keySet().stream())
+                .distinct()
+                .toList());
+            auth.put("requirements", requirements.stream().map(SecurityRequirement::keySet).map(List::copyOf).toList());
+        }
+        return auth;
+    }
+
+    private void putIfPresent(Map<String, Object> map, String key, Object value) {
+        if (value != null) {
+            map.put(key, value);
+        }
+    }
+
     private void succeedStep(PlanStep step, String detail) {
         step.setStepStatus(PlanStepStatus.SUCCESS);
         step.setInputRef(detail);
@@ -225,5 +576,35 @@ public class ApiAnalysisApplicationService {
         static MaterialValidation invalid(String errorCode, String errorMessage) {
             return new MaterialValidation(false, errorCode, errorMessage);
         }
+    }
+
+    private record OpenApiParseOutcome(
+        boolean succeeded,
+        String systemName,
+        List<ParsedOpenApiOperation> operations,
+        String errorCode,
+        String errorMessage
+    ) {
+
+        static OpenApiParseOutcome success(String systemName, List<ParsedOpenApiOperation> operations) {
+            return new OpenApiParseOutcome(true, systemName, List.copyOf(operations), null, null);
+        }
+
+        static OpenApiParseOutcome failure(String errorCode, String errorMessage) {
+            return new OpenApiParseOutcome(false, null, List.of(), errorCode, errorMessage);
+        }
+    }
+
+    private record ParsedOpenApiOperation(
+        HttpMethod httpMethod,
+        String path,
+        String moduleName,
+        String summary,
+        String description,
+        String operationId,
+        Map<String, Object> parameters,
+        Map<String, Object> constraints,
+        Map<String, Object> auth
+    ) {
     }
 }

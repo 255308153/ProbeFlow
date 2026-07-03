@@ -39,6 +39,12 @@ public class ApiSpec {
     @Column(name = "summary", columnDefinition = "text")
     private String summary;
 
+    @Column(name = "description", columnDefinition = "text")
+    private String description;
+
+    @Column(name = "operation_id", length = 255)
+    private String operationId;
+
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "parameters", nullable = false, columnDefinition = "jsonb")
     private Map<String, Object> parameters = new LinkedHashMap<>();
@@ -57,6 +63,13 @@ public class ApiSpec {
 
     @Column(name = "source_ref", columnDefinition = "text")
     private String sourceRef;
+
+    @Column(name = "source_material_id", length = 36)
+    private String sourceMaterialId;
+
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "source_location", nullable = false, columnDefinition = "jsonb")
+    private Map<String, Object> sourceLocation = new LinkedHashMap<>();
 
     @Column(name = "version", nullable = false)
     private Integer version = 1;
@@ -148,6 +161,22 @@ public class ApiSpec {
         this.summary = summary;
     }
 
+    public String getDescription() {
+        return description;
+    }
+
+    public void setDescription(String description) {
+        this.description = description;
+    }
+
+    public String getOperationId() {
+        return operationId;
+    }
+
+    public void setOperationId(String operationId) {
+        this.operationId = operationId;
+    }
+
     public Map<String, Object> getParameters() {
         return parameters;
     }
@@ -186,6 +215,22 @@ public class ApiSpec {
 
     public void setSourceRef(String sourceRef) {
         this.sourceRef = sourceRef;
+    }
+
+    public String getSourceMaterialId() {
+        return sourceMaterialId;
+    }
+
+    public void setSourceMaterialId(String sourceMaterialId) {
+        this.sourceMaterialId = sourceMaterialId;
+    }
+
+    public Map<String, Object> getSourceLocation() {
+        return sourceLocation;
+    }
+
+    public void setSourceLocation(Map<String, Object> sourceLocation) {
+        this.sourceLocation = sourceLocation;
     }
 
     public Integer getVersion() {

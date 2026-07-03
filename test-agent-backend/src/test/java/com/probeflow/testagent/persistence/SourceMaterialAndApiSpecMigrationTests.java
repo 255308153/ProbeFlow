@@ -31,6 +31,15 @@ class SourceMaterialAndApiSpecMigrationTests {
         assertThat(indexExists("idx_source_material_type_status")).isTrue();
         assertThat(indexExists("idx_api_spec_module_path")).isTrue();
         assertThat(indexExists("idx_api_spec_readiness")).isTrue();
+        assertThat(indexExists("idx_api_spec_source_material_route")).isTrue();
+    }
+
+    @Test
+    void migrationsCreateApiAnalysisMetadataColumns() {
+        assertThat(columnExists("api_spec", "source_material_id")).isTrue();
+        assertThat(columnExists("api_spec", "operation_id")).isTrue();
+        assertThat(columnExists("api_spec", "description")).isTrue();
+        assertThat(columnExists("api_spec", "source_location")).isTrue();
     }
 
     private boolean tableExists(String tableName) {
@@ -58,6 +67,23 @@ class SourceMaterialAndApiSpecMigrationTests {
             """,
             Integer.class,
             indexName
+        );
+
+        return count != null && count == 1;
+    }
+
+    private boolean columnExists(String tableName, String columnName) {
+        Integer count = jdbc.queryForObject(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE LOWER(table_schema) = 'public'
+              AND LOWER(table_name) = LOWER(?)
+              AND LOWER(column_name) = LOWER(?)
+            """,
+            Integer.class,
+            tableName,
+            columnName
         );
 
         return count != null && count == 1;

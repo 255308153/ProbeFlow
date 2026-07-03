@@ -3,6 +3,7 @@ package com.probeflow.testagent.analysis;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.probeflow.testagent.apispec.ApiSpecRepository;
+import com.probeflow.testagent.apispec.HttpMethod;
 import com.probeflow.testagent.sourcematerial.IngestStatus;
 import com.probeflow.testagent.sourcematerial.MaterialType;
 import com.probeflow.testagent.sourcematerial.SourceMaterialRepository;
@@ -69,8 +70,154 @@ class ApiAnalysisApplicationServiceTests {
 
         assertThat(planSteps.findByTaskIdOrderByStepOrderAsc(result.taskId()))
             .extracting(step -> step.getStepStatus())
-            .containsExactly(PlanStepStatus.SUCCESS, PlanStepStatus.SUCCESS);
+            .containsOnly(PlanStepStatus.SUCCESS);
         assertThat(apiSpecs.count()).isZero();
+    }
+
+    @Test
+    void openApiMaterialImportsOperationsIntoApiSpecs() throws Exception {
+        var openApiFile = tempDir.resolve("orders-openapi.yaml");
+        Files.writeString(openApiFile, """
+            openapi: 3.0.3
+            info:
+              title: Order Platform
+              version: 1.0.0
+            components:
+              securitySchemes:
+                bearerAuth:
+                  type: http
+                  scheme: bearer
+              schemas:
+                CreateOrderRequest:
+                  type: object
+                  required:
+                    - skuId
+                    - quantity
+                  properties:
+                    skuId:
+                      type: string
+                    quantity:
+                      type: integer
+                      minimum: 1
+                      maximum: 99
+                    channel:
+                      type: string
+                      enum:
+                        - WEB
+                        - APP
+                OrderResponse:
+                  type: object
+                  properties:
+                    orderId:
+                      type: string
+                    status:
+                      type: string
+                      enum:
+                        - CREATED
+                        - PAID
+            paths:
+              /api/orders/{orderId}:
+                get:
+                  tags:
+                    - orders
+                  operationId: getOrder
+                  summary: Get order
+                  description: Load an order by id.
+                  parameters:
+                    - name: orderId
+                      in: path
+                      required: true
+                      schema:
+                        type: string
+                    - name: includeItems
+                      in: query
+                      required: false
+                      schema:
+                        type: boolean
+                    - name: X-Trace-Id
+                      in: header
+                      required: false
+                      schema:
+                        type: string
+                  responses:
+                    "200":
+                      description: OK
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/OrderResponse"
+              /api/orders:
+                post:
+                  tags:
+                    - orders
+                  operationId: createOrder
+                  summary: Create order
+                  description: Create an order from a JSON payload.
+                  security:
+                    - bearerAuth: []
+                  requestBody:
+                    required: true
+                    content:
+                      application/json:
+                        schema:
+                          $ref: "#/components/schemas/CreateOrderRequest"
+                  responses:
+                    "201":
+                      description: Created
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/OrderResponse"
+            """);
+
+        var result = apiAnalysis.analyze(ApiAnalysisRequest.createMaterial(
+            MaterialType.OPENAPI_FILE,
+            "orders-openapi.yaml",
+            openApiFile.toString(),
+            openApiFile.toString(),
+            "tester"
+        ));
+
+        assertThat(result.succeeded()).isTrue();
+        assertThat(result.apiSpecIds()).hasSize(2);
+
+        var specs = apiSpecs.findBySourceMaterialIdOrderByPathAscHttpMethodAsc(result.materialId());
+        assertThat(specs).hasSize(2);
+
+        assertThat(specs).anySatisfy(spec -> {
+            assertThat(spec.getSystemName()).isEqualTo("Order Platform");
+            assertThat(spec.getModuleName()).isEqualTo("orders");
+            assertThat(spec.getHttpMethod()).isEqualTo(HttpMethod.GET);
+            assertThat(spec.getPath()).isEqualTo("/api/orders/{orderId}");
+            assertThat(spec.getSummary()).isEqualTo("Get order");
+            assertThat(spec.getDescription()).isEqualTo("Load an order by id.");
+            assertThat(spec.getOperationId()).isEqualTo("getOrder");
+            assertThat(spec.getParameters()).containsKeys("path", "query", "header", "responses");
+            assertThat(spec.isRouteReady()).isTrue();
+            assertThat(spec.isBasicParamReady()).isTrue();
+            assertThat(spec.isDtoExpanded()).isTrue();
+            assertThat(spec.isValidationReady()).isTrue();
+            assertThat(spec.isAuthReady()).isTrue();
+            assertThat(spec.isKnowledgeContextReady()).isFalse();
+        });
+
+        assertThat(specs).anySatisfy(spec -> {
+            assertThat(spec.getHttpMethod()).isEqualTo(HttpMethod.POST);
+            assertThat(spec.getPath()).isEqualTo("/api/orders");
+            assertThat(spec.getSummary()).isEqualTo("Create order");
+            assertThat(spec.getDescription()).isEqualTo("Create an order from a JSON payload.");
+            assertThat(spec.getOperationId()).isEqualTo("createOrder");
+            assertThat(spec.getParameters()).containsKeys("requestBody", "responses");
+            assertThat(spec.getConstraints()).containsKeys("required", "enums");
+            assertThat(spec.getAuth()).containsEntry("required", true);
+        });
+
+        var task = tasks.findById(result.taskId()).orElseThrow();
+        assertThat(task.getStatus()).isEqualTo(TaskStatus.COMPLETED);
+        assertThat(task.getTargetApiSpecIds()).containsExactlyInAnyOrderElementsOf(result.apiSpecIds());
+        assertThat(planSteps.findByTaskIdOrderByStepOrderAsc(result.taskId()))
+            .extracting(step -> step.getStepStatus())
+            .containsOnly(PlanStepStatus.SUCCESS);
     }
 
     @Test
