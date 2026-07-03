@@ -38,12 +38,14 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.zip.ZipInputStream;
 import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.Operation;
 import io.swagger.v3.oas.models.PathItem;
@@ -118,6 +120,9 @@ public class ApiAnalysisApplicationService {
         if (material.getMaterialType() == MaterialType.SOURCE_DIRECTORY) {
             return analyzeSpringSource(material, task, route);
         }
+        if (material.getMaterialType() == MaterialType.CODE_ARCHIVE) {
+            return analyzeSourceArchive(material, task, route);
+        }
 
         task.setStatus(TaskStatus.COMPLETED);
         task.setMetadata(Map.of("parserRoute", route, "apiSpecCount", 0));
@@ -138,16 +143,46 @@ public class ApiAnalysisApplicationService {
     }
 
     private ApiAnalysisResult analyzeSpringSource(SourceMaterial material, Task task, String route) {
-        var parseStep = createStep(task.getTaskId(), 3, "Parse Spring controller source", material.getStoragePath());
-        var mergeStep = createStep(task.getTaskId(), 4, "Persist ApiSpec operations", material.getMaterialId());
+        return analyzeSpringSourcePath(material, task, route, Path.of(material.getStoragePath()), 3);
+    }
 
-        var parseResult = parseSpringSource(material);
+    private ApiAnalysisResult analyzeSourceArchive(SourceMaterial material, Task task, String route) {
+        var unpackStep = createStep(task.getTaskId(), 3, "Unpack source archive", material.getStoragePath());
+        var unpackResult = unpackSourceArchive(material);
+        if (!unpackResult.succeeded()) {
+            failStep(unpackStep, unpackResult.errorCode(), unpackResult.errorMessage());
+            return failAnalysis(material, task, route, unpackResult.errorCode(), unpackResult.errorMessage());
+        }
+
+        succeedStep(unpackStep, "Archive unpacked for source analysis");
+        try {
+            return analyzeSpringSourcePath(material, task, route, unpackResult.sourceRoot(), 4);
+        } finally {
+            deleteRecursively(unpackResult.sourceRoot());
+        }
+    }
+
+    private ApiAnalysisResult analyzeSpringSourcePath(
+        SourceMaterial material,
+        Task task,
+        String route,
+        Path sourceRoot,
+        int parseStepOrder
+    ) {
+        var parseStep = createStep(task.getTaskId(), parseStepOrder, "Parse Spring controller source", sourceRoot.toString());
+        var mergeStep = createStep(task.getTaskId(), parseStepOrder + 1, "Persist ApiSpec operations", material.getMaterialId());
+
+        var parseResult = parseSpringSource(material, sourceRoot);
         if (!parseResult.succeeded()) {
             failStep(parseStep, parseResult.errorCode(), parseResult.errorMessage());
             skipStep(mergeStep, "Spring source parse failed");
             return failAnalysis(material, task, route, parseResult.errorCode(), parseResult.errorMessage());
         }
-        succeedStep(parseStep, "Parsed Spring routes: " + parseResult.operations().size());
+        var parseMessage = "Parsed Spring routes: " + parseResult.operations().size();
+        if (!parseResult.warnings().isEmpty()) {
+            parseMessage += "; warnings: " + parseResult.warnings().size();
+        }
+        succeedStep(parseStep, parseMessage);
 
         var savedSpecs = new ArrayList<ApiSpec>();
         var latestRouteKeys = new LinkedHashSet<String>();
@@ -161,7 +196,7 @@ public class ApiAnalysisApplicationService {
 
         task.setStatus(TaskStatus.COMPLETED);
         task.setTargetApiSpecIds(apiSpecIds);
-        task.setMetadata(Map.of("parserRoute", route, "apiSpecCount", apiSpecIds.size()));
+        task.setMetadata(successMetadata(route, apiSpecIds.size(), parseResult.warnings()));
         tasks.save(task);
 
         material.setIngestStatus(IngestStatus.READY);
@@ -370,8 +405,62 @@ public class ApiAnalysisApplicationService {
         return OpenApiParseOutcome.success(systemName(openApi), operations);
     }
 
-    private SpringSourceParseOutcome parseSpringSource(SourceMaterial material) {
-        var sourceRoot = Path.of(material.getStoragePath());
+    private ArchiveUnpackOutcome unpackSourceArchive(SourceMaterial material) {
+        var archivePath = Path.of(material.getStoragePath());
+        if (!archivePath.getFileName().toString().toLowerCase().endsWith(".zip")) {
+            return ArchiveUnpackOutcome.failure("ARCHIVE_UNSUPPORTED_FORMAT", "Only .zip source archives are supported");
+        }
+
+        Path sourceRoot = null;
+        try {
+            sourceRoot = Files.createTempDirectory("probeflow-source-archive-").toAbsolutePath().normalize();
+            try (var zip = new ZipInputStream(Files.newInputStream(archivePath))) {
+                var entry = zip.getNextEntry();
+                while (entry != null) {
+                    var destination = sourceRoot.resolve(entry.getName()).normalize();
+                    if (!destination.startsWith(sourceRoot)) {
+                        deleteRecursively(sourceRoot);
+                        return ArchiveUnpackOutcome.failure("ARCHIVE_UNSAFE_ENTRY", "Archive entry escapes extraction root: " + entry.getName());
+                    }
+
+                    if (entry.isDirectory()) {
+                        Files.createDirectories(destination);
+                    } else {
+                        var parent = destination.getParent();
+                        if (parent != null) {
+                            Files.createDirectories(parent);
+                        }
+                        Files.copy(zip, destination);
+                    }
+                    zip.closeEntry();
+                    entry = zip.getNextEntry();
+                }
+            }
+            return ArchiveUnpackOutcome.success(sourceRoot);
+        } catch (IOException exception) {
+            if (sourceRoot != null) {
+                deleteRecursively(sourceRoot);
+            }
+            return ArchiveUnpackOutcome.failure("ARCHIVE_UNPACK_FAILED", exception.getMessage());
+        }
+    }
+
+    private void deleteRecursively(Path root) {
+        if (root == null || !Files.exists(root)) {
+            return;
+        }
+        try (var paths = Files.walk(root)) {
+            paths.sorted(Comparator.reverseOrder()).forEach(path -> {
+                try {
+                    Files.deleteIfExists(path);
+                } catch (IOException ignored) {
+                }
+            });
+        } catch (IOException ignored) {
+        }
+    }
+
+    private SpringSourceParseOutcome parseSpringSource(SourceMaterial material, Path sourceRoot) {
         var parser = new JavaParser(new ParserConfiguration());
         var operations = new ArrayList<ParsedSpringOperation>();
         var javaFiles = new ArrayList<ParsedJavaFile>();
@@ -385,8 +474,10 @@ public class ApiAnalysisApplicationService {
 
             for (var javaFile : sourceFiles) {
                 var parseResult = parser.parse(javaFile);
-                if (parseResult.getResult().isEmpty()) {
+                if (!parseResult.getProblems().isEmpty()) {
                     errors.add(javaFile + ": " + parseResult.getProblems());
+                }
+                if (parseResult.getResult().isEmpty()) {
                     continue;
                 }
                 javaFiles.add(new ParsedJavaFile(javaFile, parseResult.getResult().orElseThrow()));
@@ -594,6 +685,17 @@ public class ApiAnalysisApplicationService {
 
     private String routeKey(HttpMethod httpMethod, String path) {
         return httpMethod.name() + " " + normalizePath(path);
+    }
+
+    private Map<String, Object> successMetadata(String parserRoute, int apiSpecCount, List<String> warnings) {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("parserRoute", parserRoute);
+        metadata.put("apiSpecCount", apiSpecCount);
+        if (!warnings.isEmpty()) {
+            metadata.put("warningCount", warnings.size());
+            metadata.put("warnings", warnings);
+        }
+        return metadata;
     }
 
     private SourceMaterial resolveMaterial(ApiAnalysisRequest request) {
@@ -1386,6 +1488,22 @@ public class ApiAnalysisApplicationService {
 
         static SpringSourceParseOutcome failure(String errorCode, String errorMessage) {
             return new SpringSourceParseOutcome(false, null, List.of(), List.of(), errorCode, errorMessage);
+        }
+    }
+
+    private record ArchiveUnpackOutcome(
+        boolean succeeded,
+        Path sourceRoot,
+        String errorCode,
+        String errorMessage
+    ) {
+
+        static ArchiveUnpackOutcome success(Path sourceRoot) {
+            return new ArchiveUnpackOutcome(true, sourceRoot, null, null);
+        }
+
+        static ArchiveUnpackOutcome failure(String errorCode, String errorMessage) {
+            return new ArchiveUnpackOutcome(false, null, errorCode, errorMessage);
         }
     }
 

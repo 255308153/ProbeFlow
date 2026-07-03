@@ -12,8 +12,13 @@ import com.probeflow.testagent.task.PlanStepRepository;
 import com.probeflow.testagent.task.PlanStepStatus;
 import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.task.TaskStatus;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Map;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -515,6 +520,87 @@ class ApiAnalysisApplicationServiceTests {
     }
 
     @Test
+    void sourceArchiveImportsValidSpringControllers() throws Exception {
+        var archive = zipSource("valid-source.zip", Map.of(
+            "src/main/java/com/example/archive/ArchiveController.java", archiveControllerSource()
+        ));
+
+        var result = apiAnalysis.analyze(ApiAnalysisRequest.createMaterial(
+            MaterialType.CODE_ARCHIVE,
+            "valid-source.zip",
+            archive.toString(),
+            archive.toString(),
+            "tester"
+        ));
+
+        assertThat(result.succeeded()).isTrue();
+        assertThat(result.parserRoute()).isEqualTo("source-archive");
+        assertThat(result.apiSpecIds()).hasSize(1);
+
+        var spec = apiSpecs.findBySourceMaterialIdOrderByPathAscHttpMethodAsc(result.materialId()).getFirst();
+        assertThat(spec.getHttpMethod()).isEqualTo(HttpMethod.GET);
+        assertThat(spec.getPath()).isEqualTo("/api/archive/{itemId}");
+        assertThat(spec.getSourceLocation().get("relativePath").toString())
+            .contains("src/main/java/com/example/archive/ArchiveController.java");
+
+        var task = tasks.findById(result.taskId()).orElseThrow();
+        assertThat(task.getStatus()).isEqualTo(TaskStatus.COMPLETED);
+        assertThat(task.getMetadata()).containsEntry("parserRoute", "source-archive");
+        assertThat(planSteps.findByTaskIdOrderByStepOrderAsc(result.taskId()))
+            .extracting(step -> step.getStepStatus())
+            .containsOnly(PlanStepStatus.SUCCESS);
+    }
+
+    @Test
+    void sourceArchiveKeepsValidApiSpecsWhenOneJavaFileCannotBeParsed() throws Exception {
+        var archive = zipSource("partial-source.zip", Map.of(
+            "src/main/java/com/example/archive/ArchiveController.java", archiveControllerSource(),
+            "src/main/java/com/example/archive/BrokenController.java", "class BrokenController {"
+        ));
+
+        var result = apiAnalysis.analyze(ApiAnalysisRequest.createMaterial(
+            MaterialType.CODE_ARCHIVE,
+            "partial-source.zip",
+            archive.toString(),
+            archive.toString(),
+            "tester"
+        ));
+
+        assertThat(result.succeeded()).isTrue();
+        assertThat(result.apiSpecIds()).hasSize(1);
+
+        var task = tasks.findById(result.taskId()).orElseThrow();
+        assertThat(task.getStatus()).isEqualTo(TaskStatus.COMPLETED);
+        assertThat(task.getMetadata()).containsEntry("warningCount", 1);
+        assertThat(task.getMetadata().get("warnings").toString()).contains("BrokenController.java");
+        assertThat(apiSpecs.findBySourceMaterialIdOrderByPathAscHttpMethodAsc(result.materialId())).hasSize(1);
+    }
+
+    @Test
+    void sourceArchiveWithUnsafeEntryFailsWithoutCreatingApiSpecs() throws Exception {
+        var archive = zipSource("unsafe-source.zip", Map.of("../EscapeController.java", archiveControllerSource()));
+
+        var result = apiAnalysis.analyze(ApiAnalysisRequest.createMaterial(
+            MaterialType.CODE_ARCHIVE,
+            "unsafe-source.zip",
+            archive.toString(),
+            archive.toString(),
+            "tester"
+        ));
+
+        assertThat(result.succeeded()).isFalse();
+        assertThat(result.errorCode()).isEqualTo("ARCHIVE_UNSAFE_ENTRY");
+        assertThat(apiSpecs.count()).isZero();
+
+        var material = sourceMaterials.findById(result.materialId()).orElseThrow();
+        assertThat(material.getIngestStatus()).isEqualTo(IngestStatus.FAILED);
+
+        var task = tasks.findById(result.taskId()).orElseThrow();
+        assertThat(task.getStatus()).isEqualTo(TaskStatus.FAILED);
+        assertThat(task.getMetadata()).containsEntry("errorCode", "ARCHIVE_UNSAFE_ENTRY");
+    }
+
+    @Test
     void invalidMaterialPathFailsWithoutCreatingApiSpecs() {
         var missingFile = tempDir.resolve("missing.yaml");
 
@@ -569,6 +655,43 @@ class ApiAnalysisApplicationServiceTests {
             .extracting(step -> step.getStepStatus())
             .containsExactly(PlanStepStatus.SUCCESS, PlanStepStatus.FAILED);
         assertThat(apiSpecs.count()).isZero();
+    }
+
+    private Path zipSource(String archiveName, Map<String, String> entries) throws IOException {
+        var archive = tempDir.resolve(archiveName);
+        try (var zip = new ZipOutputStream(Files.newOutputStream(archive))) {
+            for (var entry : entries.entrySet()) {
+                zip.putNextEntry(new ZipEntry(entry.getKey()));
+                zip.write(entry.getValue().getBytes(StandardCharsets.UTF_8));
+                zip.closeEntry();
+            }
+        }
+        return archive;
+    }
+
+    private String archiveControllerSource() {
+        return """
+            package com.example.archive;
+
+            import org.springframework.web.bind.annotation.GetMapping;
+            import org.springframework.web.bind.annotation.PathVariable;
+            import org.springframework.web.bind.annotation.RequestMapping;
+            import org.springframework.web.bind.annotation.RestController;
+
+            @RestController
+            @RequestMapping("/api/archive")
+            class ArchiveController {
+
+                @GetMapping("/{itemId}")
+                ArchiveResponse getItem(@PathVariable("itemId") String itemId) {
+                    return null;
+                }
+            }
+
+            class ArchiveResponse {
+                private String itemId;
+            }
+            """;
     }
 
     private String openApiDocument(String createOrderSummary, boolean includeGetOrder) {
