@@ -40,6 +40,7 @@ class SourceMaterialAndApiSpecMigrationTests {
         assertThat(columnExists("api_spec", "operation_id")).isTrue();
         assertThat(columnExists("api_spec", "description")).isTrue();
         assertThat(columnExists("api_spec", "source_location")).isTrue();
+        assertThat(columnExists("api_spec", "present_in_latest_analysis")).isTrue();
     }
 
     private boolean tableExists(String tableName) {

@@ -25,6 +25,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -121,10 +122,12 @@ public class ApiAnalysisApplicationService {
         succeedStep(parseStep, "Parsed OpenAPI operations: " + parseResult.operations().size());
 
         var savedSpecs = new ArrayList<ApiSpec>();
+        var latestRouteKeys = new LinkedHashSet<String>();
         for (var operation : parseResult.operations()) {
-            var apiSpec = toApiSpec(material, parseResult.systemName(), operation);
-            savedSpecs.add(apiSpecs.save(apiSpec));
+            latestRouteKeys.add(routeKey(operation.httpMethod(), operation.path()));
+            savedSpecs.add(upsertApiSpec(material, parseResult.systemName(), operation));
         }
+        markRoutesAbsentFromLatestAnalysis(material.getMaterialId(), latestRouteKeys);
         var apiSpecIds = savedSpecs.stream().map(ApiSpec::getApiSpecId).toList();
         succeedStep(mergeStep, "Persisted ApiSpec operations: " + apiSpecIds.size());
 
@@ -137,6 +140,84 @@ public class ApiAnalysisApplicationService {
         sourceMaterials.save(material);
 
         return ApiAnalysisResult.success(material.getMaterialId(), task.getTaskId(), route, apiSpecIds);
+    }
+
+    private ApiSpec upsertApiSpec(SourceMaterial material, String systemName, ParsedOpenApiOperation operation) {
+        var existing = findExistingApiSpec(material.getMaterialId(), operation);
+        if (existing == null) {
+            return apiSpecs.save(toApiSpec(material, systemName, operation));
+        }
+
+        var changed = applyApiSpecChanges(existing, material, systemName, operation);
+        if (changed) {
+            existing.setVersion(existing.getVersion() + 1);
+            return apiSpecs.save(existing);
+        }
+        if (!existing.isPresentInLatestAnalysis()) {
+            existing.setPresentInLatestAnalysis(true);
+            return apiSpecs.save(existing);
+        }
+        return existing;
+    }
+
+    private ApiSpec findExistingApiSpec(String materialId, ParsedOpenApiOperation operation) {
+        if (operation.operationId() != null && !operation.operationId().isBlank()) {
+            var byOperationId = apiSpecs.findFirstBySourceMaterialIdAndOperationId(materialId, operation.operationId());
+            if (byOperationId.isPresent()) {
+                return byOperationId.get();
+            }
+        }
+        return apiSpecs.findFirstBySourceMaterialIdAndHttpMethodAndPath(materialId, operation.httpMethod(), operation.path())
+            .orElse(null);
+    }
+
+    private boolean applyApiSpecChanges(
+        ApiSpec apiSpec,
+        SourceMaterial material,
+        String systemName,
+        ParsedOpenApiOperation operation
+    ) {
+        var changed = false;
+        changed |= setIfChanged(apiSpec.getSystemName(), systemName, apiSpec::setSystemName);
+        changed |= setIfChanged(apiSpec.getModuleName(), operation.moduleName(), apiSpec::setModuleName);
+        changed |= setIfChanged(apiSpec.getHttpMethod(), operation.httpMethod(), apiSpec::setHttpMethod);
+        changed |= setIfChanged(apiSpec.getPath(), operation.path(), apiSpec::setPath);
+        changed |= setIfChanged(apiSpec.getSummary(), operation.summary(), apiSpec::setSummary);
+        changed |= setIfChanged(apiSpec.getDescription(), operation.description(), apiSpec::setDescription);
+        changed |= setIfChanged(apiSpec.getOperationId(), operation.operationId(), apiSpec::setOperationId);
+        changed |= setIfChanged(apiSpec.getParameters(), operation.parameters(), apiSpec::setParameters);
+        changed |= setIfChanged(apiSpec.getConstraints(), operation.constraints(), apiSpec::setConstraints);
+        changed |= setIfChanged(apiSpec.getAuth(), operation.auth(), apiSpec::setAuth);
+        changed |= setIfChanged(apiSpec.getSourceRef(), sourceRef(material, operation), apiSpec::setSourceRef);
+        changed |= setIfChanged(apiSpec.getSourceLocation(), sourceLocation(material, operation), apiSpec::setSourceLocation);
+        apiSpec.setSourceType(ApiSpecSourceType.OPENAPI);
+        apiSpec.setSourceMaterialId(material.getMaterialId());
+        apiSpec.setRouteReady(true);
+        apiSpec.setBasicParamReady(true);
+        apiSpec.setDtoExpanded(true);
+        apiSpec.setValidationReady(true);
+        apiSpec.setAuthReady(true);
+        apiSpec.setKnowledgeContextReady(false);
+        apiSpec.setPresentInLatestAnalysis(true);
+        return changed;
+    }
+
+    private <T> boolean setIfChanged(T currentValue, T newValue, java.util.function.Consumer<T> setter) {
+        if (Objects.equals(currentValue, newValue)) {
+            return false;
+        }
+        setter.accept(newValue);
+        return true;
+    }
+
+    private void markRoutesAbsentFromLatestAnalysis(String materialId, LinkedHashSet<String> latestRouteKeys) {
+        apiSpecs.findBySourceMaterialIdOrderByPathAscHttpMethodAsc(materialId).stream()
+            .filter(apiSpec -> !latestRouteKeys.contains(routeKey(apiSpec.getHttpMethod(), apiSpec.getPath())))
+            .filter(ApiSpec::isPresentInLatestAnalysis)
+            .forEach(apiSpec -> {
+                apiSpec.setPresentInLatestAnalysis(false);
+                apiSpecs.save(apiSpec);
+            });
     }
 
     private OpenApiParseOutcome parseOpenApi(String storagePath) {
@@ -212,12 +293,8 @@ public class ApiAnalysisApplicationService {
         apiSpec.setAuth(operation.auth());
         apiSpec.setSourceType(ApiSpecSourceType.OPENAPI);
         apiSpec.setSourceMaterialId(material.getMaterialId());
-        apiSpec.setSourceRef("openapi://" + material.getMaterialId() + "#/paths/" + jsonPointerPath(operation.path()) + "/" + operation.httpMethod().name().toLowerCase());
-        apiSpec.setSourceLocation(Map.of(
-            "materialId", material.getMaterialId(),
-            "path", operation.path(),
-            "method", operation.httpMethod().name()
-        ));
+        apiSpec.setSourceRef(sourceRef(material, operation));
+        apiSpec.setSourceLocation(sourceLocation(material, operation));
         apiSpec.setVersion(1);
         apiSpec.setRouteReady(true);
         apiSpec.setBasicParamReady(true);
@@ -225,7 +302,24 @@ public class ApiAnalysisApplicationService {
         apiSpec.setValidationReady(true);
         apiSpec.setAuthReady(true);
         apiSpec.setKnowledgeContextReady(false);
+        apiSpec.setPresentInLatestAnalysis(true);
         return apiSpec;
+    }
+
+    private String sourceRef(SourceMaterial material, ParsedOpenApiOperation operation) {
+        return "openapi://" + material.getMaterialId() + "#/paths/" + jsonPointerPath(operation.path()) + "/" + operation.httpMethod().name().toLowerCase();
+    }
+
+    private Map<String, Object> sourceLocation(SourceMaterial material, ParsedOpenApiOperation operation) {
+        return Map.of(
+            "materialId", material.getMaterialId(),
+            "path", operation.path(),
+            "method", operation.httpMethod().name()
+        );
+    }
+
+    private String routeKey(HttpMethod httpMethod, String path) {
+        return httpMethod.name() + " " + normalizePath(path);
     }
 
     private SourceMaterial resolveMaterial(ApiAnalysisRequest request) {

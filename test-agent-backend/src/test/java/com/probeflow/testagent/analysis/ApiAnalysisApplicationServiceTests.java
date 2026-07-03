@@ -221,6 +221,67 @@ class ApiAnalysisApplicationServiceTests {
     }
 
     @Test
+    void repeatedOpenApiAnalysisForSameMaterialIsIdempotent() throws Exception {
+        var openApiFile = tempDir.resolve("idempotent-openapi.yaml");
+        Files.writeString(openApiFile, openApiDocument("Create order", true));
+
+        var first = apiAnalysis.analyze(ApiAnalysisRequest.createMaterial(
+            MaterialType.OPENAPI_FILE,
+            "idempotent-openapi.yaml",
+            openApiFile.toString(),
+            openApiFile.toString(),
+            "tester"
+        ));
+        var firstSpecs = apiSpecs.findBySourceMaterialIdOrderByPathAscHttpMethodAsc(first.materialId());
+
+        var second = apiAnalysis.analyze(ApiAnalysisRequest.existingMaterial(first.materialId(), "tester"));
+        var secondSpecs = apiSpecs.findBySourceMaterialIdOrderByPathAscHttpMethodAsc(first.materialId());
+
+        assertThat(second.succeeded()).isTrue();
+        assertThat(secondSpecs).hasSize(2);
+        assertThat(secondSpecs).extracting(spec -> spec.getApiSpecId())
+            .containsExactlyElementsOf(firstSpecs.stream().map(spec -> spec.getApiSpecId()).toList());
+        assertThat(secondSpecs).extracting(spec -> spec.getVersion()).containsOnly(1);
+        assertThat(secondSpecs).extracting(spec -> spec.isPresentInLatestAnalysis()).containsOnly(true);
+    }
+
+    @Test
+    void changedOpenApiOperationUpdatesExistingApiSpecVersionAndRemovedRoutePresence() throws Exception {
+        var openApiFile = tempDir.resolve("changed-openapi.yaml");
+        Files.writeString(openApiFile, openApiDocument("Create order", true));
+
+        var first = apiAnalysis.analyze(ApiAnalysisRequest.createMaterial(
+            MaterialType.OPENAPI_FILE,
+            "changed-openapi.yaml",
+            openApiFile.toString(),
+            openApiFile.toString(),
+            "tester"
+        ));
+        var createdBefore = apiSpecs.findBySourceMaterialIdOrderByPathAscHttpMethodAsc(first.materialId()).stream()
+            .filter(spec -> spec.getOperationId().equals("createOrder"))
+            .findFirst()
+            .orElseThrow();
+
+        Files.writeString(openApiFile, openApiDocument("Create order v2", false));
+
+        var second = apiAnalysis.analyze(ApiAnalysisRequest.existingMaterial(first.materialId(), "tester"));
+        var specs = apiSpecs.findBySourceMaterialIdOrderByPathAscHttpMethodAsc(first.materialId());
+
+        assertThat(second.succeeded()).isTrue();
+        assertThat(specs).hasSize(2);
+        assertThat(specs).anySatisfy(spec -> {
+            assertThat(spec.getApiSpecId()).isEqualTo(createdBefore.getApiSpecId());
+            assertThat(spec.getSummary()).isEqualTo("Create order v2");
+            assertThat(spec.getVersion()).isEqualTo(2);
+            assertThat(spec.isPresentInLatestAnalysis()).isTrue();
+        });
+        assertThat(specs).anySatisfy(spec -> {
+            assertThat(spec.getOperationId()).isEqualTo("getOrder");
+            assertThat(spec.isPresentInLatestAnalysis()).isFalse();
+        });
+    }
+
+    @Test
     void invalidMaterialPathFailsWithoutCreatingApiSpecs() {
         var missingFile = tempDir.resolve("missing.yaml");
 
@@ -275,5 +336,52 @@ class ApiAnalysisApplicationServiceTests {
             .extracting(step -> step.getStepStatus())
             .containsExactly(PlanStepStatus.SUCCESS, PlanStepStatus.FAILED);
         assertThat(apiSpecs.count()).isZero();
+    }
+
+    private String openApiDocument(String createOrderSummary, boolean includeGetOrder) {
+        var getOrderPath = includeGetOrder
+            ? "  /api/orders/{orderId}:\n"
+                + "    get:\n"
+                + "      tags:\n"
+                + "        - orders\n"
+                + "      operationId: getOrder\n"
+                + "      summary: Get order\n"
+                + "      parameters:\n"
+                + "        - name: orderId\n"
+                + "          in: path\n"
+                + "          required: true\n"
+                + "          schema:\n"
+                + "            type: string\n"
+                + "      responses:\n"
+                + "        \"200\":\n"
+                + "          description: OK\n"
+            : "";
+
+        return "openapi: 3.0.3\n"
+            + "info:\n"
+            + "  title: Order Platform\n"
+            + "  version: 1.0.0\n"
+            + "paths:\n"
+            + getOrderPath
+            + "  /api/orders:\n"
+            + "    post:\n"
+            + "      tags:\n"
+            + "        - orders\n"
+            + "      operationId: createOrder\n"
+            + "      summary: " + createOrderSummary + "\n"
+            + "      requestBody:\n"
+            + "        required: true\n"
+            + "        content:\n"
+            + "          application/json:\n"
+            + "            schema:\n"
+            + "              type: object\n"
+            + "              required:\n"
+            + "                - skuId\n"
+            + "              properties:\n"
+            + "                skuId:\n"
+            + "                  type: string\n"
+            + "      responses:\n"
+            + "        \"201\":\n"
+            + "          description: Created\n";
     }
 }

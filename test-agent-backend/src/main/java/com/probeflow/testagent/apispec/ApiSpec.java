@@ -92,6 +92,9 @@ public class ApiSpec {
     @Column(name = "knowledge_context_ready", nullable = false)
     private boolean knowledgeContextReady;
 
+    @Column(name = "present_in_latest_analysis", nullable = false)
+    private boolean presentInLatestAnalysis = true;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -287,6 +290,14 @@ public class ApiSpec {
 
     public void setKnowledgeContextReady(boolean knowledgeContextReady) {
         this.knowledgeContextReady = knowledgeContextReady;
+    }
+
+    public boolean isPresentInLatestAnalysis() {
+        return presentInLatestAnalysis;
+    }
+
+    public void setPresentInLatestAnalysis(boolean presentInLatestAnalysis) {
+        this.presentInLatestAnalysis = presentInLatestAnalysis;
     }
 
     public Instant getCreatedAt() {
