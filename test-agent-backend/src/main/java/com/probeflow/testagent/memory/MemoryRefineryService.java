@@ -3,12 +3,16 @@ package com.probeflow.testagent.memory;
 import com.probeflow.testagent.knowledge.EmbeddingService;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -48,12 +52,22 @@ public class MemoryRefineryService {
         var importance = importanceOf(scopeType, confidence, tags, metadata);
         var successContribution = successContributionOf(scopeType, confidence);
 
-        var existing = longTermMemories.findAllByStatusOrderByCreatedAtAscMemoryIdAsc(MemoryStatus.ACTIVE)
-            .stream()
-            .filter(memory -> equivalent(memory, scopeType, summary, content, tags, normalized.sourceType(), normalized.sourceRef()))
-            .findFirst();
+        var existing = findMergeCandidate(scopeType, summary, content, fullContent, tags, normalized, metadata);
         if (existing.isPresent()) {
-            return new MemoryRefineryResult(true, false, true, null, toView(existing.get()));
+            var merged = mergeIntoExisting(
+                existing.get(),
+                normalized,
+                scopeType,
+                summary,
+                content,
+                fullContent,
+                tags,
+                metadata,
+                confidence,
+                importance,
+                successContribution
+            );
+            return new MemoryRefineryResult(true, false, true, null, toView(merged));
         }
 
         var memory = new LongTermMemory();
@@ -74,6 +88,25 @@ public class MemoryRefineryService {
 
         var saved = longTermMemories.save(memory);
         return new MemoryRefineryResult(true, true, false, null, toView(saved));
+    }
+
+    @Transactional
+    public void archiveMemory(String memoryId) {
+        requireNonBlank(memoryId, "memoryId must not be blank");
+        var memory = longTermMemories.findById(memoryId.trim())
+            .orElseThrow(() -> new IllegalArgumentException("LongTermMemory not found: " + memoryId));
+        memory.setStatus(MemoryStatus.ARCHIVED);
+        memory.setArchivedAt(Instant.now());
+        longTermMemories.save(memory);
+    }
+
+    @Transactional
+    public void deactivateMemory(String memoryId) {
+        requireNonBlank(memoryId, "memoryId must not be blank");
+        var memory = longTermMemories.findById(memoryId.trim())
+            .orElseThrow(() -> new IllegalArgumentException("LongTermMemory not found: " + memoryId));
+        memory.setStatus(MemoryStatus.INACTIVE);
+        longTermMemories.save(memory);
     }
 
     private RefinedMemoryView toView(LongTermMemory memory) {
@@ -111,6 +144,210 @@ public class MemoryRefineryService {
             && Objects.equals(memory.getTags(), tags)
             && memory.getSourceType() == sourceType
             && Objects.equals(memory.getSourceRef(), sourceRef);
+    }
+
+    private java.util.Optional<LongTermMemory> findMergeCandidate(
+        MemoryScopeType scopeType,
+        String summary,
+        String content,
+        String fullContent,
+        List<String> tags,
+        MemoryCandidateRequest request,
+        Map<String, Object> metadata
+    ) {
+        return longTermMemories.findAllByStatusOrderByCreatedAtAscMemoryIdAsc(MemoryStatus.ACTIVE)
+            .stream()
+            .filter(memory -> memory.getScopeType() == scopeType)
+            .filter(memory -> equivalent(memory, scopeType, summary, content, tags, request.sourceType(), request.sourceRef())
+                || isSimilarCandidate(memory, summary, content, fullContent, tags, request, metadata))
+            .sorted(Comparator
+                .comparing((LongTermMemory memory) -> !equivalent(memory, scopeType, summary, content, tags, request.sourceType(), request.sourceRef()))
+                .thenComparing(LongTermMemory::getCreatedAt)
+                .thenComparing(LongTermMemory::getMemoryId))
+            .findFirst();
+    }
+
+    private LongTermMemory mergeIntoExisting(
+        LongTermMemory existing,
+        MemoryCandidateRequest request,
+        MemoryScopeType scopeType,
+        String summary,
+        String content,
+        String fullContent,
+        List<String> tags,
+        Map<String, Object> metadata,
+        float confidence,
+        float importance,
+        float successContribution
+    ) {
+        existing.setSummary(preferLonger(existing.getSummary(), summary, SUMMARY_LIMIT));
+        existing.setContent(preferLonger(existing.getContent(), content, CONTENT_LIMIT));
+        existing.setFullContent(mergeEvidence(existing.getFullContent(), fullContent));
+        existing.setTags(mergeTags(existing.getTags(), tags));
+        existing.setConfidence(Math.max(existing.getConfidence(), confidence));
+        existing.setImportance(Math.max(existing.getImportance(), importance));
+        existing.setSuccessContribution(clamp(
+            Math.max(existing.getSuccessContribution(), successContribution) + 0.02f,
+            0.25f,
+            0.85f
+        ));
+        existing.setHitCount(existing.getHitCount() + 1);
+        existing.setMetadata(mergeMetadata(existing.getMetadata(), metadata, request.sourceRef()));
+        existing.setEmbedding(embeddingService.embedDocument(existing.getSummary() + "\n" + existing.getContent()));
+        return longTermMemories.save(existing);
+    }
+
+    private boolean isSimilarCandidate(
+        LongTermMemory memory,
+        String summary,
+        String content,
+        String fullContent,
+        List<String> tags,
+        MemoryCandidateRequest request,
+        Map<String, Object> metadata
+    ) {
+        if (memory.getSourceType() != request.sourceType()) {
+            return false;
+        }
+
+        var tagOverlap = overlapCount(memory.getTags(), tags);
+        var metadataHintMatch = sharesMetadataHint(memory.getMetadata(), metadata);
+        var textSimilarity = Math.max(
+            tokenSimilarity(memory.getSummary(), summary),
+            tokenSimilarity(memory.getContent(), content)
+        );
+        var evidenceContained = containsNormalized(memory.getFullContent(), fullContent)
+            || containsNormalized(fullContent, memory.getFullContent());
+
+        return evidenceContained
+            || (metadataHintMatch && tagOverlap >= 1)
+            || (metadataHintMatch && textSimilarity >= 0.30d)
+            || (tagOverlap >= 2 && textSimilarity >= 0.45d);
+    }
+
+    private int overlapCount(List<String> left, List<String> right) {
+        var leftSet = new HashSet<>(left);
+        var overlap = 0;
+        for (var candidate : right) {
+            if (leftSet.contains(candidate)) {
+                overlap++;
+            }
+        }
+        return overlap;
+    }
+
+    private boolean sharesMetadataHint(Map<String, Object> left, Map<String, Object> right) {
+        return metadataHintEquals(left, right, "errorCode")
+            || metadataHintEquals(left, right, "apiPath")
+            || metadataHintEquals(left, right, "module")
+            || metadataHintEquals(left, right, "taskId");
+    }
+
+    private boolean metadataHintEquals(Map<String, Object> left, Map<String, Object> right, String key) {
+        return left.containsKey(key)
+            && right.containsKey(key)
+            && Objects.equals(String.valueOf(left.get(key)), String.valueOf(right.get(key)));
+    }
+
+    private double tokenSimilarity(String left, String right) {
+        var leftTokens = normalizedTokens(left);
+        var rightTokens = normalizedTokens(right);
+        if (leftTokens.isEmpty() || rightTokens.isEmpty()) {
+            return 0.0d;
+        }
+        var intersection = 0;
+        for (var token : leftTokens) {
+            if (rightTokens.contains(token)) {
+                intersection++;
+            }
+        }
+        var union = new HashSet<String>();
+        union.addAll(leftTokens);
+        union.addAll(rightTokens);
+        return intersection / (double) union.size();
+    }
+
+    private Set<String> normalizedTokens(String value) {
+        if (!StringUtils.hasText(value)) {
+            return Set.of();
+        }
+        return Arrays.stream(value.toLowerCase(Locale.ROOT).split("[^a-z0-9_]+"))
+            .filter(token -> token.length() >= 3)
+            .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+    }
+
+    private boolean containsNormalized(String container, String candidate) {
+        return collapseWhitespace(container).contains(collapseWhitespace(candidate));
+    }
+
+    private String preferLonger(String existing, String candidate, int limit) {
+        var normalizedExisting = collapseWhitespace(existing);
+        var normalizedCandidate = collapseWhitespace(candidate);
+        var preferred = normalizedCandidate.length() > normalizedExisting.length() ? normalizedCandidate : normalizedExisting;
+        return limit(preferred, limit);
+    }
+
+    private String mergeEvidence(String existing, String incoming) {
+        var normalizedExisting = collapseWhitespace(existing);
+        var normalizedIncoming = collapseWhitespace(incoming);
+        if (!StringUtils.hasText(normalizedExisting)) {
+            return normalizedIncoming;
+        }
+        if (!StringUtils.hasText(normalizedIncoming) || normalizedExisting.contains(normalizedIncoming)) {
+            return normalizedExisting;
+        }
+        if (normalizedIncoming.contains(normalizedExisting)) {
+            return normalizedIncoming;
+        }
+        return normalizedExisting + "\n---\n" + normalizedIncoming;
+    }
+
+    private List<String> mergeTags(List<String> existing, List<String> incoming) {
+        var merged = new LinkedHashSet<String>();
+        merged.addAll(existing);
+        merged.addAll(incoming);
+        return merged.stream().sorted().toList();
+    }
+
+    private Map<String, Object> mergeMetadata(
+        Map<String, Object> existing,
+        Map<String, Object> incoming,
+        String sourceRef
+    ) {
+        var merged = new TreeMap<String, Object>();
+        merged.putAll(existing);
+        incoming.forEach(merged::putIfAbsent);
+        merged.put("mergeCount", asInt(existing.get("mergeCount")) + 1);
+        merged.put("evidenceCount", asInt(existing.get("evidenceCount")) + 1);
+        merged.put("lastMergedAt", Instant.now().toString());
+
+        var sourceRefs = new LinkedHashSet<String>();
+        collectSourceRefs(sourceRefs, existing.get("mergedSourceRefs"));
+        collectSourceRefs(sourceRefs, existing.get("sourceRef"));
+        collectSourceRefs(sourceRefs, sourceRef);
+        if (!sourceRefs.isEmpty()) {
+            merged.put("mergedSourceRefs", List.copyOf(sourceRefs));
+        }
+        return new LinkedHashMap<>(merged);
+    }
+
+    private void collectSourceRefs(LinkedHashSet<String> sourceRefs, Object raw) {
+        if (raw instanceof List<?> values) {
+            for (var value : values) {
+                collectSourceRefs(sourceRefs, value);
+            }
+            return;
+        }
+        if (raw != null && StringUtils.hasText(raw.toString())) {
+            sourceRefs.add(raw.toString().trim());
+        }
+    }
+
+    private int asInt(Object value) {
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        return 1;
     }
 
     private String rejectionReason(MemoryCandidateRequest request) {
@@ -206,6 +443,12 @@ public class MemoryRefineryService {
         metadata.putAll(request.metadata());
         metadata.put("refinedAt", Instant.now().toString());
         metadata.put("scopeType", scopeType.name());
+        metadata.put("evidenceCount", 1);
+        metadata.put("mergeCount", 1);
+        if (request.sourceRef() != null) {
+            metadata.put("sourceRef", request.sourceRef());
+            metadata.put("mergedSourceRefs", List.of(request.sourceRef()));
+        }
         if (request.taskId() != null) {
             metadata.put("taskId", request.taskId());
         }
@@ -368,6 +611,12 @@ public class MemoryRefineryService {
 
     private void requireNonNull(Object value, String message) {
         if (value == null) {
+            throw new IllegalArgumentException(message);
+        }
+    }
+
+    private void requireNonBlank(String value, String message) {
+        if (!StringUtils.hasText(value)) {
             throw new IllegalArgumentException(message);
         }
     }

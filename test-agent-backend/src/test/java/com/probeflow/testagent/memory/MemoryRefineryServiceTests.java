@@ -145,4 +145,132 @@ class MemoryRefineryServiceTests {
         assertThat(second.duplicateSuppressed()).isTrue();
         assertThat(second.memory().memoryId()).isEqualTo(first.memory().memoryId());
     }
+
+    @Test
+    void mergesStrongerEvidenceIntoExistingActiveMemory() {
+        var first = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Gateway timeout requires shorter retry windows",
+            "Retry gateway timeouts with a tighter window.",
+            MemorySourceType.EXECUTION_RESULT,
+            "execution-merge-1",
+            "task-phase4-04",
+            List.of("payment", "retry"),
+            0.71f,
+            "First execution showed a gateway timeout after three retries.",
+            Map.of("errorCode", "GW_TIMEOUT", "module", "payment")
+        ));
+        var second = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Gateway timeout requires shorter retry windows",
+            "Retry gateway timeouts with a tighter assertion and retry window.",
+            MemorySourceType.EXECUTION_RESULT,
+            "execution-merge-2",
+            "task-phase4-04",
+            List.of("retry", "payment", "timeout"),
+            0.9f,
+            "Second execution confirmed the same gateway timeout and showed the tighter retry window works better.",
+            Map.of("errorCode", "GW_TIMEOUT", "module", "payment")
+        ));
+
+        assertThat(second.accepted()).isTrue();
+        assertThat(second.created()).isFalse();
+        assertThat(second.duplicateSuppressed()).isTrue();
+        assertThat(second.memory().memoryId()).isEqualTo(first.memory().memoryId());
+        assertThat(second.memory().confidence()).isEqualTo(0.9f);
+        assertThat(second.memory().importance()).isGreaterThanOrEqualTo(first.memory().importance());
+        assertThat(second.memory().fullContent())
+            .contains("First execution showed a gateway timeout")
+            .contains("Second execution confirmed the same gateway timeout");
+        assertThat(second.memory().metadata())
+            .containsEntry("mergeCount", 2)
+            .containsEntry("evidenceCount", 2);
+        assertThat((List<String>) second.memory().metadata().get("mergedSourceRefs"))
+            .contains("execution-merge-1", "execution-merge-2");
+    }
+
+    @Test
+    void createsSeparateMemoryForNonDuplicateCandidates() {
+        var first = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Payment timeout retry guidance",
+            "Retry payment gateway timeouts with a tighter window.",
+            MemorySourceType.EXECUTION_RESULT,
+            "execution-non-dup-1",
+            "task-phase4-04-a",
+            List.of("payment", "retry"),
+            0.86f,
+            "Timeout happened on payment flow.",
+            Map.of("errorCode", "GW_TIMEOUT", "module", "payment")
+        ));
+        var second = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Order auth requires tenant bootstrap",
+            "Order auth failures require tenant bootstrap before the request.",
+            MemorySourceType.OBSERVATION,
+            "execution-non-dup-2",
+            "task-phase4-04-b",
+            List.of("order", "auth"),
+            0.88f,
+            "Observed 401 on order flow without tenant bootstrap.",
+            Map.of("errorCode", "AUTH_401", "module", "order")
+        ));
+
+        assertThat(second.created()).isTrue();
+        assertThat(second.memory().memoryId()).isNotEqualTo(first.memory().memoryId());
+    }
+
+    @Test
+    void doesNotReviveArchivedOrInactiveMemoriesSilently() {
+        var archived = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Gateway timeout retry guidance",
+            "Retry gateway timeouts with a smaller assertion window.",
+            MemorySourceType.EXECUTION_RESULT,
+            "execution-archived-1",
+            "task-phase4-04-archived",
+            List.of("payment", "retry"),
+            0.83f,
+            "Archived baseline evidence for gateway timeout.",
+            Map.of("errorCode", "GW_TIMEOUT")
+        ));
+        memoryRefineryService.archiveMemory(archived.memory().memoryId());
+
+        var archivedReplacement = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Gateway timeout retry guidance",
+            "Retry gateway timeouts with a smaller assertion window.",
+            MemorySourceType.EXECUTION_RESULT,
+            "execution-archived-2",
+            "task-phase4-04-archived",
+            List.of("retry", "payment"),
+            0.84f,
+            "Fresh evidence should create a new active memory instead of reviving the archived one.",
+            Map.of("errorCode", "GW_TIMEOUT")
+        ));
+
+        var inactive = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Order tenant bootstrap guidance",
+            "Bootstrap tenant context before order auth checks.",
+            MemorySourceType.OBSERVATION,
+            "execution-inactive-1",
+            "task-phase4-04-inactive",
+            List.of("order", "tenant"),
+            0.8f,
+            "Inactive baseline evidence for tenant bootstrap.",
+            Map.of("errorCode", "AUTH_401", "module", "order")
+        ));
+        memoryRefineryService.deactivateMemory(inactive.memory().memoryId());
+
+        var inactiveReplacement = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Order tenant bootstrap guidance",
+            "Bootstrap tenant context before order auth checks.",
+            MemorySourceType.OBSERVATION,
+            "execution-inactive-2",
+            "task-phase4-04-inactive",
+            List.of("tenant", "order"),
+            0.86f,
+            "Fresh evidence should create a new active memory instead of reviving the inactive one.",
+            Map.of("errorCode", "AUTH_401", "module", "order")
+        ));
+
+        assertThat(archivedReplacement.created()).isTrue();
+        assertThat(archivedReplacement.memory().memoryId()).isNotEqualTo(archived.memory().memoryId());
+        assertThat(inactiveReplacement.created()).isTrue();
+        assertThat(inactiveReplacement.memory().memoryId()).isNotEqualTo(inactive.memory().memoryId());
+    }
 }
