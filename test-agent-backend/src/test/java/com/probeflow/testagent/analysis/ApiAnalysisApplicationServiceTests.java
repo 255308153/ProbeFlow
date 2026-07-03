@@ -3,6 +3,7 @@ package com.probeflow.testagent.analysis;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.probeflow.testagent.apispec.ApiSpecRepository;
+import com.probeflow.testagent.apispec.ApiSpecSourceType;
 import com.probeflow.testagent.apispec.HttpMethod;
 import com.probeflow.testagent.sourcematerial.IngestStatus;
 import com.probeflow.testagent.sourcematerial.MaterialType;
@@ -320,6 +321,100 @@ class ApiAnalysisApplicationServiceTests {
             .extracting(step -> step.getStepStatus())
             .containsExactly(PlanStepStatus.SUCCESS, PlanStepStatus.SUCCESS, PlanStepStatus.FAILED);
         assertThat(apiSpecs.count()).isZero();
+    }
+
+    @Test
+    void springSourceDirectoryImportsControllerRoutesAndBasicParameters() throws Exception {
+        var sourceRoot = tempDir.resolve("spring-source");
+        var controllerDir = sourceRoot.resolve("src/main/java/com/example/orders");
+        Files.createDirectories(controllerDir);
+        var controllerFile = controllerDir.resolve("OrderController.java");
+        Files.writeString(controllerFile, """
+            package com.example.orders;
+
+            import org.springframework.http.ResponseEntity;
+            import org.springframework.web.bind.annotation.GetMapping;
+            import org.springframework.web.bind.annotation.PathVariable;
+            import org.springframework.web.bind.annotation.PostMapping;
+            import org.springframework.web.bind.annotation.RequestBody;
+            import org.springframework.web.bind.annotation.RequestHeader;
+            import org.springframework.web.bind.annotation.RequestMapping;
+            import org.springframework.web.bind.annotation.RequestParam;
+            import org.springframework.web.bind.annotation.RestController;
+
+            @RestController
+            @RequestMapping("/api/orders")
+            class OrderController {
+
+                @GetMapping("/{orderId}")
+                ResponseEntity<OrderResponse> getOrder(
+                    @PathVariable("orderId") String orderId,
+                    @RequestParam(name = "includeItems", required = false) boolean includeItems,
+                    @RequestHeader("X-Trace-Id") String traceId
+                ) {
+                    return null;
+                }
+
+                @PostMapping
+                OrderResponse createOrder(@RequestBody CreateOrderRequest request) {
+                    return null;
+                }
+            }
+
+            class CreateOrderRequest {
+                private String skuId;
+            }
+
+            class OrderResponse {
+                private String orderId;
+            }
+            """);
+
+        var result = apiAnalysis.analyze(ApiAnalysisRequest.createMaterial(
+            MaterialType.SOURCE_DIRECTORY,
+            "spring-source",
+            sourceRoot.toString(),
+            sourceRoot.toString(),
+            "tester"
+        ));
+
+        assertThat(result.succeeded()).isTrue();
+        assertThat(result.parserRoute()).isEqualTo("spring-source");
+        assertThat(result.apiSpecIds()).hasSize(2);
+
+        var specs = apiSpecs.findBySourceMaterialIdOrderByPathAscHttpMethodAsc(result.materialId());
+        assertThat(specs).hasSize(2);
+
+        assertThat(specs).anySatisfy(spec -> {
+            assertThat(spec.getSourceType()).isEqualTo(ApiSpecSourceType.CODE_ANALYSIS);
+            assertThat(spec.getHttpMethod()).isEqualTo(HttpMethod.GET);
+            assertThat(spec.getPath()).isEqualTo("/api/orders/{orderId}");
+            assertThat(spec.getModuleName()).isEqualTo("orders");
+            assertThat(spec.getSummary()).isEqualTo("OrderController#getOrder");
+            assertThat(spec.getParameters()).containsKeys("path", "query", "header");
+            assertThat(spec.getSourceLocation())
+                .containsEntry("className", "OrderController")
+                .containsEntry("methodName", "getOrder")
+                .containsEntry("filePath", controllerFile.toString());
+            assertThat(spec.getSourceLocation()).containsKey("line");
+            assertThat(spec.isRouteReady()).isTrue();
+            assertThat(spec.isBasicParamReady()).isTrue();
+            assertThat(spec.isKnowledgeContextReady()).isFalse();
+        });
+
+        assertThat(specs).anySatisfy(spec -> {
+            assertThat(spec.getHttpMethod()).isEqualTo(HttpMethod.POST);
+            assertThat(spec.getPath()).isEqualTo("/api/orders");
+            assertThat(spec.getParameters()).containsKey("requestBody");
+            assertThat(spec.getSourceRef()).contains("OrderController#createOrder");
+        });
+
+        var task = tasks.findById(result.taskId()).orElseThrow();
+        assertThat(task.getStatus()).isEqualTo(TaskStatus.COMPLETED);
+        assertThat(task.getMetadata()).containsEntry("parserRoute", "spring-source");
+        assertThat(planSteps.findByTaskIdOrderByStepOrderAsc(result.taskId()))
+            .extracting(step -> step.getStepStatus())
+            .containsOnly(PlanStepStatus.SUCCESS);
     }
 
     @Test

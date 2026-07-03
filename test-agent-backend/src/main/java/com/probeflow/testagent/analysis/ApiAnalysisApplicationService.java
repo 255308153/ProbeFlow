@@ -1,5 +1,18 @@
 package com.probeflow.testagent.analysis;
 
+import com.github.javaparser.JavaParser;
+import com.github.javaparser.ParserConfiguration;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.expr.AnnotationExpr;
+import com.github.javaparser.ast.expr.ArrayInitializerExpr;
+import com.github.javaparser.ast.expr.Expression;
+import com.github.javaparser.ast.expr.FieldAccessExpr;
+import com.github.javaparser.ast.expr.MemberValuePair;
+import com.github.javaparser.ast.expr.NameExpr;
+import com.github.javaparser.ast.expr.NormalAnnotationExpr;
+import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
 import com.probeflow.testagent.apispec.ApiSpec;
 import com.probeflow.testagent.apispec.ApiSpecRepository;
 import com.probeflow.testagent.apispec.ApiSpecSourceType;
@@ -19,6 +32,7 @@ import com.probeflow.testagent.task.TaskSourceType;
 import com.probeflow.testagent.task.TaskStatus;
 import com.probeflow.testagent.task.TaskType;
 import com.probeflow.testagent.testcasedraft.PromotionMode;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -29,6 +43,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.Operation;
 import io.swagger.v3.oas.models.PathItem;
@@ -100,6 +115,9 @@ public class ApiAnalysisApplicationService {
         if (material.getMaterialType() == MaterialType.SWAGGER_FILE) {
             return rejectUnsupportedSwagger(material, task, route);
         }
+        if (material.getMaterialType() == MaterialType.SOURCE_DIRECTORY) {
+            return analyzeSpringSource(material, task, route);
+        }
 
         task.setStatus(TaskStatus.COMPLETED);
         task.setMetadata(Map.of("parserRoute", route, "apiSpecCount", 0));
@@ -117,6 +135,39 @@ public class ApiAnalysisApplicationService {
         var message = "Swagger 2.x input is not supported by API analysis yet";
         failStep(swaggerStep, "SWAGGER_UNSUPPORTED", message);
         return failAnalysis(material, task, route, "SWAGGER_UNSUPPORTED", message);
+    }
+
+    private ApiAnalysisResult analyzeSpringSource(SourceMaterial material, Task task, String route) {
+        var parseStep = createStep(task.getTaskId(), 3, "Parse Spring controller source", material.getStoragePath());
+        var mergeStep = createStep(task.getTaskId(), 4, "Persist ApiSpec operations", material.getMaterialId());
+
+        var parseResult = parseSpringSource(material);
+        if (!parseResult.succeeded()) {
+            failStep(parseStep, parseResult.errorCode(), parseResult.errorMessage());
+            skipStep(mergeStep, "Spring source parse failed");
+            return failAnalysis(material, task, route, parseResult.errorCode(), parseResult.errorMessage());
+        }
+        succeedStep(parseStep, "Parsed Spring routes: " + parseResult.operations().size());
+
+        var savedSpecs = new ArrayList<ApiSpec>();
+        var latestRouteKeys = new LinkedHashSet<String>();
+        for (var operation : parseResult.operations()) {
+            latestRouteKeys.add(routeKey(operation.httpMethod(), operation.path()));
+            savedSpecs.add(upsertSpringApiSpec(material, parseResult.systemName(), operation));
+        }
+        markRoutesAbsentFromLatestAnalysis(material.getMaterialId(), latestRouteKeys);
+        var apiSpecIds = savedSpecs.stream().map(ApiSpec::getApiSpecId).toList();
+        succeedStep(mergeStep, "Persisted ApiSpec operations: " + apiSpecIds.size());
+
+        task.setStatus(TaskStatus.COMPLETED);
+        task.setTargetApiSpecIds(apiSpecIds);
+        task.setMetadata(Map.of("parserRoute", route, "apiSpecCount", apiSpecIds.size()));
+        tasks.save(task);
+
+        material.setIngestStatus(IngestStatus.READY);
+        sourceMaterials.save(material);
+
+        return ApiAnalysisResult.success(material.getMaterialId(), task.getTaskId(), route, apiSpecIds);
     }
 
     private ApiAnalysisResult analyzeOpenApi(SourceMaterial material, Task task, String route) {
@@ -170,14 +221,41 @@ public class ApiAnalysisApplicationService {
         return existing;
     }
 
+    private ApiSpec upsertSpringApiSpec(SourceMaterial material, String systemName, ParsedSpringOperation operation) {
+        var existing = findExistingApiSpec(
+            material.getMaterialId(),
+            operation.operationId(),
+            operation.httpMethod(),
+            operation.path()
+        );
+        if (existing == null) {
+            return apiSpecs.save(toSpringApiSpec(material, systemName, operation));
+        }
+
+        var changed = applySpringApiSpecChanges(existing, material, systemName, operation);
+        if (changed) {
+            existing.setVersion(existing.getVersion() + 1);
+            return apiSpecs.save(existing);
+        }
+        if (!existing.isPresentInLatestAnalysis()) {
+            existing.setPresentInLatestAnalysis(true);
+            return apiSpecs.save(existing);
+        }
+        return existing;
+    }
+
     private ApiSpec findExistingApiSpec(String materialId, ParsedOpenApiOperation operation) {
-        if (operation.operationId() != null && !operation.operationId().isBlank()) {
-            var byOperationId = apiSpecs.findFirstBySourceMaterialIdAndOperationId(materialId, operation.operationId());
+        return findExistingApiSpec(materialId, operation.operationId(), operation.httpMethod(), operation.path());
+    }
+
+    private ApiSpec findExistingApiSpec(String materialId, String operationId, HttpMethod httpMethod, String path) {
+        if (operationId != null && !operationId.isBlank()) {
+            var byOperationId = apiSpecs.findFirstBySourceMaterialIdAndOperationId(materialId, operationId);
             if (byOperationId.isPresent()) {
                 return byOperationId.get();
             }
         }
-        return apiSpecs.findFirstBySourceMaterialIdAndHttpMethodAndPath(materialId, operation.httpMethod(), operation.path())
+        return apiSpecs.findFirstBySourceMaterialIdAndHttpMethodAndPath(materialId, httpMethod, path)
             .orElse(null);
     }
 
@@ -207,6 +285,37 @@ public class ApiAnalysisApplicationService {
         apiSpec.setDtoExpanded(true);
         apiSpec.setValidationReady(true);
         apiSpec.setAuthReady(true);
+        apiSpec.setKnowledgeContextReady(false);
+        apiSpec.setPresentInLatestAnalysis(true);
+        return changed;
+    }
+
+    private boolean applySpringApiSpecChanges(
+        ApiSpec apiSpec,
+        SourceMaterial material,
+        String systemName,
+        ParsedSpringOperation operation
+    ) {
+        var changed = false;
+        changed |= setIfChanged(apiSpec.getSystemName(), systemName, apiSpec::setSystemName);
+        changed |= setIfChanged(apiSpec.getModuleName(), operation.moduleName(), apiSpec::setModuleName);
+        changed |= setIfChanged(apiSpec.getHttpMethod(), operation.httpMethod(), apiSpec::setHttpMethod);
+        changed |= setIfChanged(apiSpec.getPath(), operation.path(), apiSpec::setPath);
+        changed |= setIfChanged(apiSpec.getSummary(), operation.summary(), apiSpec::setSummary);
+        changed |= setIfChanged(apiSpec.getDescription(), operation.description(), apiSpec::setDescription);
+        changed |= setIfChanged(apiSpec.getOperationId(), operation.operationId(), apiSpec::setOperationId);
+        changed |= setIfChanged(apiSpec.getParameters(), operation.parameters(), apiSpec::setParameters);
+        changed |= setIfChanged(apiSpec.getConstraints(), operation.constraints(), apiSpec::setConstraints);
+        changed |= setIfChanged(apiSpec.getAuth(), operation.auth(), apiSpec::setAuth);
+        changed |= setIfChanged(apiSpec.getSourceRef(), sourceRef(material, operation), apiSpec::setSourceRef);
+        changed |= setIfChanged(apiSpec.getSourceLocation(), operation.sourceLocation(), apiSpec::setSourceLocation);
+        apiSpec.setSourceType(ApiSpecSourceType.CODE_ANALYSIS);
+        apiSpec.setSourceMaterialId(material.getMaterialId());
+        apiSpec.setRouteReady(true);
+        apiSpec.setBasicParamReady(true);
+        apiSpec.setDtoExpanded(false);
+        apiSpec.setValidationReady(false);
+        apiSpec.setAuthReady(false);
         apiSpec.setKnowledgeContextReady(false);
         apiSpec.setPresentInLatestAnalysis(true);
         return changed;
@@ -259,6 +368,119 @@ public class ApiAnalysisApplicationService {
         }
 
         return OpenApiParseOutcome.success(systemName(openApi), operations);
+    }
+
+    private SpringSourceParseOutcome parseSpringSource(SourceMaterial material) {
+        var sourceRoot = Path.of(material.getStoragePath());
+        var parser = new JavaParser(new ParserConfiguration());
+        var operations = new ArrayList<ParsedSpringOperation>();
+        var errors = new ArrayList<String>();
+
+        try (var paths = Files.walk(sourceRoot)) {
+            var javaFiles = paths
+                .filter(path -> Files.isRegularFile(path) && path.toString().endsWith(".java"))
+                .sorted()
+                .toList();
+
+            for (var javaFile : javaFiles) {
+                var parseResult = parser.parse(javaFile);
+                if (parseResult.getResult().isEmpty()) {
+                    errors.add(javaFile + ": " + parseResult.getProblems());
+                    continue;
+                }
+                operations.addAll(extractSpringOperations(material, sourceRoot, javaFile, parseResult.getResult().orElseThrow()));
+            }
+        } catch (IOException exception) {
+            return SpringSourceParseOutcome.failure("SPRING_SOURCE_NOT_READABLE", exception.getMessage());
+        }
+
+        if (operations.isEmpty()) {
+            var message = errors.isEmpty()
+                ? "No Spring @RestController routes were found"
+                : "No Spring @RestController routes were found; parse errors: " + String.join("; ", errors);
+            return SpringSourceParseOutcome.failure("NO_APIS_FOUND", message);
+        }
+
+        return SpringSourceParseOutcome.success(systemNameForSource(material), operations, errors);
+    }
+
+    private List<ParsedSpringOperation> extractSpringOperations(
+        SourceMaterial material,
+        Path sourceRoot,
+        Path javaFile,
+        CompilationUnit compilationUnit
+    ) {
+        var operations = new ArrayList<ParsedSpringOperation>();
+        for (var controller : compilationUnit.findAll(ClassOrInterfaceDeclaration.class)) {
+            if (!hasAnnotation(controller.getAnnotations(), "RestController")) {
+                continue;
+            }
+
+            var classPaths = mappingPaths(controller.getAnnotations(), "RequestMapping");
+            var packageName = compilationUnit.getPackageDeclaration()
+                .map(packageDeclaration -> packageDeclaration.getNameAsString())
+                .orElse("");
+            var moduleName = moduleName(packageName, controller.getNameAsString());
+
+            for (var method : controller.getMethods()) {
+                var mapping = methodMapping(method);
+                if (mapping == null) {
+                    continue;
+                }
+
+                for (var httpMethod : mapping.httpMethods()) {
+                    for (var classPath : classPaths) {
+                        for (var methodPath : mapping.paths()) {
+                            operations.add(toSpringOperation(
+                                material,
+                                sourceRoot,
+                                javaFile,
+                                controller,
+                                method,
+                                httpMethod,
+                                combinePaths(classPath, methodPath),
+                                moduleName
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        return operations;
+    }
+
+    private ParsedSpringOperation toSpringOperation(
+        SourceMaterial material,
+        Path sourceRoot,
+        Path javaFile,
+        ClassOrInterfaceDeclaration controller,
+        MethodDeclaration method,
+        HttpMethod httpMethod,
+        String path,
+        String moduleName
+    ) {
+        var sourceLocation = new LinkedHashMap<String, Object>();
+        sourceLocation.put("materialId", material.getMaterialId());
+        sourceLocation.put("filePath", javaFile.toString());
+        sourceLocation.put("relativePath", sourceRoot.relativize(javaFile).toString());
+        sourceLocation.put("className", controller.getNameAsString());
+        sourceLocation.put("methodName", method.getNameAsString());
+        method.getBegin().ifPresent(position -> sourceLocation.put("line", position.line));
+
+        return new ParsedSpringOperation(
+            httpMethod,
+            path,
+            moduleName,
+            controller.getNameAsString() + "#" + method.getNameAsString(),
+            null,
+            controller.getNameAsString() + "#" + method.getNameAsString(),
+            springParameters(method),
+            new LinkedHashMap<>(),
+            new LinkedHashMap<>(),
+            sourceLocation,
+            controller.getNameAsString(),
+            method.getNameAsString()
+        );
     }
 
     private ParsedOpenApiOperation toParsedOperation(
@@ -316,8 +538,41 @@ public class ApiAnalysisApplicationService {
         return apiSpec;
     }
 
+    private ApiSpec toSpringApiSpec(SourceMaterial material, String systemName, ParsedSpringOperation operation) {
+        var apiSpec = new ApiSpec();
+        apiSpec.setSystemName(systemName);
+        apiSpec.setModuleName(operation.moduleName());
+        apiSpec.setHttpMethod(operation.httpMethod());
+        apiSpec.setPath(operation.path());
+        apiSpec.setSummary(operation.summary());
+        apiSpec.setDescription(operation.description());
+        apiSpec.setOperationId(operation.operationId());
+        apiSpec.setParameters(operation.parameters());
+        apiSpec.setConstraints(operation.constraints());
+        apiSpec.setAuth(operation.auth());
+        apiSpec.setSourceType(ApiSpecSourceType.CODE_ANALYSIS);
+        apiSpec.setSourceMaterialId(material.getMaterialId());
+        apiSpec.setSourceRef(sourceRef(material, operation));
+        apiSpec.setSourceLocation(operation.sourceLocation());
+        apiSpec.setVersion(1);
+        apiSpec.setRouteReady(true);
+        apiSpec.setBasicParamReady(true);
+        apiSpec.setDtoExpanded(false);
+        apiSpec.setValidationReady(false);
+        apiSpec.setAuthReady(false);
+        apiSpec.setKnowledgeContextReady(false);
+        apiSpec.setPresentInLatestAnalysis(true);
+        return apiSpec;
+    }
+
     private String sourceRef(SourceMaterial material, ParsedOpenApiOperation operation) {
         return "openapi://" + material.getMaterialId() + "#/paths/" + jsonPointerPath(operation.path()) + "/" + operation.httpMethod().name().toLowerCase();
+    }
+
+    private String sourceRef(SourceMaterial material, ParsedSpringOperation operation) {
+        return "spring-source://" + material.getMaterialId()
+            + "#" + operation.className() + "#" + operation.methodName()
+            + "[" + operation.httpMethod().name() + " " + operation.path() + "]";
     }
 
     private Map<String, Object> sourceLocation(SourceMaterial material, ParsedOpenApiOperation operation) {
@@ -420,6 +675,190 @@ public class ApiAnalysisApplicationService {
         };
     }
 
+    private boolean hasAnnotation(List<AnnotationExpr> annotations, String annotationName) {
+        return annotations.stream().anyMatch(annotation -> annotationName(annotation).equals(annotationName));
+    }
+
+    private SpringMapping methodMapping(MethodDeclaration method) {
+        for (var annotation : method.getAnnotations()) {
+            var annotationName = annotationName(annotation);
+            var methods = switch (annotationName) {
+                case "GetMapping" -> List.of(HttpMethod.GET);
+                case "PostMapping" -> List.of(HttpMethod.POST);
+                case "PutMapping" -> List.of(HttpMethod.PUT);
+                case "DeleteMapping" -> List.of(HttpMethod.DELETE);
+                case "PatchMapping" -> List.of(HttpMethod.PATCH);
+                case "RequestMapping" -> requestMappingMethods(annotation);
+                default -> List.<HttpMethod>of();
+            };
+            if (!methods.isEmpty()) {
+                return new SpringMapping(mappingPaths(annotation), methods);
+            }
+        }
+        return null;
+    }
+
+    private List<HttpMethod> requestMappingMethods(AnnotationExpr annotation) {
+        return annotationMember(annotation, "method")
+            .map(this::httpMethods)
+            .filter(methods -> !methods.isEmpty())
+            .orElse(List.of(HttpMethod.GET, HttpMethod.POST, HttpMethod.PUT, HttpMethod.DELETE, HttpMethod.PATCH));
+    }
+
+    private List<HttpMethod> httpMethods(Expression expression) {
+        if (expression.isArrayInitializerExpr()) {
+            return expression.asArrayInitializerExpr().getValues().stream()
+                .map(this::httpMethod)
+                .flatMap(Optional::stream)
+                .toList();
+        }
+        return httpMethod(expression).map(List::of).orElse(List.of());
+    }
+
+    private Optional<HttpMethod> httpMethod(Expression expression) {
+        var methodName = switch (expression) {
+            case FieldAccessExpr fieldAccess -> fieldAccess.getNameAsString();
+            case NameExpr name -> name.getNameAsString();
+            default -> null;
+        };
+        if (methodName == null) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(HttpMethod.valueOf(methodName));
+        } catch (IllegalArgumentException ignored) {
+            return Optional.empty();
+        }
+    }
+
+    private List<String> mappingPaths(List<AnnotationExpr> annotations, String annotationName) {
+        return annotations.stream()
+            .filter(annotation -> annotationName(annotation).equals(annotationName))
+            .findFirst()
+            .map(this::mappingPaths)
+            .orElse(List.of(""));
+    }
+
+    private List<String> mappingPaths(AnnotationExpr annotation) {
+        return annotationMember(annotation, "path")
+            .or(() -> annotationMember(annotation, "value"))
+            .map(this::stringValues)
+            .filter(values -> !values.isEmpty())
+            .orElse(List.of(""));
+    }
+
+    private Optional<Expression> annotationMember(AnnotationExpr annotation, String memberName) {
+        if (annotation instanceof SingleMemberAnnotationExpr singleMember && memberName.equals("value")) {
+            return Optional.of(singleMember.getMemberValue());
+        }
+        if (annotation instanceof NormalAnnotationExpr normalAnnotation) {
+            return normalAnnotation.getPairs().stream()
+                .filter(pair -> pair.getNameAsString().equals(memberName))
+                .findFirst()
+                .map(MemberValuePair::getValue);
+        }
+        return Optional.empty();
+    }
+
+    private List<String> stringValues(Expression expression) {
+        if (expression.isStringLiteralExpr()) {
+            return List.of(expression.asStringLiteralExpr().asString());
+        }
+        if (expression instanceof ArrayInitializerExpr arrayInitializer) {
+            return arrayInitializer.getValues().stream()
+                .filter(Expression::isStringLiteralExpr)
+                .map(value -> value.asStringLiteralExpr().asString())
+                .toList();
+        }
+        return List.of();
+    }
+
+    private String annotationName(AnnotationExpr annotation) {
+        var name = annotation.getNameAsString();
+        var separator = name.lastIndexOf('.');
+        return separator == -1 ? name : name.substring(separator + 1);
+    }
+
+    private Map<String, Object> springParameters(MethodDeclaration method) {
+        var parameters = new LinkedHashMap<String, Object>();
+        for (var parameter : method.getParameters()) {
+            for (var annotation : parameter.getAnnotations()) {
+                switch (annotationName(annotation)) {
+                    case "PathVariable" -> parameterBucket(parameters, "path").add(parameterShape(annotation, parameter, true));
+                    case "RequestParam" -> parameterBucket(parameters, "query").add(parameterShape(annotation, parameter, required(annotation, true)));
+                    case "RequestHeader" -> parameterBucket(parameters, "header").add(parameterShape(annotation, parameter, required(annotation, true)));
+                    case "RequestBody" -> parameters.put("requestBody", requestBodyShape(annotation, parameter));
+                    default -> {
+                    }
+                }
+            }
+        }
+        return parameters;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> parameterBucket(Map<String, Object> parameters, String key) {
+        return (List<Map<String, Object>>) parameters.computeIfAbsent(key, ignored -> new ArrayList<Map<String, Object>>());
+    }
+
+    private Map<String, Object> parameterShape(
+        AnnotationExpr annotation,
+        com.github.javaparser.ast.body.Parameter parameter,
+        boolean required
+    ) {
+        var shape = new LinkedHashMap<String, Object>();
+        shape.put("name", annotationStringValue(annotation, "name")
+            .or(() -> annotationStringValue(annotation, "value"))
+            .orElse(parameter.getNameAsString()));
+        shape.put("type", parameter.getTypeAsString());
+        shape.put("required", required);
+        return shape;
+    }
+
+    private Map<String, Object> requestBodyShape(AnnotationExpr annotation, com.github.javaparser.ast.body.Parameter parameter) {
+        var body = new LinkedHashMap<String, Object>();
+        body.put("name", parameter.getNameAsString());
+        body.put("type", parameter.getTypeAsString());
+        body.put("required", required(annotation, true));
+        return body;
+    }
+
+    private Optional<String> annotationStringValue(AnnotationExpr annotation, String memberName) {
+        return annotationMember(annotation, memberName)
+            .filter(Expression::isStringLiteralExpr)
+            .map(value -> value.asStringLiteralExpr().asString());
+    }
+
+    private boolean required(AnnotationExpr annotation, boolean defaultValue) {
+        return annotationMember(annotation, "required")
+            .filter(Expression::isBooleanLiteralExpr)
+            .map(value -> value.asBooleanLiteralExpr().getValue())
+            .orElse(defaultValue);
+    }
+
+    private String combinePaths(String classPath, String methodPath) {
+        if ((classPath == null || classPath.isBlank()) && (methodPath == null || methodPath.isBlank())) {
+            return "/";
+        }
+        return normalizePath((classPath == null ? "" : classPath) + "/" + (methodPath == null ? "" : methodPath));
+    }
+
+    private String moduleName(String packageName, String className) {
+        if (packageName == null || packageName.isBlank()) {
+            return className;
+        }
+        var separator = packageName.lastIndexOf('.');
+        return separator == -1 ? packageName : packageName.substring(separator + 1);
+    }
+
+    private String systemNameForSource(SourceMaterial material) {
+        var path = Path.of(material.getStoragePath()).getFileName();
+        if (path != null && !path.toString().isBlank()) {
+            return path.toString();
+        }
+        return "source-system";
+    }
+
     private HttpMethod toHttpMethod(PathItem.HttpMethod method) {
         return switch (method) {
             case GET -> HttpMethod.GET;
@@ -443,7 +882,11 @@ public class ApiAnalysisApplicationService {
             return "/";
         }
         var normalized = path.trim().replaceAll("/{2,}", "/");
-        return normalized.startsWith("/") ? normalized : "/" + normalized;
+        normalized = normalized.startsWith("/") ? normalized : "/" + normalized;
+        if (normalized.length() > 1 && normalized.endsWith("/")) {
+            return normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
     }
 
     private String jsonPointerPath(String path) {
@@ -702,6 +1145,24 @@ public class ApiAnalysisApplicationService {
         }
     }
 
+    private record SpringSourceParseOutcome(
+        boolean succeeded,
+        String systemName,
+        List<ParsedSpringOperation> operations,
+        List<String> warnings,
+        String errorCode,
+        String errorMessage
+    ) {
+
+        static SpringSourceParseOutcome success(String systemName, List<ParsedSpringOperation> operations, List<String> warnings) {
+            return new SpringSourceParseOutcome(true, systemName, List.copyOf(operations), List.copyOf(warnings), null, null);
+        }
+
+        static SpringSourceParseOutcome failure(String errorCode, String errorMessage) {
+            return new SpringSourceParseOutcome(false, null, List.of(), List.of(), errorCode, errorMessage);
+        }
+    }
+
     private record ParsedOpenApiOperation(
         HttpMethod httpMethod,
         String path,
@@ -713,5 +1174,24 @@ public class ApiAnalysisApplicationService {
         Map<String, Object> constraints,
         Map<String, Object> auth
     ) {
+    }
+
+    private record ParsedSpringOperation(
+        HttpMethod httpMethod,
+        String path,
+        String moduleName,
+        String summary,
+        String description,
+        String operationId,
+        Map<String, Object> parameters,
+        Map<String, Object> constraints,
+        Map<String, Object> auth,
+        Map<String, Object> sourceLocation,
+        String className,
+        String methodName
+    ) {
+    }
+
+    private record SpringMapping(List<String> paths, List<HttpMethod> httpMethods) {
     }
 }
