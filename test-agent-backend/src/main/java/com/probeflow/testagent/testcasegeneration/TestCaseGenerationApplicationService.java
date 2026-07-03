@@ -80,9 +80,17 @@ public class TestCaseGenerationApplicationService {
 
         var plan = planScenarioIntents(apiSpec, context, requestedCategories);
         var createdDraftIds = new ArrayList<String>();
+        var updatedDraftIds = new ArrayList<String>();
+        var duplicateSuppressed = 0;
+        var protectedSkipped = 0;
         for (var intent : plan.intents()) {
-            var draft = drafts.save(draftFromIntent(task.getTaskId(), task.getPromotionMode(), apiSpec, context, tokenBudget(request), intent));
-            createdDraftIds.add(draft.getDraftId());
+            var persistence = persistDraft(task.getTaskId(), task.getPromotionMode(), apiSpec, context, tokenBudget(request), intent);
+            switch (persistence.action()) {
+                case CREATED -> createdDraftIds.add(persistence.draftId());
+                case UPDATED -> updatedDraftIds.add(persistence.draftId());
+                case DUPLICATE_SUPPRESSED -> duplicateSuppressed++;
+                case PROTECTED_SKIPPED -> protectedSkipped++;
+            }
         }
         return new TestCaseGenerationResult(
             task.getTaskId(),
@@ -94,8 +102,60 @@ public class TestCaseGenerationApplicationService {
             plan.skippedCategories(),
             plan.unsupportedCategories(),
             warnings(context),
-            new TestCaseGenerationCounts(createdDraftIds.size(), 0, plan.skippedCategories().size() + plan.unsupportedCategories().size(), 0)
+            new TestCaseGenerationCounts(
+                createdDraftIds.size(),
+                updatedDraftIds.size(),
+                plan.skippedCategories().size() + plan.unsupportedCategories().size() + protectedSkipped,
+                duplicateSuppressed
+            )
         );
+    }
+
+    private DraftPersistenceResult persistDraft(
+        String taskId,
+        PromotionMode promotionMode,
+        ApiSpec apiSpec,
+        ContextBundle context,
+        int tokenBudget,
+        ScenarioIntent intent
+    ) {
+        var incoming = draftFromIntent(taskId, promotionMode, apiSpec, context, tokenBudget, intent);
+        var existingDrafts = drafts.findByTaskIdAndDedupKeyOrderByCreatedAtAsc(taskId, incoming.getDedupKey());
+        if (existingDrafts.isEmpty()) {
+            var saved = drafts.save(incoming);
+            return new DraftPersistenceResult(DraftPersistenceAction.CREATED, saved.getDraftId());
+        }
+
+        var updateCandidate = existingDrafts.stream()
+            .filter(this::canUpdateDraft)
+            .findFirst();
+        if (updateCandidate.isEmpty()) {
+            return new DraftPersistenceResult(DraftPersistenceAction.PROTECTED_SKIPPED, existingDrafts.getFirst().getDraftId());
+        }
+
+        var draft = updateCandidate.get();
+        if (draftEquivalent(draft, incoming)) {
+            return new DraftPersistenceResult(DraftPersistenceAction.DUPLICATE_SUPPRESSED, draft.getDraftId());
+        }
+
+        draft.setSource(incoming.getSource());
+        draft.setStage(incoming.getStage());
+        draft.setStatus(incoming.getStatus());
+        draft.setPromotionMode(incoming.getPromotionMode());
+        draft.setTargetApiSpecId(incoming.getTargetApiSpecId());
+        draft.setExpectedStatusCode(incoming.getExpectedStatusCode());
+        draft.setDraftContent(incoming.getDraftContent());
+        var saved = drafts.save(draft);
+        return new DraftPersistenceResult(DraftPersistenceAction.UPDATED, saved.getDraftId());
+    }
+
+    private boolean canUpdateDraft(TestCaseDraft draft) {
+        return draft.getStatus() == DraftStatus.PENDING_REVIEW && !StringUtils.hasText(draft.getPromotedCaseId());
+    }
+
+    private boolean draftEquivalent(TestCaseDraft existing, TestCaseDraft incoming) {
+        return existing.getExpectedStatusCode().equals(incoming.getExpectedStatusCode())
+            && existing.getDraftContent().equals(incoming.getDraftContent());
     }
 
     private void validateSingleRequest(TestCaseGenerationRequest request) {
@@ -788,5 +848,15 @@ public class TestCaseGenerationApplicationService {
         static MemoryEvidence from(LongTermMemoryRetrievalHit hit) {
             return new MemoryEvidence("long_term_memory", hit.memoryId(), hit.sourceRef(), hit.summary());
         }
+    }
+
+    private enum DraftPersistenceAction {
+        CREATED,
+        UPDATED,
+        DUPLICATE_SUPPRESSED,
+        PROTECTED_SKIPPED
+    }
+
+    private record DraftPersistenceResult(DraftPersistenceAction action, String draftId) {
     }
 }

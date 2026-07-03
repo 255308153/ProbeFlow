@@ -368,6 +368,133 @@ class TestCaseGenerationApplicationServiceTests {
             .anySatisfy(warning -> assertThat(warning).asString().contains("CONTEXT_CONFLICT"));
     }
 
+    @Test
+    void repeatedSingleGenerationSuppressesDuplicateDraftsByDedupKey() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var request = new TestCaseGenerationRequest(
+            task.getTaskId(),
+            "phase5-session-04",
+            List.of(apiSpec.getApiSpecId()),
+            TestCaseGenerationMode.SINGLE,
+            List.of(ScenarioCategory.HAPPY_PATH, ScenarioCategory.MISSING_REQUIRED),
+            300
+        );
+
+        var first = generationService.generate(request);
+        var second = generationService.generate(request);
+
+        assertThat(first.counts().created()).isEqualTo(2);
+        assertThat(second.createdDraftIds()).isEmpty();
+        assertThat(second.counts().created()).isZero();
+        assertThat(second.counts().updated()).isZero();
+        assertThat(second.counts().duplicateSuppressed()).isEqualTo(2);
+        assertThat(drafts.findAll()).hasSize(2);
+    }
+
+    @Test
+    void regenerationUpdatesCompatiblePendingDraftWhenContentChanges() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var request = new TestCaseGenerationRequest(
+            task.getTaskId(),
+            "phase5-session-04-update",
+            List.of(apiSpec.getApiSpecId()),
+            TestCaseGenerationMode.SINGLE,
+            List.of(ScenarioCategory.HAPPY_PATH),
+            300
+        );
+
+        var first = generationService.generate(request);
+        var draftId = first.createdDraftIds().getFirst();
+        var draft = drafts.findById(draftId).orElseThrow();
+        var editedContent = new java.util.LinkedHashMap<>(draft.getDraftContent());
+        editedContent.put("description", "stale generated description");
+        draft.setDraftContent(editedContent);
+        drafts.save(draft);
+        entityManager.flush();
+
+        var second = generationService.generate(request);
+
+        assertThat(second.createdDraftIds()).isEmpty();
+        assertThat(second.counts().updated()).isEqualTo(1);
+        assertThat(second.counts().duplicateSuppressed()).isZero();
+        assertThat(drafts.findAll()).hasSize(1);
+        assertThat(drafts.findById(draftId).orElseThrow().getDraftContent().get("description"))
+            .asString()
+            .contains("normal successful HTTP API behavior");
+    }
+
+    @Test
+    void regenerationSkipsPromotedDraftsWithoutOverwriting() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var request = new TestCaseGenerationRequest(
+            task.getTaskId(),
+            "phase5-session-04-promoted",
+            List.of(apiSpec.getApiSpecId()),
+            TestCaseGenerationMode.SINGLE,
+            List.of(ScenarioCategory.HAPPY_PATH),
+            300
+        );
+
+        var first = generationService.generate(request);
+        var draft = drafts.findById(first.createdDraftIds().getFirst()).orElseThrow();
+        var protectedContent = new java.util.LinkedHashMap<>(draft.getDraftContent());
+        protectedContent.put("description", "human approved protected content");
+        draft.setDraftContent(protectedContent);
+        draft.setStatus(DraftStatus.PROMOTED);
+        draft.setPromotedCaseId("case-protected-01");
+        drafts.save(draft);
+        entityManager.flush();
+
+        var second = generationService.generate(request);
+
+        assertThat(second.createdDraftIds()).isEmpty();
+        assertThat(second.counts().skipped()).isEqualTo(1);
+        assertThat(second.counts().updated()).isZero();
+        assertThat(second.counts().duplicateSuppressed()).isZero();
+        var loaded = drafts.findById(draft.getDraftId()).orElseThrow();
+        assertThat(loaded.getPromotedCaseId()).isEqualTo("case-protected-01");
+        assertThat(loaded.getDraftContent().get("description")).isEqualTo("human approved protected content");
+    }
+
+    @Test
+    void contextDerivedScenariosUseDedupOnRepeatedGeneration() {
+        var apiSpec = apiSpecs.save(newPaymentApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        knowledgeIngest.ingest(new KnowledgeIngestRequest(
+            "Payment business rule",
+            KnowledgeContentFormat.MARKDOWN,
+            "POST /api/orders/{orderId}/pay requires tenant bootstrap.",
+            DocumentSourceType.WIKI,
+            "wiki/payment-business-rule.md",
+            DocumentType.DOMAIN_RULE,
+            DocumentAuthority.HIGH,
+            "order-platform",
+            "payment",
+            "order",
+            List.of("payment"),
+            List.of("case_generation"),
+            Map.of()
+        ));
+        var request = new TestCaseGenerationRequest(
+            task.getTaskId(),
+            "phase5-session-04-context",
+            List.of(apiSpec.getApiSpecId()),
+            TestCaseGenerationMode.SINGLE,
+            List.of(ScenarioCategory.BUSINESS_RULE),
+            600
+        );
+
+        var first = generationService.generate(request);
+        var second = generationService.generate(request);
+
+        assertThat(first.counts().created()).isEqualTo(1);
+        assertThat(second.counts().duplicateSuppressed()).isEqualTo(1);
+        assertThat(drafts.findAll()).hasSize(1);
+    }
+
     private ApiSpec newApiSpec() {
         var apiSpec = new ApiSpec();
         apiSpec.setSystemName("order-platform");
