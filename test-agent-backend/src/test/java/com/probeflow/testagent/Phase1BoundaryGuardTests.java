@@ -52,6 +52,7 @@ class Phase1BoundaryGuardTests {
             "task",
             "taskcaseexecution",
             "testcase",
+            "testcasegeneration",
             "testcasedraft"
         ));
     }

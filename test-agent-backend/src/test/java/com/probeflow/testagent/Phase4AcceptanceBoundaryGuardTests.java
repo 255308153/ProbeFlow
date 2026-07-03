@@ -287,8 +287,6 @@ class Phase4AcceptanceBoundaryGuardTests {
             .filter(line -> line.startsWith("@RestController") || line.startsWith("@Controller"))
             .toList();
         var forbiddenTerms = List.of(
-            "TestCaseGenerator",
-            "TestCaseDraftGenerator",
             "HttpExecutionEngine",
             "ReportRenderer",
             "Playwright",
@@ -315,6 +313,8 @@ class Phase4AcceptanceBoundaryGuardTests {
             "MemoryRefineryService",
             "SessionMemoryService",
             "TaskMemoryService",
+            "TestCaseGenerationApplicationService",
+            "TestCasePromotionService",
             "UnifiedContextBuilder"
         );
         assertThat(controllerAnnotations).isEmpty();
