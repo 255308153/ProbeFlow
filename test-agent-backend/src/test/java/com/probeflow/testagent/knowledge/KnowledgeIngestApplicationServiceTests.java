@@ -96,7 +96,19 @@ class KnowledgeIngestApplicationServiceTests {
             .containsEntry("sourceRef", "docs/payment-rules.md")
             .containsEntry("rawContent", request.content());
 
-        assertThat(chunks.findAll()).isEmpty();
+        var storedChunks = chunks.findByDocumentRevisionIdOrderByChunkOrderAsc(result.documentRevisionId());
+        assertThat(storedChunks).isNotEmpty();
+        assertThat(storedChunks).allSatisfy(chunk -> {
+            assertThat(chunk.getChunkStatus()).isEqualTo(ChunkStatus.ACTIVE);
+            assertThat(chunk.getChunkTitle()).isEqualTo("Payment rules");
+            assertThat(chunk.getTokenCount()).isPositive();
+            assertThat(chunk.getTags()).containsExactly("business-rule", "payment");
+            assertThat(chunk.getApplicableStages()).containsExactly("case_generation", "failure_analysis");
+            assertThat(chunk.getMetadata())
+                .containsEntry("contentFormat", "MARKDOWN")
+                .containsEntry("headerPath", List.of("Payment rules"))
+                .containsEntry("chunkKind", "PARAGRAPH");
+        });
     }
 
     @Test
@@ -223,6 +235,143 @@ class KnowledgeIngestApplicationServiceTests {
         assertThat(chunks.count()).isZero();
     }
 
+    @Test
+    void markdownChunkingPreservesHeadingHierarchyAndStructuredBlocks() {
+        var request = new KnowledgeIngestRequest(
+            "Payment integration notes",
+            KnowledgeContentFormat.MARKDOWN,
+            """
+                # Payment rules
+
+                Orders must be in CREATED status before payment.
+
+                ## Retry policy
+
+                - Retry only when status is PROCESSING.
+                - Stop after 3 attempts.
+
+                | Error Code | Meaning |
+                | --- | --- |
+                | PAY_401 | Signature invalid |
+                | PAY_409 | Order status invalid |
+
+                ```bash
+                curl -X POST /api/payments
+                ```
+                """,
+            DocumentSourceType.WIKI,
+            "wiki/payment-rules.md",
+            DocumentType.API_NOTE,
+            DocumentAuthority.HIGH,
+            "order-platform",
+            "payment",
+            "order",
+            List.of("payment", "auth"),
+            List.of("api_analysis", "case_generation"),
+            Map.of("owner", "qa")
+        );
+
+        var result = knowledgeIngest.ingest(request);
+
+        entityManager.flush();
+        entityManager.clear();
+
+        var storedChunks = chunks.findByDocumentRevisionIdOrderByChunkOrderAsc(result.documentRevisionId());
+
+        assertThat(storedChunks).hasSize(4);
+        assertThat(storedChunks).extracting(KnowledgeChunk::getChunkOrder).containsExactly(1, 2, 3, 4);
+        assertThat(storedChunks).allSatisfy(chunk -> {
+            assertThat(chunk.getChunkStatus()).isEqualTo(ChunkStatus.ACTIVE);
+            assertThat(chunk.getTokenCount()).isPositive();
+            assertThat(chunk.getTags()).containsExactly("auth", "payment");
+            assertThat(chunk.getApplicableStages()).containsExactly("api_analysis", "case_generation");
+            assertThat(chunk.getMetadata()).containsEntry("parentChunkId", null);
+        });
+        assertThat(storedChunks).anySatisfy(chunk -> {
+            assertThat(chunk.getChunkTitle()).isEqualTo("Payment rules");
+            assertThat(chunk.getChunkContent()).contains("Orders must be in CREATED status before payment.");
+            assertThat(chunk.getMetadata())
+                .containsEntry("chunkKind", "PARAGRAPH")
+                .containsEntry("headerPath", List.of("Payment rules"));
+        });
+        assertThat(storedChunks).anySatisfy(chunk -> {
+            assertThat(chunk.getChunkTitle()).isEqualTo("Retry policy");
+            assertThat(chunk.getChunkContent())
+                .contains("- Retry only when status is PROCESSING.")
+                .contains("- Stop after 3 attempts.");
+            assertThat(chunk.getMetadata())
+                .containsEntry("chunkKind", "LIST")
+                .containsEntry("headerPath", List.of("Payment rules", "Retry policy"));
+        });
+        assertThat(storedChunks).anySatisfy(chunk -> {
+            assertThat(chunk.getChunkTitle()).isEqualTo("Retry policy");
+            assertThat(chunk.getChunkContent())
+                .contains("| Error Code | Meaning |")
+                .contains("| PAY_409 | Order status invalid |");
+            assertThat(chunk.getMetadata())
+                .containsEntry("chunkKind", "TABLE")
+                .containsEntry("headerPath", List.of("Payment rules", "Retry policy"));
+        });
+        assertThat(storedChunks).anySatisfy(chunk -> {
+            assertThat(chunk.getChunkTitle()).isEqualTo("Retry policy");
+            assertThat(chunk.getChunkContent())
+                .contains("```bash")
+                .contains("curl -X POST /api/payments");
+            assertThat(chunk.getMetadata())
+                .containsEntry("chunkKind", "CODE_BLOCK")
+                .containsEntry("headerPath", List.of("Payment rules", "Retry policy"));
+        });
+    }
+
+    @Test
+    void plainTextChunkingUsesParagraphFirstAndDeterministicFallbackOverlap() {
+        var longSentence = "payment-token signature order-status amount-boundary retry-window gateway-timeout";
+        var oversizedParagraph = String.join(" ", java.util.Collections.nCopies(40, longSentence));
+        var request = new KnowledgeIngestRequest(
+            "Plain text guide",
+            KnowledgeContentFormat.PLAIN_TEXT,
+            """
+                Payment requests require a valid tenant and signature.
+
+                Retry only after checking the upstream gateway status.
+
+                """ + oversizedParagraph,
+            DocumentSourceType.MANUAL,
+            "notes/plain-text-guide.txt",
+            DocumentType.ENV_GUIDE,
+            DocumentAuthority.MEDIUM,
+            "order-platform",
+            "payment",
+            "order",
+            List.of("payment", "env"),
+            List.of("api_analysis"),
+            Map.of()
+        );
+
+        var result = knowledgeIngest.ingest(request);
+
+        entityManager.flush();
+        entityManager.clear();
+
+        var storedChunks = chunks.findByDocumentRevisionIdOrderByChunkOrderAsc(result.documentRevisionId());
+
+        assertThat(storedChunks).hasSizeGreaterThanOrEqualTo(4);
+        assertThat(storedChunks.get(0).getChunkContent()).isEqualTo("Payment requests require a valid tenant and signature.");
+        assertThat(storedChunks.get(1).getChunkContent()).isEqualTo("Retry only after checking the upstream gateway status.");
+        assertThat(storedChunks).allSatisfy(chunk -> {
+            assertThat(chunk.getChunkStatus()).isEqualTo(ChunkStatus.ACTIVE);
+            assertThat(chunk.getMetadata())
+                .containsEntry("chunkKind", "TEXT")
+                .containsEntry("headerPath", List.of("Plain text guide"));
+        });
+
+        var fallbackChunks = storedChunks.subList(2, storedChunks.size());
+        assertThat(fallbackChunks).hasSizeGreaterThanOrEqualTo(2);
+        assertThat(fallbackChunks.getFirst().getTokenCount()).isLessThanOrEqualTo(140);
+        assertThat(fallbackChunks.get(1).getChunkContent())
+            .startsWith(lastWords(fallbackChunks.getFirst().getChunkContent(), 20));
+    }
+
     private KnowledgeIngestRequest baseRequest(String title, String content) {
         return new KnowledgeIngestRequest(
             title,
@@ -239,6 +388,12 @@ class KnowledgeIngestApplicationServiceTests {
             List.of("case_generation"),
             new LinkedHashMap<>(Map.of("owner", "qa"))
         );
+    }
+
+    private String lastWords(String value, int count) {
+        var words = value.split("\\s+");
+        var start = Math.max(0, words.length - count);
+        return String.join(" ", java.util.Arrays.copyOfRange(words, start, words.length));
     }
 
     private float[] testEmbedding() {

@@ -20,17 +20,20 @@ public class KnowledgeIngestApplicationService {
     private final KnowledgeDocumentRepository documents;
     private final KnowledgeDocumentRevisionRepository revisions;
     private final KnowledgeChunkRepository chunks;
+    private final KnowledgeChunkingService chunkingService;
     private final ObjectMapper objectMapper;
 
     public KnowledgeIngestApplicationService(
         KnowledgeDocumentRepository documents,
         KnowledgeDocumentRevisionRepository revisions,
         KnowledgeChunkRepository chunks,
+        KnowledgeChunkingService chunkingService,
         ObjectMapper objectMapper
     ) {
         this.documents = documents;
         this.revisions = revisions;
         this.chunks = chunks;
+        this.chunkingService = chunkingService;
         this.objectMapper = objectMapper;
     }
 
@@ -74,6 +77,7 @@ public class KnowledgeIngestApplicationService {
         var nextVersion = latestRevision == null ? 1 : latestRevision.getVersion() + 1;
         var revision = buildRevision(existingDocument.getDocumentId(), nextVersion, sourceHash, normalizedRequest);
         revision = revisions.save(revision);
+        persistChunks(existingDocument.getDocumentId(), revision.getDocumentRevisionId(), normalizedRequest);
 
         return new KnowledgeIngestResult(
             existingDocument.getDocumentId(),
@@ -92,6 +96,7 @@ public class KnowledgeIngestApplicationService {
 
         var revision = buildRevision(document.getDocumentId(), 1, sourceHash, request);
         revision = revisions.save(revision);
+        persistChunks(document.getDocumentId(), revision.getDocumentRevisionId(), request);
 
         return new KnowledgeIngestResult(
             document.getDocumentId(),
@@ -138,6 +143,11 @@ public class KnowledgeIngestApplicationService {
             chunk.setChunkStatus(ChunkStatus.SUPERSEDED);
             chunks.save(chunk);
         }
+    }
+
+    private void persistChunks(String documentId, String revisionId, KnowledgeIngestRequest request) {
+        var generatedChunks = chunkingService.chunk(documentId, revisionId, request);
+        chunks.saveAll(generatedChunks);
     }
 
     private void validate(KnowledgeIngestRequest request) {
