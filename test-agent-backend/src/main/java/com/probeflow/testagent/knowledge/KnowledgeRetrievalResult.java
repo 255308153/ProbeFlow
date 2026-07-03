@@ -7,7 +7,8 @@ public record KnowledgeRetrievalResult(
     List<KnowledgeRetrievalHit> hits,
     double coverage,
     int totalCandidates,
-    int totalTokens
+    int totalTokens,
+    boolean lowConfidence
 ) {
 
     public boolean isEmpty() {
