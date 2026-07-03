@@ -253,7 +253,14 @@ class Phase2AcceptanceBoundaryGuardTests {
             .filter(sourceText::contains)
             .toList();
 
-        assertThat(serviceClasses).containsExactly("ApiAnalysisApplicationService");
+        assertThat(serviceClasses).containsExactlyInAnyOrder(
+            "ApiAnalysisApplicationService",
+            "EmbeddingService",
+            "FakeEmbeddingService",
+            "KnowledgeChunkingService",
+            "KnowledgeIngestApplicationService",
+            "KnowledgeRetrievalApplicationService"
+        );
         assertThat(controllerAnnotations).isEmpty();
         assertThat(presentForbiddenTerms).isEmpty();
     }
