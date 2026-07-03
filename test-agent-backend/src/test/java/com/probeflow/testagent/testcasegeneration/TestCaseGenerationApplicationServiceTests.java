@@ -556,6 +556,70 @@ class TestCaseGenerationApplicationServiceTests {
         assertThat(drafts.findAll()).hasSize(1);
     }
 
+    @Test
+    void suiteModeGeneratesFlowDraftAcrossRelatedApiSpecsAndIsIdempotent() {
+        var createOrder = apiSpecs.save(newApiSpec());
+        var readOrder = apiSpecs.save(newReadOrderApiSpec());
+        var task = tasks.save(newTask(createOrder.getApiSpecId(), readOrder.getApiSpecId()));
+        var request = new TestCaseGenerationRequest(
+            task.getTaskId(),
+            "phase5-session-06-suite",
+            List.of(createOrder.getApiSpecId(), readOrder.getApiSpecId()),
+            TestCaseGenerationMode.SUITE,
+            List.of(ScenarioCategory.BUSINESS_FLOW),
+            700
+        );
+
+        var first = generationService.generate(request);
+        var second = generationService.generate(request);
+
+        assertThat(first.generationMode()).isEqualTo(TestCaseGenerationMode.SUITE);
+        assertThat(first.targetApiSpecIds()).containsExactly(createOrder.getApiSpecId(), readOrder.getApiSpecId());
+        assertThat(first.createdDraftIds()).hasSize(1);
+        assertThat(first.generatedCategories()).containsExactly(ScenarioCategory.BUSINESS_FLOW);
+        assertThat(first.coverage()).hasSize(2);
+        assertThat(first.coverage()).extracting(TargetCoverageSummary::status)
+            .containsExactly(CoverageStatus.GENERATED, CoverageStatus.GENERATED);
+        assertThat(first.coverage().getFirst().scenarios()).singleElement()
+            .satisfies(coverage -> {
+                assertThat(coverage.category()).isEqualTo(ScenarioCategory.BUSINESS_FLOW);
+                assertThat(coverage.status()).isEqualTo(CoverageStatus.GENERATED);
+            });
+
+        var draft = drafts.findById(first.createdDraftIds().getFirst()).orElseThrow();
+        assertThat(draft.getTargetApiSpecId()).isEqualTo(createOrder.getApiSpecId());
+        assertThat(draft.getExpectedStatusCode()).isEqualTo(200);
+        assertThat(draft.getDedupKey()).contains("phase5", "suite", "business_flow");
+        assertThat(draft.getDraftContent()).containsEntry("scenarioCategory", "BUSINESS_FLOW");
+        assertThat(draft.getDraftContent()).containsEntry("scenarioName", "business-flow");
+        assertThat(draft.getDraftContent()).containsEntry("moduleName", "order");
+        assertThat(draft.getDraftContent().get("tags")).asList().contains("api", "suite", "business-flow", "post", "get");
+
+        @SuppressWarnings("unchecked")
+        var steps = (List<Map<String, Object>>) draft.getDraftContent().get("steps");
+        assertThat(steps).hasSize(2);
+        assertThat(steps.get(0)).containsEntry("order", 1);
+        assertThat(steps.get(0)).containsEntry("apiSpecId", createOrder.getApiSpecId());
+        assertThat(steps.get(0)).containsEntry("expectedStatus", 201);
+        assertThat(steps.get(1)).containsEntry("order", 2);
+        assertThat(steps.get(1)).containsEntry("apiSpecId", readOrder.getApiSpecId());
+        assertThat(steps.get(1)).containsEntry("expectedStatus", 200);
+        assertThat(steps.get(1)).containsKey("requestShape");
+
+        @SuppressWarnings("unchecked")
+        var metadata = (Map<String, Object>) draft.getDraftContent().get("generationMetadata");
+        assertThat(metadata).containsEntry("mode", "SUITE");
+        assertThat(metadata).containsEntry("contextBuiltCount", 2);
+        assertThat(metadata.get("targetApiSpecIds")).asList()
+            .containsExactly(createOrder.getApiSpecId(), readOrder.getApiSpecId());
+
+        assertThat(second.createdDraftIds()).isEmpty();
+        assertThat(second.counts().duplicateSuppressed()).isEqualTo(1);
+        assertThat(second.coverage().getFirst().scenarios()).singleElement()
+            .satisfies(coverage -> assertThat(coverage.status()).isEqualTo(CoverageStatus.SKIPPED));
+        assertThat(drafts.findAll()).hasSize(1);
+    }
+
     private ApiSpec newApiSpec() {
         var apiSpec = new ApiSpec();
         apiSpec.setSystemName("order-platform");
@@ -648,14 +712,44 @@ class TestCaseGenerationApplicationServiceTests {
         return apiSpec;
     }
 
-    private Task newTask(String apiSpecId) {
+    private ApiSpec newReadOrderApiSpec() {
+        var apiSpec = new ApiSpec();
+        apiSpec.setSystemName("order-platform");
+        apiSpec.setModuleName("order");
+        apiSpec.setHttpMethod(HttpMethod.GET);
+        apiSpec.setPath("/api/orders/{orderId}");
+        apiSpec.setSummary("Read order");
+        apiSpec.setDescription("Read an order by id");
+        apiSpec.setOperationId("readOrder");
+        apiSpec.setParameters(Map.of(
+            "path", Map.of("orderId", Map.of("type", "string", "required", true))
+        ));
+        apiSpec.setConstraints(Map.of());
+        apiSpec.setAuth(Map.of(
+            "type", "bearer",
+            "roles", List.of("ORDER_MANAGER")
+        ));
+        apiSpec.setSourceType(ApiSpecSourceType.OPENAPI);
+        apiSpec.setSourceRef("openapi://orders.yaml#/paths/~1api~1orders~1{orderId}/get");
+        apiSpec.setSourceLocation(Map.of("line", 53));
+        apiSpec.setVersion(2);
+        apiSpec.setRouteReady(true);
+        apiSpec.setBasicParamReady(true);
+        apiSpec.setDtoExpanded(true);
+        apiSpec.setValidationReady(true);
+        apiSpec.setAuthReady(true);
+        apiSpec.setKnowledgeContextReady(false);
+        return apiSpec;
+    }
+
+    private Task newTask(String... apiSpecIds) {
         var task = new Task();
         task.setTaskType(TaskType.API_ANALYSIS);
         task.setTaskName("Generate order API cases");
         task.setStatus(TaskStatus.COMPLETED);
         task.setSourceType(TaskSourceType.MANUAL);
         task.setSourceRef("phase5-issue-01");
-        task.setTargetApiSpecIds(List.of(apiSpecId));
+        task.setTargetApiSpecIds(List.of(apiSpecIds));
         task.setPromotionMode(PromotionMode.MANUAL);
         task.setMemoryRefinementStatus(MemoryRefinementStatus.NOT_REQUIRED);
         task.setPriority(TaskPriority.MEDIUM);

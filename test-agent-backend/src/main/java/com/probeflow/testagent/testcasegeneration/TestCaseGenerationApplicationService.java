@@ -53,10 +53,21 @@ public class TestCaseGenerationApplicationService {
 
     @Transactional
     public TestCaseGenerationResult generate(TestCaseGenerationRequest request) {
-        validateSingleRequest(request);
-
+        validateRequest(request);
         var task = tasks.findById(request.taskId())
             .orElseThrow(() -> new IllegalArgumentException("Task not found: " + request.taskId()));
+        return switch (request.generationMode()) {
+            case SINGLE -> generateSingle(request, task.getTaskId(), task.getPromotionMode());
+            case SUITE -> generateSuite(request, task.getTaskId(), task.getPromotionMode());
+            case BATCH -> throw new IllegalArgumentException("BATCH generation is not implemented until issue 07");
+        };
+    }
+
+    private TestCaseGenerationResult generateSingle(
+        TestCaseGenerationRequest request,
+        String taskId,
+        PromotionMode promotionMode
+    ) {
         var apiSpecId = request.targetApiSpecIds().getFirst();
         var apiSpec = apiSpecs.findById(apiSpecId)
             .orElseThrow(() -> new IllegalArgumentException("ApiSpec not found: " + apiSpecId));
@@ -67,7 +78,7 @@ public class TestCaseGenerationApplicationService {
         }
 
         var context = unifiedContextBuilder.build(new UnifiedContextQuery(
-            task.getTaskId(),
+            taskId,
             request.sessionId(),
             apiSpec.getApiSpecId(),
             null,
@@ -88,7 +99,7 @@ public class TestCaseGenerationApplicationService {
         var protectedSkipped = 0;
         var coverageByCategory = new LinkedHashMap<ScenarioCategory, ScenarioCoverage>();
         for (var intent : plan.intents()) {
-            var persistence = persistDraft(task.getTaskId(), task.getPromotionMode(), apiSpec, context, tokenBudget(request), intent);
+            var persistence = persistDraft(taskId, promotionMode, apiSpec, context, tokenBudget(request), intent);
             switch (persistence.action()) {
                 case CREATED -> {
                     createdDraftIds.add(persistence.draftId());
@@ -150,7 +161,7 @@ public class TestCaseGenerationApplicationService {
         }
         var resultWarnings = warnings(context);
         return new TestCaseGenerationResult(
-            task.getTaskId(),
+            taskId,
             request.sessionId(),
             request.generationMode(),
             List.of(apiSpec.getApiSpecId()),
@@ -172,6 +183,143 @@ public class TestCaseGenerationApplicationService {
                 plan.skippedCategories().size() + plan.unsupportedCategories().size() + protectedSkipped,
                 duplicateSuppressed
             )
+        );
+    }
+
+    private TestCaseGenerationResult generateSuite(
+        TestCaseGenerationRequest request,
+        String taskId,
+        PromotionMode promotionMode
+    ) {
+        var apiSpecTargets = request.targetApiSpecIds().stream()
+            .map(apiSpecId -> apiSpecs.findById(apiSpecId)
+                .orElseThrow(() -> new IllegalArgumentException("ApiSpec not found: " + apiSpecId)))
+            .toList();
+        var diagnostics = new ArrayList<String>();
+        for (var apiSpec : apiSpecTargets) {
+            diagnostics.addAll(structuralDiagnostics(apiSpec));
+        }
+        if (!diagnostics.isEmpty()) {
+            return incompleteSuiteResult(request, apiSpecTargets, diagnostics);
+        }
+
+        var contexts = new ArrayList<ContextBundle>();
+        for (var apiSpec : apiSpecTargets) {
+            contexts.add(unifiedContextBuilder.build(new UnifiedContextQuery(
+                taskId,
+                request.sessionId(),
+                apiSpec.getApiSpecId(),
+                null,
+                STAGE_PROFILE,
+                rawQueryFor(apiSpec),
+                apiSpec.getSystemName(),
+                apiSpec.getModuleName(),
+                apiSpec.getPath(),
+                null,
+                contextTags(apiSpec, List.of(ScenarioCategory.BUSINESS_FLOW)),
+                tokenBudget(request)
+            )));
+        }
+
+        var incoming = suiteDraft(taskId, promotionMode, apiSpecTargets, contexts, tokenBudget(request));
+        var persistence = persistPreparedDraft(incoming);
+        var createdDraftIds = new ArrayList<String>();
+        var updated = 0;
+        var skipped = 0;
+        var duplicateSuppressed = 0;
+        var status = switch (persistence.action()) {
+            case CREATED -> {
+                createdDraftIds.add(persistence.draftId());
+                yield CoverageStatus.GENERATED;
+            }
+            case UPDATED -> {
+                updated = 1;
+                yield CoverageStatus.UPDATED;
+            }
+            case DUPLICATE_SUPPRESSED -> {
+                duplicateSuppressed = 1;
+                yield CoverageStatus.SKIPPED;
+            }
+            case PROTECTED_SKIPPED -> {
+                skipped = 1;
+                yield CoverageStatus.BLOCKED;
+            }
+        };
+        var reason = switch (status) {
+            case GENERATED -> "Generated flow-oriented suite draft across related ApiSpecs";
+            case UPDATED -> "Updated compatible pending suite draft with regenerated flow content";
+            case BLOCKED -> "Existing suite draft is promoted or otherwise protected from regeneration";
+            default -> "Equivalent suite draft already exists for deterministic flow dedup key";
+        };
+        var warningList = contexts.stream()
+            .flatMap(context -> warnings(context).stream())
+            .distinct()
+            .toList();
+        var scenarioCoverage = new ScenarioCoverage(
+            ScenarioCategory.BUSINESS_FLOW,
+            status,
+            reason,
+            persistence.draftId()
+        );
+        var coverage = apiSpecTargets.stream()
+            .map(apiSpec -> new TargetCoverageSummary(
+                apiSpec.getApiSpecId(),
+                status,
+                List.of(scenarioCoverage),
+                warningList,
+                List.of()
+            ))
+            .toList();
+        return new TestCaseGenerationResult(
+            taskId,
+            request.sessionId(),
+            request.generationMode(),
+            apiSpecTargets.stream().map(ApiSpec::getApiSpecId).toList(),
+            List.copyOf(createdDraftIds),
+            List.of(ScenarioCategory.BUSINESS_FLOW),
+            Map.of(),
+            Map.of(),
+            coverage,
+            warningList,
+            new TestCaseGenerationCounts(createdDraftIds.size(), updated, skipped, duplicateSuppressed)
+        );
+    }
+
+    private TestCaseGenerationResult incompleteSuiteResult(
+        TestCaseGenerationRequest request,
+        List<ApiSpec> apiSpecTargets,
+        List<String> diagnostics
+    ) {
+        var warnings = diagnostics.stream()
+            .map(diagnostic -> "INCOMPLETE_APISPEC: " + diagnostic)
+            .toList();
+        var scenarioCoverage = new ScenarioCoverage(
+            ScenarioCategory.BUSINESS_FLOW,
+            CoverageStatus.INCOMPLETE,
+            "At least one ApiSpec is structurally insufficient for suite flow generation",
+            null
+        );
+        var coverage = apiSpecTargets.stream()
+            .map(apiSpec -> new TargetCoverageSummary(
+                apiSpec.getApiSpecId(),
+                CoverageStatus.INCOMPLETE,
+                List.of(scenarioCoverage),
+                warnings,
+                diagnostics
+            ))
+            .toList();
+        return new TestCaseGenerationResult(
+            request.taskId(),
+            request.sessionId(),
+            request.generationMode(),
+            apiSpecTargets.stream().map(ApiSpec::getApiSpecId).toList(),
+            List.of(),
+            List.of(),
+            Map.of(),
+            Map.of(),
+            coverage,
+            warnings,
+            new TestCaseGenerationCounts(0, 0, apiSpecTargets.size(), 0)
         );
     }
 
@@ -222,7 +370,11 @@ public class TestCaseGenerationApplicationService {
         ScenarioIntent intent
     ) {
         var incoming = draftFromIntent(taskId, promotionMode, apiSpec, context, tokenBudget, intent);
-        var existingDrafts = drafts.findByTaskIdAndDedupKeyOrderByCreatedAtAsc(taskId, incoming.getDedupKey());
+        return persistPreparedDraft(incoming);
+    }
+
+    private DraftPersistenceResult persistPreparedDraft(TestCaseDraft incoming) {
+        var existingDrafts = drafts.findByTaskIdAndDedupKeyOrderByCreatedAtAsc(incoming.getTaskId(), incoming.getDedupKey());
         if (existingDrafts.isEmpty()) {
             var saved = drafts.save(incoming);
             return new DraftPersistenceResult(DraftPersistenceAction.CREATED, saved.getDraftId());
@@ -260,18 +412,27 @@ public class TestCaseGenerationApplicationService {
             && existing.getDraftContent().equals(incoming.getDraftContent());
     }
 
-    private void validateSingleRequest(TestCaseGenerationRequest request) {
+    private void validateRequest(TestCaseGenerationRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("Generation request is required");
         }
         if (!StringUtils.hasText(request.taskId())) {
             throw new IllegalArgumentException("taskId is required");
         }
-        if (request.generationMode() != TestCaseGenerationMode.SINGLE) {
-            throw new IllegalArgumentException("Issue 01 supports SINGLE generation only");
+        if (request.generationMode() == null) {
+            throw new IllegalArgumentException("generationMode is required");
         }
-        if (request.targetApiSpecIds() == null || request.targetApiSpecIds().size() != 1) {
+        if (request.generationMode() == TestCaseGenerationMode.SINGLE
+            && (request.targetApiSpecIds() == null || request.targetApiSpecIds().size() != 1)) {
             throw new IllegalArgumentException("SINGLE generation requires exactly one target ApiSpec");
+        }
+        if (request.generationMode() == TestCaseGenerationMode.SUITE
+            && (request.targetApiSpecIds() == null || request.targetApiSpecIds().size() < 2)) {
+            throw new IllegalArgumentException("SUITE generation requires at least two target ApiSpecs");
+        }
+        if (request.generationMode() == TestCaseGenerationMode.BATCH
+            && (request.targetApiSpecIds() == null || request.targetApiSpecIds().isEmpty())) {
+            throw new IllegalArgumentException("BATCH generation requires at least one target ApiSpec");
         }
     }
 
@@ -305,6 +466,140 @@ public class TestCaseGenerationApplicationService {
         draft.setExpectedStatusCode(intent.expectedStatus());
         draft.setDraftContent(draftContent(apiSpec, context, tokenBudget, intent));
         return draft;
+    }
+
+    private TestCaseDraft suiteDraft(
+        String taskId,
+        PromotionMode promotionMode,
+        List<ApiSpec> apiSpecTargets,
+        List<ContextBundle> contexts,
+        int tokenBudget
+    ) {
+        var draft = new TestCaseDraft();
+        draft.setTaskId(taskId);
+        draft.setSource(CaseSource.STRUCTURE);
+        draft.setStage(CaseSource.STRUCTURE);
+        draft.setStatus(DraftStatus.PENDING_REVIEW);
+        draft.setPromotionMode(promotionMode);
+        draft.setTargetApiSpecId(apiSpecTargets.getFirst().getApiSpecId());
+        draft.setDedupKey(suiteDedupKey(taskId, apiSpecTargets));
+        draft.setExpectedStatusCode(successStatus(apiSpecTargets.getLast().getHttpMethod()));
+        draft.setDraftContent(suiteDraftContent(apiSpecTargets, contexts, tokenBudget));
+        return draft;
+    }
+
+    private Map<String, Object> suiteDraftContent(
+        List<ApiSpec> apiSpecTargets,
+        List<ContextBundle> contexts,
+        int tokenBudget
+    ) {
+        var first = apiSpecTargets.getFirst();
+        var last = apiSpecTargets.getLast();
+        var content = new LinkedHashMap<String, Object>();
+        content.put("title", first.getModuleName() + " business flow across " + apiSpecTargets.size() + " APIs");
+        content.put("description", "Verify the ordered API flow from " + first.getPath() + " to " + last.getPath() + ".");
+        content.put("preconditions", List.of("A valid API client is available", "Flow input data is prepared"));
+        content.put("steps", suiteSteps(apiSpecTargets));
+        content.put("expectedResult", "The API flow completes in order and each step returns its expected HTTP status.");
+        content.put("scenarioCategory", ScenarioCategory.BUSINESS_FLOW.name());
+        content.put("scenarioName", scenarioName(ScenarioCategory.BUSINESS_FLOW));
+        content.put("moduleName", suiteModuleName(apiSpecTargets));
+        content.put("tags", suiteTags(apiSpecTargets));
+        content.put("validationHints", List.of("Preserve step order", "Review data handoff between adjacent API calls"));
+        content.put("priorityHint", "P1");
+        content.put("riskHint", "HIGH");
+        content.put("constraintSource", "API_CONTRACT");
+        content.put("contextCitations", contexts.stream()
+            .flatMap(context -> context.citations().stream())
+            .map(this::citationMap)
+            .toList());
+        content.put("contextWarnings", contexts.stream()
+            .flatMap(context -> warnings(context).stream())
+            .distinct()
+            .toList());
+        content.put("generationMetadata", suiteGenerationMetadata(apiSpecTargets, contexts, tokenBudget));
+        return content;
+    }
+
+    private List<Map<String, Object>> suiteSteps(List<ApiSpec> apiSpecTargets) {
+        var steps = new ArrayList<Map<String, Object>>();
+        var order = 1;
+        for (var apiSpec : apiSpecTargets) {
+            steps.add(Map.of(
+                "order", order++,
+                "action", "Call HTTP API",
+                "apiSpecId", apiSpec.getApiSpecId(),
+                "method", apiSpec.getHttpMethod().name(),
+                "path", apiSpec.getPath(),
+                "requestShape", requestShape(apiSpec),
+                "expectedStatus", successStatus(apiSpec.getHttpMethod())
+            ));
+        }
+        return List.copyOf(steps);
+    }
+
+    private Map<String, Object> suiteGenerationMetadata(
+        List<ApiSpec> apiSpecTargets,
+        List<ContextBundle> contexts,
+        int tokenBudget
+    ) {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("mode", TestCaseGenerationMode.SUITE.name());
+        metadata.put("generator", "deterministic-baseline");
+        metadata.put("stageProfile", STAGE_PROFILE);
+        metadata.put("targetApiSpecIds", apiSpecTargets.stream().map(ApiSpec::getApiSpecId).toList());
+        metadata.put("apiSpecVersions", apiSpecTargets.stream().collect(
+            () -> new LinkedHashMap<String, Object>(),
+            (map, apiSpec) -> map.put(apiSpec.getApiSpecId(), apiSpec.getVersion()),
+            Map::putAll
+        ));
+        metadata.put("contextBuiltCount", contexts.size());
+        metadata.put("contextBudgetRequested", tokenBudget);
+        metadata.put("contextLowConfidence", contexts.stream().anyMatch(context -> context.coverage().lowConfidence()));
+        metadata.put("contextConflictCount", contexts.stream().mapToInt(context -> context.conflicts().size()).sum());
+        metadata.put("constraintSource", "API_CONTRACT");
+        metadata.put("source", CaseSource.STRUCTURE.name());
+        metadata.put("scenarioIntent", Map.of(
+            "category", ScenarioCategory.BUSINESS_FLOW.name(),
+            "intentKey", "business-flow",
+            "expectedStatus", successStatus(apiSpecTargets.getLast().getHttpMethod())
+        ));
+        return metadata;
+    }
+
+    private String suiteDedupKey(String taskId, List<ApiSpec> apiSpecTargets) {
+        return String.join(
+            ":",
+            "phase5",
+            taskId,
+            TestCaseGenerationMode.SUITE.name().toLowerCase(Locale.ROOT),
+            String.join(",", apiSpecTargets.stream().map(ApiSpec::getApiSpecId).toList()),
+            ScenarioCategory.BUSINESS_FLOW.name().toLowerCase(Locale.ROOT),
+            String.valueOf(successStatus(apiSpecTargets.getLast().getHttpMethod()))
+        );
+    }
+
+    private String suiteModuleName(List<ApiSpec> apiSpecTargets) {
+        var modules = apiSpecTargets.stream()
+            .map(ApiSpec::getModuleName)
+            .distinct()
+            .toList();
+        if (modules.size() == 1) {
+            return modules.getFirst();
+        }
+        return String.join(" -> ", modules);
+    }
+
+    private List<String> suiteTags(List<ApiSpec> apiSpecTargets) {
+        var tags = new ArrayList<String>();
+        tags.add("api");
+        tags.add("suite");
+        tags.add("business-flow");
+        tags.add(suiteModuleName(apiSpecTargets));
+        for (var apiSpec : apiSpecTargets) {
+            tags.add(apiSpec.getHttpMethod().name().toLowerCase(Locale.ROOT));
+        }
+        return tags.stream().distinct().toList();
     }
 
     private Map<String, Object> draftContent(
@@ -441,6 +736,7 @@ public class TestCaseGenerationApplicationService {
                         skipped.put(category, "No Memory or incident context is available for regression-risk planning");
                     }
                 }
+                case BUSINESS_FLOW -> unsupported.put(category, "BUSINESS_FLOW is generated only in SUITE mode");
             }
         }
 
