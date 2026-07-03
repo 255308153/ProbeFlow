@@ -26,6 +26,11 @@ import com.probeflow.testagent.task.TaskSourceType;
 import com.probeflow.testagent.task.TaskStatus;
 import com.probeflow.testagent.task.TaskType;
 import com.probeflow.testagent.testcase.CaseSource;
+import com.probeflow.testagent.testcase.CasePriority;
+import com.probeflow.testagent.testcase.CaseRiskLevel;
+import com.probeflow.testagent.testcase.CaseStatus;
+import com.probeflow.testagent.testcase.TestCaseMode;
+import com.probeflow.testagent.testcase.TestCaseRepository;
 import com.probeflow.testagent.testcasedraft.DraftStatus;
 import com.probeflow.testagent.testcasedraft.PromotionMode;
 import com.probeflow.testagent.testcasedraft.TestCaseDraftRepository;
@@ -47,6 +52,9 @@ class TestCaseGenerationApplicationServiceTests {
     private TestCaseGenerationApplicationService generationService;
 
     @Autowired
+    private TestCasePromotionService promotionService;
+
+    @Autowired
     private TaskRepository tasks;
 
     @Autowired
@@ -54,6 +62,9 @@ class TestCaseGenerationApplicationServiceTests {
 
     @Autowired
     private TestCaseDraftRepository drafts;
+
+    @Autowired
+    private TestCaseRepository testCases;
 
     @Autowired
     private KnowledgeIngestApplicationService knowledgeIngest;
@@ -676,6 +687,98 @@ class TestCaseGenerationApplicationServiceTests {
                 CoverageStatus.FAILED
             );
         assertThat(drafts.findAll()).hasSize(2);
+    }
+
+    @Test
+    void promotionCreatesFormalTestCaseWithProvenanceAndIsIdempotent() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var generation = generationService.generate(new TestCaseGenerationRequest(
+            task.getTaskId(),
+            "phase5-session-08-promotion",
+            List.of(apiSpec.getApiSpecId()),
+            TestCaseGenerationMode.SINGLE,
+            List.of(ScenarioCategory.MISSING_REQUIRED),
+            500
+        ));
+        var draftId = generation.createdDraftIds().getFirst();
+
+        var first = promotionService.promote(new TestCasePromotionRequest(List.of(draftId), "phase5-reviewer"));
+        var second = promotionService.promote(new TestCasePromotionRequest(List.of(draftId), "phase5-reviewer"));
+
+        assertThat(first.promotedCaseIds()).hasSize(1);
+        assertThat(second.promotedCaseIds()).containsExactly(first.promotedCaseIds().getFirst());
+        assertThat(second.diagnostics()).containsEntry(draftId, "Draft already promoted");
+
+        var draft = drafts.findById(draftId).orElseThrow();
+        assertThat(draft.getStatus()).isEqualTo(DraftStatus.PROMOTED);
+        assertThat(draft.getPromotedCaseId()).isEqualTo(first.promotedCaseIds().getFirst());
+
+        var testCase = testCases.findById(first.promotedCaseIds().getFirst()).orElseThrow();
+        assertThat(testCase.getPrimaryApiSpecId()).isEqualTo(apiSpec.getApiSpecId());
+        assertThat(testCase.getMode()).isEqualTo(TestCaseMode.SINGLE);
+        assertThat(testCase.getTitle()).contains("missing required");
+        assertThat(testCase.getDescription()).contains("required parameter");
+        assertThat(testCase.getPreconditions()).isNotEmpty();
+        assertThat(testCase.getExpectedResult()).contains("HTTP 400");
+        assertThat(testCase.getPriority()).isEqualTo(CasePriority.HIGH);
+        assertThat(testCase.getRiskLevel()).isEqualTo(CaseRiskLevel.HIGH);
+        assertThat(testCase.getTags()).contains("api", "single", "missing-required", "order");
+        assertThat(testCase.getScenarioName()).isEqualTo("missing-required");
+        assertThat(testCase.getModuleName()).isEqualTo("order");
+        assertThat(testCase.getStatus()).isEqualTo(CaseStatus.READY);
+        assertThat(testCase.getSource()).isEqualTo(CaseSource.STRUCTURE);
+        assertThat(testCase.isManualEdited()).isFalse();
+        assertThat(testCase.isLocked()).isFalse();
+        assertThat(testCase.getSteps()).hasSize(1);
+        assertThat(testCase.getBasedOnApiSpecVersions()).containsEntry(apiSpec.getApiSpecId(), 3);
+        assertThat(testCase.getGeneratedFromSingleCaseIds()).containsExactly(draftId);
+        assertThat(testCase.getGeneratedAt()).isNotNull();
+        assertThat(testCase.getUpdatedBy()).isEqualTo("phase5-reviewer");
+        assertThat(testCase.getDetail()).containsEntry("draftId", draftId);
+        assertThat(testCase.getDetail()).containsEntry("taskId", task.getTaskId());
+        assertThat(testCase.getDetail()).containsEntry("targetApiSpecId", apiSpec.getApiSpecId());
+        assertThat(testCase.getDetail()).containsEntry("dedupKey", draft.getDedupKey());
+        assertThat(testCase.getDetail()).containsEntry("expectedStatus", 400);
+        assertThat(testCase.getDetail()).containsKey("requestShape");
+        assertThat(testCase.getDetail()).containsKey("generationMetadata");
+
+        var regeneration = generationService.generate(new TestCaseGenerationRequest(
+            task.getTaskId(),
+            "phase5-session-08-promotion",
+            List.of(apiSpec.getApiSpecId()),
+            TestCaseGenerationMode.SINGLE,
+            List.of(ScenarioCategory.MISSING_REQUIRED),
+            500
+        ));
+        assertThat(regeneration.createdDraftIds()).isEmpty();
+        assertThat(regeneration.counts().skipped()).isEqualTo(1);
+        assertThat(regeneration.coverage().getFirst().status()).isEqualTo(CoverageStatus.BLOCKED);
+        assertThat(testCases.findAll()).hasSize(1);
+    }
+
+    @Test
+    void promotionMapsSuiteDraftToFormalSuiteCase() {
+        var createOrder = apiSpecs.save(newApiSpec());
+        var readOrder = apiSpecs.save(newReadOrderApiSpec());
+        var task = tasks.save(newTask(createOrder.getApiSpecId(), readOrder.getApiSpecId()));
+        var generation = generationService.generate(new TestCaseGenerationRequest(
+            task.getTaskId(),
+            "phase5-session-08-suite-promotion",
+            List.of(createOrder.getApiSpecId(), readOrder.getApiSpecId()),
+            TestCaseGenerationMode.SUITE,
+            List.of(ScenarioCategory.BUSINESS_FLOW),
+            700
+        ));
+
+        var promotion = promotionService.promote(new TestCasePromotionRequest(generation.createdDraftIds(), "phase5-reviewer"));
+
+        var testCase = testCases.findById(promotion.promotedCaseIds().getFirst()).orElseThrow();
+        assertThat(testCase.getMode()).isEqualTo(TestCaseMode.SUITE);
+        assertThat(testCase.getScenarioName()).isEqualTo("business-flow");
+        assertThat(testCase.getSteps()).hasSize(2);
+        assertThat(testCase.getBasedOnApiSpecVersions()).containsKeys(createOrder.getApiSpecId(), readOrder.getApiSpecId());
+        assertThat(testCase.getDetail().get("generationMetadata")).isInstanceOf(Map.class);
     }
 
     private ApiSpec newApiSpec() {
