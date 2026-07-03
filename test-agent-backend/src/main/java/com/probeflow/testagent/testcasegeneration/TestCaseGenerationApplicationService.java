@@ -60,9 +60,12 @@ public class TestCaseGenerationApplicationService {
         var apiSpecId = request.targetApiSpecIds().getFirst();
         var apiSpec = apiSpecs.findById(apiSpecId)
             .orElseThrow(() -> new IllegalArgumentException("ApiSpec not found: " + apiSpecId));
-        assertStructurallyValid(apiSpec);
-
         var requestedCategories = requestedCategories(request);
+        var structuralDiagnostics = structuralDiagnostics(apiSpec);
+        if (!structuralDiagnostics.isEmpty()) {
+            return incompleteResult(request, apiSpec, requestedCategories, structuralDiagnostics);
+        }
+
         var context = unifiedContextBuilder.build(new UnifiedContextQuery(
             task.getTaskId(),
             request.sessionId(),
@@ -83,15 +86,69 @@ public class TestCaseGenerationApplicationService {
         var updatedDraftIds = new ArrayList<String>();
         var duplicateSuppressed = 0;
         var protectedSkipped = 0;
+        var coverageByCategory = new LinkedHashMap<ScenarioCategory, ScenarioCoverage>();
         for (var intent : plan.intents()) {
             var persistence = persistDraft(task.getTaskId(), task.getPromotionMode(), apiSpec, context, tokenBudget(request), intent);
             switch (persistence.action()) {
-                case CREATED -> createdDraftIds.add(persistence.draftId());
-                case UPDATED -> updatedDraftIds.add(persistence.draftId());
-                case DUPLICATE_SUPPRESSED -> duplicateSuppressed++;
-                case PROTECTED_SKIPPED -> protectedSkipped++;
+                case CREATED -> {
+                    createdDraftIds.add(persistence.draftId());
+                    coverageByCategory.put(intent.category(), new ScenarioCoverage(
+                        intent.category(),
+                        CoverageStatus.GENERATED,
+                        "Generated draft from deterministic scenario plan",
+                        persistence.draftId()
+                    ));
+                }
+                case UPDATED -> {
+                    updatedDraftIds.add(persistence.draftId());
+                    coverageByCategory.put(intent.category(), new ScenarioCoverage(
+                        intent.category(),
+                        CoverageStatus.UPDATED,
+                        "Updated compatible pending draft with regenerated content",
+                        persistence.draftId()
+                    ));
+                }
+                case DUPLICATE_SUPPRESSED -> {
+                    duplicateSuppressed++;
+                    coverageByCategory.put(intent.category(), new ScenarioCoverage(
+                        intent.category(),
+                        CoverageStatus.SKIPPED,
+                        "Equivalent draft already exists for deterministic dedup key",
+                        persistence.draftId()
+                    ));
+                }
+                case PROTECTED_SKIPPED -> {
+                    protectedSkipped++;
+                    coverageByCategory.put(intent.category(), new ScenarioCoverage(
+                        intent.category(),
+                        CoverageStatus.BLOCKED,
+                        "Existing draft is promoted or otherwise protected from regeneration",
+                        persistence.draftId()
+                    ));
+                }
             }
         }
+        plan.skippedCategories().forEach((category, reason) -> coverageByCategory.put(category, new ScenarioCoverage(
+            category,
+            CoverageStatus.SKIPPED,
+            reason,
+            null
+        )));
+        plan.unsupportedCategories().forEach((category, reason) -> coverageByCategory.put(category, new ScenarioCoverage(
+            category,
+            CoverageStatus.UNSUPPORTED,
+            reason,
+            null
+        )));
+        for (var category : requestedCategories) {
+            coverageByCategory.putIfAbsent(category, new ScenarioCoverage(
+                category,
+                CoverageStatus.MISSING,
+                "Requested scenario category was not produced by the deterministic planner",
+                null
+            ));
+        }
+        var resultWarnings = warnings(context);
         return new TestCaseGenerationResult(
             task.getTaskId(),
             request.sessionId(),
@@ -101,13 +158,58 @@ public class TestCaseGenerationApplicationService {
             plan.intents().stream().map(ScenarioIntent::category).toList(),
             plan.skippedCategories(),
             plan.unsupportedCategories(),
-            warnings(context),
+            List.of(new TargetCoverageSummary(
+                apiSpec.getApiSpecId(),
+                targetStatus(coverageByCategory),
+                orderedCoverage(requestedCategories, coverageByCategory),
+                resultWarnings,
+                List.of()
+            )),
+            resultWarnings,
             new TestCaseGenerationCounts(
                 createdDraftIds.size(),
                 updatedDraftIds.size(),
                 plan.skippedCategories().size() + plan.unsupportedCategories().size() + protectedSkipped,
                 duplicateSuppressed
             )
+        );
+    }
+
+    private TestCaseGenerationResult incompleteResult(
+        TestCaseGenerationRequest request,
+        ApiSpec apiSpec,
+        List<ScenarioCategory> requestedCategories,
+        List<String> diagnostics
+    ) {
+        var coverage = requestedCategories.stream()
+            .map(category -> new ScenarioCoverage(
+                category,
+                CoverageStatus.INCOMPLETE,
+                "ApiSpec is structurally insufficient for deterministic draft generation",
+                null
+            ))
+            .toList();
+        var warnings = diagnostics.stream()
+            .map(diagnostic -> "INCOMPLETE_APISPEC: " + diagnostic)
+            .toList();
+        return new TestCaseGenerationResult(
+            request.taskId(),
+            request.sessionId(),
+            request.generationMode(),
+            List.of(apiSpec.getApiSpecId()),
+            List.of(),
+            List.of(),
+            Map.of(),
+            Map.of(),
+            List.of(new TargetCoverageSummary(
+                apiSpec.getApiSpecId(),
+                CoverageStatus.INCOMPLETE,
+                coverage,
+                warnings,
+                diagnostics
+            )),
+            warnings,
+            new TestCaseGenerationCounts(0, 0, requestedCategories.size(), 0)
         );
     }
 
@@ -173,13 +275,15 @@ public class TestCaseGenerationApplicationService {
         }
     }
 
-    private void assertStructurallyValid(ApiSpec apiSpec) {
+    private List<String> structuralDiagnostics(ApiSpec apiSpec) {
+        var diagnostics = new ArrayList<String>();
         if (apiSpec.getHttpMethod() == null || !StringUtils.hasText(apiSpec.getPath())) {
-            throw new IllegalArgumentException("ApiSpec is missing route structure: " + apiSpec.getApiSpecId());
+            diagnostics.add("ApiSpec is missing route structure: " + apiSpec.getApiSpecId());
         }
         if (!apiSpec.isRouteReady() || !apiSpec.isBasicParamReady()) {
-            throw new IllegalArgumentException("ApiSpec is not ready for case generation: " + apiSpec.getApiSpecId());
+            diagnostics.add("ApiSpec is not ready for case generation: " + apiSpec.getApiSpecId());
         }
+        return List.copyOf(diagnostics);
     }
 
     private TestCaseDraft draftFromIntent(
@@ -680,6 +784,31 @@ public class TestCaseGenerationApplicationService {
                 + conflict.preferredSourceType());
         }
         return List.copyOf(warnings);
+    }
+
+    private List<ScenarioCoverage> orderedCoverage(
+        List<ScenarioCategory> requestedCategories,
+        Map<ScenarioCategory, ScenarioCoverage> coverageByCategory
+    ) {
+        return requestedCategories.stream()
+            .map(coverageByCategory::get)
+            .toList();
+    }
+
+    private CoverageStatus targetStatus(Map<ScenarioCategory, ScenarioCoverage> coverageByCategory) {
+        if (coverageByCategory.values().stream().anyMatch(coverage -> coverage.status() == CoverageStatus.BLOCKED)) {
+            return CoverageStatus.BLOCKED;
+        }
+        if (coverageByCategory.values().stream().anyMatch(coverage -> coverage.status() == CoverageStatus.GENERATED)) {
+            return CoverageStatus.GENERATED;
+        }
+        if (coverageByCategory.values().stream().anyMatch(coverage -> coverage.status() == CoverageStatus.UPDATED)) {
+            return CoverageStatus.UPDATED;
+        }
+        if (coverageByCategory.values().stream().allMatch(coverage -> coverage.status() == CoverageStatus.UNSUPPORTED)) {
+            return CoverageStatus.UNSUPPORTED;
+        }
+        return CoverageStatus.SKIPPED;
     }
 
     private List<Map<String, Object>> citationsByType(ContextBundle context, String citationType) {

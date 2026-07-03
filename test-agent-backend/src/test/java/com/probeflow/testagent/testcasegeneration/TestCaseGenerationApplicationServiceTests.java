@@ -164,6 +164,18 @@ class TestCaseGenerationApplicationServiceTests {
         assertThat(result.skippedCategories()).isEmpty();
         assertThat(result.unsupportedCategories()).isEmpty();
         assertThat(result.counts().created()).isEqualTo(6);
+        assertThat(result.coverage()).hasSize(1);
+        assertThat(result.coverage().getFirst().apiSpecId()).isEqualTo(apiSpec.getApiSpecId());
+        assertThat(result.coverage().getFirst().status()).isEqualTo(CoverageStatus.GENERATED);
+        assertThat(result.coverage().getFirst().scenarios()).extracting(ScenarioCoverage::status)
+            .containsExactly(
+                CoverageStatus.GENERATED,
+                CoverageStatus.GENERATED,
+                CoverageStatus.GENERATED,
+                CoverageStatus.GENERATED,
+                CoverageStatus.GENERATED,
+                CoverageStatus.GENERATED
+            );
 
         var persistedDrafts = result.createdDraftIds().stream()
             .map(draftId -> drafts.findById(draftId).orElseThrow())
@@ -244,6 +256,46 @@ class TestCaseGenerationApplicationServiceTests {
         assertThat(result.counts().created()).isZero();
         assertThat(result.counts().skipped()).isEqualTo(4);
         assertThat(result.warnings()).anySatisfy(warning -> assertThat(warning).asString().contains("LOW_CONFIDENCE_CONTEXT"));
+        assertThat(result.coverage()).hasSize(1);
+        assertThat(result.coverage().getFirst().scenarios()).extracting(ScenarioCoverage::status)
+            .containsExactly(
+                CoverageStatus.SKIPPED,
+                CoverageStatus.SKIPPED,
+                CoverageStatus.UNSUPPORTED,
+                CoverageStatus.UNSUPPORTED
+            );
+        assertThat(result.coverage().getFirst().scenarios()).extracting(ScenarioCoverage::reason)
+            .anySatisfy(reason -> assertThat(reason).asString().contains("No required parameters"))
+            .anySatisfy(reason -> assertThat(reason).asString().contains("No authentication metadata"));
+    }
+
+    @Test
+    void incompleteApiSpecReturnsCoverageDiagnosticsWithoutCreatingDrafts() {
+        var apiSpec = newMinimalApiSpec();
+        apiSpec.setRouteReady(false);
+        apiSpec = apiSpecs.save(apiSpec);
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+
+        var result = generationService.generate(new TestCaseGenerationRequest(
+            task.getTaskId(),
+            "phase5-session-05-incomplete",
+            List.of(apiSpec.getApiSpecId()),
+            TestCaseGenerationMode.SINGLE,
+            List.of(ScenarioCategory.HAPPY_PATH, ScenarioCategory.INVALID_VALUE),
+            500
+        ));
+
+        assertThat(result.createdDraftIds()).isEmpty();
+        assertThat(drafts.findAll()).isEmpty();
+        assertThat(result.counts().created()).isZero();
+        assertThat(result.counts().skipped()).isEqualTo(2);
+        assertThat(result.warnings()).anySatisfy(warning -> assertThat(warning).asString().contains("INCOMPLETE_APISPEC"));
+        assertThat(result.coverage()).hasSize(1);
+        assertThat(result.coverage().getFirst().status()).isEqualTo(CoverageStatus.INCOMPLETE);
+        assertThat(result.coverage().getFirst().diagnostics())
+            .anySatisfy(diagnostic -> assertThat(diagnostic).asString().contains("not ready"));
+        assertThat(result.coverage().getFirst().scenarios()).extracting(ScenarioCoverage::status)
+            .containsExactly(CoverageStatus.INCOMPLETE, CoverageStatus.INCOMPLETE);
     }
 
     @Test
@@ -332,6 +384,8 @@ class TestCaseGenerationApplicationServiceTests {
             ScenarioCategory.REGRESSION_RISK
         );
         assertThat(result.warnings()).anySatisfy(warning -> assertThat(warning).asString().contains("CONTEXT_CONFLICT"));
+        assertThat(result.coverage().getFirst().warnings())
+            .anySatisfy(warning -> assertThat(warning).asString().contains("CONTEXT_CONFLICT"));
 
         var persistedDrafts = result.createdDraftIds().stream()
             .map(draftId -> drafts.findById(draftId).orElseThrow())
@@ -454,6 +508,13 @@ class TestCaseGenerationApplicationServiceTests {
         assertThat(second.counts().skipped()).isEqualTo(1);
         assertThat(second.counts().updated()).isZero();
         assertThat(second.counts().duplicateSuppressed()).isZero();
+        assertThat(second.coverage().getFirst().status()).isEqualTo(CoverageStatus.BLOCKED);
+        assertThat(second.coverage().getFirst().scenarios()).singleElement()
+            .satisfies(coverage -> {
+                assertThat(coverage.status()).isEqualTo(CoverageStatus.BLOCKED);
+                assertThat(coverage.reason()).contains("protected");
+                assertThat(coverage.draftId()).isEqualTo(draft.getDraftId());
+            });
         var loaded = drafts.findById(draft.getDraftId()).orElseThrow();
         assertThat(loaded.getPromotedCaseId()).isEqualTo("case-protected-01");
         assertThat(loaded.getDraftContent().get("description")).isEqualTo("human approved protected content");

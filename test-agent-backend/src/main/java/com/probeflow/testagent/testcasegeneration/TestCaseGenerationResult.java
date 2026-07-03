@@ -12,6 +12,7 @@ public record TestCaseGenerationResult(
     List<ScenarioCategory> generatedCategories,
     Map<ScenarioCategory, String> skippedCategories,
     Map<ScenarioCategory, String> unsupportedCategories,
+    List<TargetCoverageSummary> coverage,
     List<String> warnings,
     TestCaseGenerationCounts counts
 ) {
