@@ -8,7 +8,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Locale;
 import java.util.regex.Pattern;
-import java.util.regex.Matcher;
 import org.springframework.stereotype.Component;
 
 @Component
@@ -47,7 +46,6 @@ public class KnowledgeChunkingService {
                 chunk.setApplicableStages(enrichStages(request));
                 chunk.setMetadata(chunkMetadata(request, segment));
                 chunk.setTokenCount(estimateTokenCount(segment.content()));
-                chunk.setEmbedding(zeroEmbedding());
                 chunks.add(chunk);
             }
         }
@@ -363,10 +361,6 @@ public class KnowledgeChunkingService {
         return (int) Arrays.stream(trimmed.split("\\s+"))
             .filter(token -> !token.isBlank())
             .count();
-    }
-
-    private float[] zeroEmbedding() {
-        return new float[1024];
     }
 
     private void flushMarkdownBuffers(

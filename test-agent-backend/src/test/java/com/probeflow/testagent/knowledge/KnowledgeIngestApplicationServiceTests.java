@@ -31,6 +31,9 @@ class KnowledgeIngestApplicationServiceTests {
     private KnowledgeChunkRepository chunks;
 
     @Autowired
+    private EmbeddingService embeddingService;
+
+    @Autowired
     private EntityManager entityManager;
 
     @Test
@@ -108,6 +111,7 @@ class KnowledgeIngestApplicationServiceTests {
                 .containsEntry("contentFormat", "MARKDOWN")
                 .containsEntry("headerPath", List.of("Payment rules"))
                 .containsEntry("chunkKind", "PARAGRAPH");
+            assertThat(chunk.getEmbedding()).containsExactly(embeddingService.embedDocument(chunk.getChunkContent()));
         });
     }
 

@@ -11,6 +11,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -21,20 +22,26 @@ public class KnowledgeIngestApplicationService {
     private final KnowledgeDocumentRevisionRepository revisions;
     private final KnowledgeChunkRepository chunks;
     private final KnowledgeChunkingService chunkingService;
+    private final EmbeddingService embeddingService;
     private final ObjectMapper objectMapper;
+    private final int embeddingDimension;
 
     public KnowledgeIngestApplicationService(
         KnowledgeDocumentRepository documents,
         KnowledgeDocumentRevisionRepository revisions,
         KnowledgeChunkRepository chunks,
         KnowledgeChunkingService chunkingService,
-        ObjectMapper objectMapper
+        EmbeddingService embeddingService,
+        ObjectMapper objectMapper,
+        @Value("${probeflow.embedding.dimension:1024}") int embeddingDimension
     ) {
         this.documents = documents;
         this.revisions = revisions;
         this.chunks = chunks;
         this.chunkingService = chunkingService;
+        this.embeddingService = embeddingService;
         this.objectMapper = objectMapper;
+        this.embeddingDimension = embeddingDimension;
     }
 
     @Transactional
@@ -147,7 +154,27 @@ public class KnowledgeIngestApplicationService {
 
     private void persistChunks(String documentId, String revisionId, KnowledgeIngestRequest request) {
         var generatedChunks = chunkingService.chunk(documentId, revisionId, request);
+        validateEmbeddingDimension("provider", embeddingService.dimensions());
+        for (var chunk : generatedChunks) {
+            chunk.setEmbedding(embedDocumentChunk(chunk));
+        }
         chunks.saveAll(generatedChunks);
+    }
+
+    private float[] embedDocumentChunk(KnowledgeChunk chunk) {
+        var embedding = embeddingService.embedDocument(chunk.getChunkContent());
+        validateEmbeddingDimension("document", embedding == null ? -1 : embedding.length);
+        return embedding;
+    }
+
+    private void validateEmbeddingDimension(String path, int actualDimension) {
+        if (actualDimension != embeddingDimension) {
+            throw new IllegalStateException(
+                "embedding dimension mismatch for " + path
+                    + ": expected " + embeddingDimension
+                    + " but was " + actualDimension
+            );
+        }
     }
 
     private void validate(KnowledgeIngestRequest request) {
