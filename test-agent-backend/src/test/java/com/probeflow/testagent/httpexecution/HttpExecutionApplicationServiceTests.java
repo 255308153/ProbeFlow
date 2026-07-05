@@ -193,7 +193,7 @@ class HttpExecutionApplicationServiceTests {
         assertThat(result.caseResults()).singleElement()
             .satisfies(caseResult -> {
                 assertThat(caseResult.status()).isEqualTo(HttpExecutionOutcomeStatus.SKIPPED);
-                assertThat(caseResult.executionRecordId()).isNull();
+                assertThat(caseResult.executionRecordId()).isNotBlank();
                 assertThat(caseResult.message()).contains("Dry run prepared request");
                 assertThat(caseResult.requestSnapshot()).containsEntry("url", "https://api.staging.example/api/orders/order-123");
                 assertThat(caseResult.requestSnapshot()).containsEntry("path", "/api/orders/order-123");
@@ -210,7 +210,11 @@ class HttpExecutionApplicationServiceTests {
             });
         assertThat(result.counts()).isEqualTo(new HttpExecutionCounts(1, 0, 0, 0, 1, 0));
         assertThat(fakeHttpClient.requests()).isEmpty();
-        assertThat(executionRecords.findAll()).isEmpty();
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.SKIPPED);
+        assertThat(record.getResponseSnapshot()).containsEntry("dryRun", true);
+        assertThat(record.getResponseSnapshot()).containsEntry("durationMs", 0L);
     }
 
     @Test
@@ -290,12 +294,16 @@ class HttpExecutionApplicationServiceTests {
         assertThat(result.caseResults()).singleElement()
             .satisfies(caseResult -> {
                 assertThat(caseResult.status()).isEqualTo(HttpExecutionOutcomeStatus.BLOCKED);
-                assertThat(caseResult.executionRecordId()).isNull();
+                assertThat(caseResult.executionRecordId()).isNotBlank();
                 assertThat(caseResult.message()).contains("Unresolved variable: orderId");
             });
         assertThat(result.counts()).isEqualTo(new HttpExecutionCounts(1, 0, 0, 0, 0, 1));
         assertThat(fakeHttpClient.requests()).isEmpty();
-        assertThat(executionRecords.findAll()).isEmpty();
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.BLOCKED);
+        assertThat(record.getErrorMessage()).contains("Unresolved variable: orderId");
+        assertThat(record.getResponseSnapshot()).containsEntry("errorType", "BLOCKED_REQUEST");
     }
 
     @Test
@@ -325,6 +333,130 @@ class HttpExecutionApplicationServiceTests {
             });
         assertThat(result.counts()).isEqualTo(new HttpExecutionCounts(1, 0, 0, 0, 0, 1));
         assertThat(fakeHttpClient.requests()).isEmpty();
+    }
+
+    @Test
+    void successfulResponseSnapshotCapturesHeadersBodyMetadataAndTruncatesLargeText() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId()));
+        var largeBody = "0123456789".repeat(200);
+        fakeHttpClient.respondWith(new HttpClientResponse(
+            200,
+            Map.of("Content-Type", "text/plain", "X-Trace-Id", "trace-001"),
+            largeBody,
+            64L
+        ));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.PASSED);
+        assertThat(record.getStatusCode()).isEqualTo(200);
+        assertThat(record.getDurationMs()).isEqualTo(64L);
+        assertThat(record.getResponseSnapshot()).containsEntry("statusCode", 200);
+        assertThat(record.getResponseSnapshot()).containsEntry("bodyType", "text");
+        assertThat(record.getResponseSnapshot()).containsEntry("bodyTruncated", true);
+        assertThat(record.getResponseSnapshot().get("bodyExcerpt")).asString().startsWith("0123456789");
+        assertThat(record.getResponseSnapshot().get("bodyExcerpt")).asString().hasSizeLessThan(largeBody.length());
+        assertThat(record.getResponseSnapshot()).containsEntry("bodySizeBytes", largeBody.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+
+        @SuppressWarnings("unchecked")
+        var headers = (Map<String, Object>) record.getResponseSnapshot().get("headers");
+        assertThat(headers).containsEntry("Content-Type", "text/plain");
+        assertThat(headers).containsEntry("X-Trace-Id", "trace-001");
+    }
+
+    @Test
+    void binaryResponseSnapshotStoresMetadataWithoutRawBytes() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId()));
+        fakeHttpClient.respondWith(new HttpClientResponse(
+            200,
+            Map.of("Content-Type", "application/octet-stream"),
+            new byte[] {1, 2, 3, 4},
+            19L
+        ));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getResponseSnapshot()).containsEntry("bodyType", "binary");
+        assertThat(record.getResponseSnapshot()).containsEntry("bodySizeBytes", 4);
+        assertThat(record.getResponseSnapshot()).containsEntry("bodyTruncated", false);
+        assertThat(record.getResponseSnapshot()).doesNotContainKey("body");
+        assertThat(record.getResponseSnapshot()).doesNotContainKey("bodyExcerpt");
+    }
+
+    @Test
+    void networkErrorPersistsExecutionRecordWithErrorSnapshot() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId()));
+        fakeHttpClient.failWith(HttpTransportException.networkError("Connection refused", 33L));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        assertThat(result.caseResults()).singleElement()
+            .satisfies(caseResult -> {
+                assertThat(caseResult.status()).isEqualTo(HttpExecutionOutcomeStatus.ERROR);
+                assertThat(caseResult.executionRecordId()).isNotBlank();
+                assertThat(caseResult.message()).contains("Connection refused");
+            });
+        assertThat(result.counts()).isEqualTo(new HttpExecutionCounts(1, 0, 0, 1, 0, 0));
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.ERROR);
+        assertThat(record.getDurationMs()).isEqualTo(33L);
+        assertThat(record.getErrorMessage()).contains("Connection refused");
+        assertThat(record.getResponseSnapshot()).containsEntry("errorType", "NETWORK_ERROR");
+        assertThat(record.getResponseSnapshot()).containsEntry("durationMs", 33L);
+    }
+
+    @Test
+    void timeoutPersistsExecutionRecordWithTimeoutSnapshot() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId()));
+        fakeHttpClient.failWith(HttpTransportException.timeout("Request timed out", 30_000L));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(result.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.ERROR);
+        assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.ERROR);
+        assertThat(record.getDurationMs()).isEqualTo(30_000L);
+        assertThat(record.getResponseSnapshot()).containsEntry("errorType", "TIMEOUT");
+        assertThat(record.getErrorMessage()).contains("Request timed out");
     }
 
     private ApiSpec newApiSpec() {

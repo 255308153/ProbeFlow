@@ -31,6 +31,7 @@ public class HttpExecutionApplicationService {
     private final TaskCaseExecutionRepository taskCaseExecutions;
     private final HttpClientGateway httpClientGateway;
     private final ExecutableRequestBuilder executableRequestBuilder;
+    private final HttpResponseSnapshotFactory responseSnapshotFactory;
 
     public HttpExecutionApplicationService(
         TaskRepository tasks,
@@ -39,7 +40,8 @@ public class HttpExecutionApplicationService {
         ExecutionRecordRepository executionRecords,
         TaskCaseExecutionRepository taskCaseExecutions,
         HttpClientGateway httpClientGateway,
-        ExecutableRequestBuilder executableRequestBuilder
+        ExecutableRequestBuilder executableRequestBuilder,
+        HttpResponseSnapshotFactory responseSnapshotFactory
     ) {
         this.tasks = tasks;
         this.testCases = testCases;
@@ -48,6 +50,7 @@ public class HttpExecutionApplicationService {
         this.taskCaseExecutions = taskCaseExecutions;
         this.httpClientGateway = httpClientGateway;
         this.executableRequestBuilder = executableRequestBuilder;
+        this.responseSnapshotFactory = responseSnapshotFactory;
     }
 
     @Transactional
@@ -74,51 +77,135 @@ public class HttpExecutionApplicationService {
 
         var preparedRequest = executableRequestBuilder.build(testCase, apiSpec, request);
         if (preparedRequest.blocked()) {
-            return resultWithoutTransport(
+            var message = preparedRequest.message();
+            var record = persistExecutionRecord(
+                request,
+                testCase,
+                preparedRequest.requestSnapshot(),
+                responseSnapshotFactory.blocked(message),
+                HttpExecutionOutcomeStatus.BLOCKED,
+                0L,
+                null,
+                message
+            );
+            updateTaskCaseExecution(request, testCase, record, HttpExecutionOutcomeStatus.BLOCKED);
+            return singleCaseResult(
                 task.getTaskId(),
                 request,
                 testCase.getCaseId(),
+                record,
                 HttpExecutionOutcomeStatus.BLOCKED,
-                preparedRequest.message(),
+                0L,
+                null,
+                message,
                 preparedRequest.requestSnapshot()
             );
         }
         if (request.dryRun()) {
-            return resultWithoutTransport(
+            var message = "Dry run prepared request; transport not called";
+            var record = persistExecutionRecord(
+                request,
+                testCase,
+                preparedRequest.requestSnapshot(),
+                responseSnapshotFactory.dryRun(message),
+                HttpExecutionOutcomeStatus.SKIPPED,
+                0L,
+                null,
+                null
+            );
+            updateTaskCaseExecution(request, testCase, record, HttpExecutionOutcomeStatus.SKIPPED);
+            return singleCaseResult(
                 task.getTaskId(),
                 request,
                 testCase.getCaseId(),
+                record,
                 HttpExecutionOutcomeStatus.SKIPPED,
-                "Dry run prepared request; transport not called",
+                0L,
+                null,
+                message,
                 preparedRequest.requestSnapshot()
             );
         }
 
         var httpRequest = preparedRequest.clientRequest();
         var startedAt = System.nanoTime();
-        var httpResponse = httpClientGateway.execute(httpRequest, request.options());
-        var durationMs = normalizedDuration(httpResponse.durationMs(), startedAt);
-        var outcomeStatus = statusFor(httpResponse.statusCode());
-        var record = persistExecutionRecord(request, testCase, preparedRequest.requestSnapshot(), httpResponse, durationMs, outcomeStatus);
-        updateTaskCaseExecution(request, testCase, record, outcomeStatus);
-
-        var caseResult = new HttpExecutionCaseResult(
-            testCase.getCaseId(),
-            record.getExecutionId(),
-            outcomeStatus,
-            durationMs,
-            httpResponse.statusCode(),
-            null,
-            preparedRequest.requestSnapshot()
-        );
-        var caseResults = List.of(caseResult);
-        return new HttpExecutionResult(
-            task.getTaskId(),
-            request.environment(),
-            request.executionMode(),
-            caseResults,
-            HttpExecutionCounts.from(caseResults)
-        );
+        try {
+            var httpResponse = httpClientGateway.execute(httpRequest, request.options());
+            var durationMs = normalizedDuration(httpResponse.durationMs(), startedAt);
+            var outcomeStatus = statusFor(httpResponse.statusCode());
+            var record = persistExecutionRecord(
+                request,
+                testCase,
+                preparedRequest.requestSnapshot(),
+                responseSnapshotFactory.success(httpResponse, durationMs),
+                outcomeStatus,
+                durationMs,
+                httpResponse.statusCode(),
+                null
+            );
+            updateTaskCaseExecution(request, testCase, record, outcomeStatus);
+            return singleCaseResult(
+                task.getTaskId(),
+                request,
+                testCase.getCaseId(),
+                record,
+                outcomeStatus,
+                durationMs,
+                httpResponse.statusCode(),
+                null,
+                preparedRequest.requestSnapshot()
+            );
+        } catch (HttpTransportException exception) {
+            var record = persistExecutionRecord(
+                request,
+                testCase,
+                preparedRequest.requestSnapshot(),
+                responseSnapshotFactory.transportError(exception),
+                HttpExecutionOutcomeStatus.ERROR,
+                exception.durationMs(),
+                null,
+                exception.getMessage()
+            );
+            updateTaskCaseExecution(request, testCase, record, HttpExecutionOutcomeStatus.ERROR);
+            return singleCaseResult(
+                task.getTaskId(),
+                request,
+                testCase.getCaseId(),
+                record,
+                HttpExecutionOutcomeStatus.ERROR,
+                exception.durationMs(),
+                null,
+                exception.getMessage(),
+                preparedRequest.requestSnapshot()
+            );
+        } catch (RuntimeException exception) {
+            var durationMs = normalizedDuration(-1L, startedAt);
+            var message = StringUtils.hasText(exception.getMessage())
+                ? exception.getMessage()
+                : exception.getClass().getSimpleName();
+            var record = persistExecutionRecord(
+                request,
+                testCase,
+                preparedRequest.requestSnapshot(),
+                responseSnapshotFactory.transportError(message, durationMs),
+                HttpExecutionOutcomeStatus.ERROR,
+                durationMs,
+                null,
+                message
+            );
+            updateTaskCaseExecution(request, testCase, record, HttpExecutionOutcomeStatus.ERROR);
+            return singleCaseResult(
+                task.getTaskId(),
+                request,
+                testCase.getCaseId(),
+                record,
+                HttpExecutionOutcomeStatus.ERROR,
+                durationMs,
+                null,
+                message,
+                preparedRequest.requestSnapshot()
+            );
+        }
     }
 
     private void validateRequest(HttpExecutionRequest request) {
@@ -140,9 +227,11 @@ public class HttpExecutionApplicationService {
         HttpExecutionRequest request,
         TestCase testCase,
         Map<String, Object> requestSnapshot,
-        HttpClientResponse httpResponse,
+        Map<String, Object> responseSnapshot,
+        HttpExecutionOutcomeStatus outcomeStatus,
         long durationMs,
-        HttpExecutionOutcomeStatus outcomeStatus
+        Integer statusCode,
+        String errorMessage
     ) {
         var record = new ExecutionRecord();
         record.setTaskId(request.taskId());
@@ -150,12 +239,15 @@ public class HttpExecutionApplicationService {
         record.setExecutorType(ExecutorType.HTTP);
         record.setEnvironment(request.environment());
         record.setRequestSnapshot(requestSnapshot);
-        record.setResponseSnapshot(responseSnapshot(httpResponse, durationMs));
+        record.setResponseSnapshot(responseSnapshot);
         record.setAssertionResults(List.of());
-        record.setOverallStatus(outcomeStatus == HttpExecutionOutcomeStatus.PASSED ? OverallStatus.PASSED : OverallStatus.FAILED);
-        record.setCriticalFailed(outcomeStatus != HttpExecutionOutcomeStatus.PASSED);
+        record.setOverallStatus(overallStatusFor(outcomeStatus));
+        record.setCriticalFailed(outcomeStatus == HttpExecutionOutcomeStatus.FAILED
+            || outcomeStatus == HttpExecutionOutcomeStatus.ERROR
+            || outcomeStatus == HttpExecutionOutcomeStatus.BLOCKED);
         record.setDurationMs(durationMs);
-        record.setStatusCode(httpResponse.statusCode());
+        record.setStatusCode(statusCode);
+        record.setErrorMessage(errorMessage);
         return executionRecords.save(record);
     }
 
@@ -170,29 +262,38 @@ public class HttpExecutionApplicationService {
         taskCaseExecution.setTaskId(request.taskId());
         taskCaseExecution.setCaseId(testCase.getCaseId());
         taskCaseExecution.setExecutionMode(request.executionMode());
-        taskCaseExecution.setExecutionStatus(outcomeStatus == HttpExecutionOutcomeStatus.PASSED
-            ? TaskCaseExecutionStatus.COMPLETED
-            : TaskCaseExecutionStatus.EXECUTING);
+        taskCaseExecution.setExecutionStatus(taskCaseExecutionStatusFor(outcomeStatus));
         taskCaseExecution.setExecutionRecordId(record.getExecutionId());
-        taskCaseExecution.setSnapshotJson(Map.of(
-            "environment", request.environment(),
-            "status", outcomeStatus.name(),
-            "durationMs", record.getDurationMs(),
-            "statusCode", record.getStatusCode(),
-            "executionRecordId", record.getExecutionId()
-        ));
+        var snapshot = new LinkedHashMap<String, Object>();
+        snapshot.put("environment", request.environment());
+        snapshot.put("status", outcomeStatus.name());
+        snapshot.put("durationMs", record.getDurationMs());
+        snapshot.put("statusCode", record.getStatusCode());
+        snapshot.put("executionRecordId", record.getExecutionId());
+        taskCaseExecution.setSnapshotJson(snapshot);
         taskCaseExecutions.save(taskCaseExecution);
     }
 
-    private HttpExecutionResult resultWithoutTransport(
+    private HttpExecutionResult singleCaseResult(
         String taskId,
         HttpExecutionRequest request,
         String caseId,
+        ExecutionRecord record,
         HttpExecutionOutcomeStatus status,
+        long durationMs,
+        Integer statusCode,
         String message,
         Map<String, Object> requestSnapshot
     ) {
-        var caseResult = new HttpExecutionCaseResult(caseId, null, status, 0L, null, message, requestSnapshot);
+        var caseResult = new HttpExecutionCaseResult(
+            caseId,
+            record.getExecutionId(),
+            status,
+            durationMs,
+            statusCode,
+            message,
+            requestSnapshot
+        );
         var caseResults = List.of(caseResult);
         return new HttpExecutionResult(
             taskId,
@@ -203,21 +304,30 @@ public class HttpExecutionApplicationService {
         );
     }
 
-    private Map<String, Object> responseSnapshot(HttpClientResponse response, long durationMs) {
-        var snapshot = new LinkedHashMap<String, Object>();
-        snapshot.put("statusCode", response.statusCode());
-        snapshot.put("headers", response.headers());
-        if (response.body() != null) {
-            snapshot.put("body", response.body());
-        }
-        snapshot.put("durationMs", durationMs);
-        return snapshot;
-    }
-
     private HttpExecutionOutcomeStatus statusFor(int statusCode) {
         return statusCode >= 200 && statusCode < 400
             ? HttpExecutionOutcomeStatus.PASSED
             : HttpExecutionOutcomeStatus.FAILED;
+    }
+
+    private OverallStatus overallStatusFor(HttpExecutionOutcomeStatus outcomeStatus) {
+        return switch (outcomeStatus) {
+            case PASSED -> OverallStatus.PASSED;
+            case FAILED -> OverallStatus.FAILED;
+            case ERROR -> OverallStatus.ERROR;
+            case SKIPPED -> OverallStatus.SKIPPED;
+            case BLOCKED -> OverallStatus.BLOCKED;
+        };
+    }
+
+    private TaskCaseExecutionStatus taskCaseExecutionStatusFor(HttpExecutionOutcomeStatus outcomeStatus) {
+        return switch (outcomeStatus) {
+            case PASSED -> TaskCaseExecutionStatus.COMPLETED;
+            case FAILED -> TaskCaseExecutionStatus.FAILED;
+            case ERROR -> TaskCaseExecutionStatus.ERROR;
+            case SKIPPED -> TaskCaseExecutionStatus.SKIPPED;
+            case BLOCKED -> TaskCaseExecutionStatus.BLOCKED;
+        };
     }
 
     private long normalizedDuration(long reportedDurationMs, long startedAt) {

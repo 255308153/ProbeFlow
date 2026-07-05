@@ -4,5 +4,8 @@ public enum TaskCaseExecutionStatus {
     PENDING,
     EXECUTING,
     COMPLETED,
-    SKIPPED
+    FAILED,
+    ERROR,
+    SKIPPED,
+    BLOCKED
 }
