@@ -3,6 +3,12 @@ package com.probeflow.testagent.failureanalysis;
 import com.probeflow.testagent.executionrecord.ExecutionRecord;
 import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.OverallStatus;
+import com.probeflow.testagent.observation.AnalysisLevel;
+import com.probeflow.testagent.observation.Observation;
+import com.probeflow.testagent.observation.ObservationRepository;
+import com.probeflow.testagent.observation.ObservationRiskLevel;
+import com.probeflow.testagent.observation.ObservationSource;
+import com.probeflow.testagent.observation.ObservationType;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -14,12 +20,17 @@ import org.springframework.transaction.annotation.Transactional;
 public class FailureAnalysisApplicationService {
 
     private final ExecutionRecordRepository executionRecords;
+    private final ObservationRepository observations;
 
-    public FailureAnalysisApplicationService(ExecutionRecordRepository executionRecords) {
+    public FailureAnalysisApplicationService(
+        ExecutionRecordRepository executionRecords,
+        ObservationRepository observations
+    ) {
         this.executionRecords = executionRecords;
+        this.observations = observations;
     }
 
-    @Transactional(readOnly = true)
+    @Transactional
     public FailureAnalysisResult analyzeExecution(FailureAnalysisRequest request) {
         var normalized = normalize(request);
         var record = executionRecords.findById(normalized.executionId())
@@ -27,6 +38,18 @@ public class FailureAnalysisApplicationService {
 
         var failedAssertions = failedAssertions(record);
         var classification = classify(record, failedAssertions);
+        var riskLevel = riskLevel(record, classification, failedAssertions);
+        var summary = summary(record, classification);
+        var failureReason = failureReason(record, classification, failedAssertions);
+        var nextSuggestion = "Review deterministic failure analysis evidence.";
+        var observationIds = writeObservationIfUseful(
+            record,
+            classification,
+            riskLevel,
+            summary,
+            failureReason,
+            nextSuggestion
+        );
         return new FailureAnalysisResult(
             record.getExecutionId(),
             record.getTaskId(),
@@ -42,7 +65,12 @@ public class FailureAnalysisApplicationService {
             failedAssertions,
             record.getErrorMessage(),
             classification,
-            evidence(record, failedAssertions, classification)
+            evidence(record, failedAssertions, classification),
+            observationIds,
+            riskLevel.name(),
+            summary,
+            failureReason,
+            nextSuggestion
         );
     }
 
@@ -209,6 +237,96 @@ public class FailureAnalysisApplicationService {
         ));
         evidence.add("classification=" + classification);
         return List.copyOf(evidence);
+    }
+
+    private List<String> writeObservationIfUseful(
+        ExecutionRecord record,
+        FailureClassification classification,
+        ObservationRiskLevel riskLevel,
+        String summary,
+        String failureReason,
+        String nextSuggestion
+    ) {
+        if (!shouldWriteObservation(record)) {
+            return List.of();
+        }
+        var existing = observations.findAllByExecutionIdAndAnalysisLevelOrderByCreatedAtAscObservationIdAsc(
+            record.getExecutionId(),
+            AnalysisLevel.BASIC
+        );
+        if (!existing.isEmpty()) {
+            return existing.stream().map(Observation::getObservationId).toList();
+        }
+
+        var observation = new Observation();
+        observation.setTaskId(record.getTaskId());
+        observation.setExecutionId(record.getExecutionId());
+        observation.setObservationType(observationType(classification));
+        observation.setAnalysisLevel(AnalysisLevel.BASIC);
+        observation.setSummary(summary);
+        observation.setFailureReason(failureReason);
+        observation.setRiskLevel(riskLevel);
+        observation.setNextSuggestion(nextSuggestion);
+        observation.setSource(ObservationSource.SYSTEM);
+        var saved = observations.save(observation);
+        return List.of(saved.getObservationId());
+    }
+
+    private boolean shouldWriteObservation(ExecutionRecord record) {
+        return record.getOverallStatus() == OverallStatus.FAILED
+            || record.getOverallStatus() == OverallStatus.ERROR
+            || record.getOverallStatus() == OverallStatus.BLOCKED
+            || record.getOverallStatus() == OverallStatus.PASSED_WITH_WARNINGS;
+    }
+
+    private ObservationType observationType(FailureClassification classification) {
+        return switch (classification) {
+            case AUTH_ISSUE, VALIDATION_ISSUE, SERVER_ERROR, DURATION_REGRESSION -> ObservationType.RISK_EVALUATION;
+            case UNKNOWN, NONE, SKIPPED -> ObservationType.GENERAL_COMMENT;
+            default -> ObservationType.ASSERTION_FAILURE_ANALYSIS;
+        };
+    }
+
+    private ObservationRiskLevel riskLevel(
+        ExecutionRecord record,
+        FailureClassification classification,
+        List<FailedAssertionSummary> failedAssertions
+    ) {
+        if (record.isCriticalFailed() || classification == FailureClassification.SERVER_ERROR) {
+            return ObservationRiskLevel.HIGH;
+        }
+        if (classification == FailureClassification.AUTH_ISSUE
+            || classification == FailureClassification.ENVIRONMENT_ISSUE
+            || classification == FailureClassification.TIMEOUT
+            || classification == FailureClassification.TRANSPORT_ERROR) {
+            return ObservationRiskLevel.MEDIUM;
+        }
+        if (record.getOverallStatus() == OverallStatus.PASSED_WITH_WARNINGS
+            || failedAssertions.stream().noneMatch(FailedAssertionSummary::critical)) {
+            return ObservationRiskLevel.LOW;
+        }
+        return ObservationRiskLevel.MEDIUM;
+    }
+
+    private String summary(ExecutionRecord record, FailureClassification classification) {
+        return "BASIC failure analysis classified execution " + record.getExecutionId()
+            + " as " + classification
+            + " with status " + record.getOverallStatus();
+    }
+
+    private String failureReason(
+        ExecutionRecord record,
+        FailureClassification classification,
+        List<FailedAssertionSummary> failedAssertions
+    ) {
+        if (record.getErrorMessage() != null && !record.getErrorMessage().isBlank()) {
+            return record.getErrorMessage();
+        }
+        if (!failedAssertions.isEmpty()) {
+            var first = failedAssertions.getFirst();
+            return first.type() + " expected " + first.expected() + " but got " + first.actual();
+        }
+        return "Execution evidence indicates " + classification;
     }
 
     private Map<String, Object> safeMap(Map<String, Object> value) {

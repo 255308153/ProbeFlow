@@ -7,6 +7,11 @@ import com.probeflow.testagent.executionrecord.ExecutionRecord;
 import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.ExecutorType;
 import com.probeflow.testagent.executionrecord.OverallStatus;
+import com.probeflow.testagent.observation.AnalysisLevel;
+import com.probeflow.testagent.observation.ObservationRepository;
+import com.probeflow.testagent.observation.ObservationRiskLevel;
+import com.probeflow.testagent.observation.ObservationSource;
+import com.probeflow.testagent.observation.ObservationType;
 import jakarta.persistence.EntityManager;
 import java.util.List;
 import java.util.Map;
@@ -26,6 +31,9 @@ class FailureAnalysisApplicationServiceTests {
 
     @Autowired
     private ExecutionRecordRepository executionRecords;
+
+    @Autowired
+    private ObservationRepository observations;
 
     @Autowired
     private EntityManager entityManager;
@@ -85,6 +93,10 @@ class FailureAnalysisApplicationServiceTests {
             });
         assertThat(result.classification()).isEqualTo(FailureClassification.SERVER_ERROR);
         assertThat(result.evidence()).contains("overallStatus=FAILED", "statusCode=500", "classification=SERVER_ERROR");
+        assertThat(result.observationIds()).hasSize(1);
+        assertThat(result.riskLevel()).isEqualTo("HIGH");
+        assertThat(result.summary()).contains("SERVER_ERROR");
+        assertThat(result.failureReason()).contains("STATUS_CODE");
 
         entityManager.flush();
         entityManager.clear();
@@ -194,6 +206,68 @@ class FailureAnalysisApplicationServiceTests {
         assertClassification(OverallStatus.FAILED, 400, Map.of("statusCode", 400), List.of(), FailureClassification.VALIDATION_ISSUE);
         assertClassification(OverallStatus.FAILED, 422, Map.of("statusCode", 422), List.of(), FailureClassification.VALIDATION_ISSUE);
         assertClassification(OverallStatus.FAILED, 503, Map.of("statusCode", 503), List.of(), FailureClassification.SERVER_ERROR);
+    }
+
+    @Test
+    void analysisPersistsMeaningfulObservationAndReusesItOnRepeatedAnalysis() {
+        var record = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("method", "POST", "path", "/api/orders"),
+            Map.of("statusCode", 500, "failureType", "ASSERTION_FAILURE"),
+            List.of(Map.of("type", "STATUS_CODE", "expected", 201, "actual", 500, "status", "FAILED", "critical", true))
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var first = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
+        var second = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
+
+        assertThat(first.observationIds()).hasSize(1);
+        assertThat(second.observationIds()).isEqualTo(first.observationIds());
+        assertThat(observations.findAllByExecutionIdAndAnalysisLevelOrderByCreatedAtAscObservationIdAsc(
+            record.getExecutionId(),
+            AnalysisLevel.BASIC
+        )).singleElement()
+            .satisfies(observation -> {
+                assertThat(observation.getObservationId()).isEqualTo(first.observationIds().getFirst());
+                assertThat(observation.getTaskId()).isEqualTo("task-1");
+                assertThat(observation.getExecutionId()).isEqualTo(record.getExecutionId());
+                assertThat(observation.getObservationType()).isEqualTo(ObservationType.RISK_EVALUATION);
+                assertThat(observation.getAnalysisLevel()).isEqualTo(AnalysisLevel.BASIC);
+                assertThat(observation.getSource()).isEqualTo(ObservationSource.SYSTEM);
+                assertThat(observation.getRiskLevel()).isEqualTo(ObservationRiskLevel.HIGH);
+                assertThat(observation.getSummary()).contains("SERVER_ERROR");
+                assertThat(observation.getFailureReason()).contains("STATUS_CODE expected 201 but got 500");
+                assertThat(observation.getNextSuggestion()).contains("Review deterministic failure analysis evidence");
+            });
+
+        entityManager.flush();
+        entityManager.clear();
+        var unchanged = executionRecords.findById(record.getExecutionId()).orElseThrow();
+        assertThat(unchanged.getOverallStatus()).isEqualTo(OverallStatus.FAILED);
+        assertThat(unchanged.getResponseSnapshot()).containsEntry("failureType", "ASSERTION_FAILURE");
+    }
+
+    @Test
+    void passedAndSkippedExecutionsDoNotCreateNoisyObservations() {
+        var passed = executionRecords.save(newExecutionRecord(OverallStatus.PASSED));
+        var skipped = executionRecords.save(newExecutionRecord(OverallStatus.SKIPPED));
+        entityManager.flush();
+        entityManager.clear();
+
+        var passedResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(passed.getExecutionId()));
+        var skippedResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(skipped.getExecutionId()));
+
+        assertThat(passedResult.observationIds()).isEmpty();
+        assertThat(skippedResult.observationIds()).isEmpty();
+        assertThat(observations.findAllByExecutionIdAndAnalysisLevelOrderByCreatedAtAscObservationIdAsc(
+            passed.getExecutionId(),
+            AnalysisLevel.BASIC
+        )).isEmpty();
+        assertThat(observations.findAllByExecutionIdAndAnalysisLevelOrderByCreatedAtAscObservationIdAsc(
+            skipped.getExecutionId(),
+            AnalysisLevel.BASIC
+        )).isEmpty();
     }
 
     private ExecutionRecord newExecutionRecord(OverallStatus status) {

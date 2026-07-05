@@ -18,6 +18,11 @@ public record FailureAnalysisResult(
     List<FailedAssertionSummary> failedAssertions,
     String errorMessage,
     FailureClassification classification,
-    List<String> evidence
+    List<String> evidence,
+    List<String> observationIds,
+    String riskLevel,
+    String summary,
+    String failureReason,
+    String nextSuggestion
 ) {
 }
