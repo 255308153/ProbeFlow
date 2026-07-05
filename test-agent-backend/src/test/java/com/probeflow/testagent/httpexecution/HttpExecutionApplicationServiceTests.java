@@ -10,6 +10,9 @@ import com.probeflow.testagent.apispec.HttpMethod;
 import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.ExecutorType;
 import com.probeflow.testagent.executionrecord.OverallStatus;
+import com.probeflow.testagent.memory.MemoryScopeType;
+import com.probeflow.testagent.memory.MemorySourceType;
+import com.probeflow.testagent.memory.TaskMemoryService;
 import com.probeflow.testagent.task.MemoryRefinementStatus;
 import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskPriority;
@@ -68,6 +71,9 @@ class HttpExecutionApplicationServiceTests {
 
     @Autowired
     private TaskCaseExecutionRepository taskCaseExecutions;
+
+    @Autowired
+    private TaskMemoryService taskMemoryService;
 
     @Autowired
     private EntityManager entityManager;
@@ -133,6 +139,23 @@ class HttpExecutionApplicationServiceTests {
         assertThat(taskCaseExecution.getExecutionStatus()).isEqualTo(TaskCaseExecutionStatus.COMPLETED);
         assertThat(taskCaseExecution.getExecutionRecordId()).isEqualTo(recordId);
         assertThat(taskCaseExecution.getSnapshotJson()).containsEntry("environment", "test");
+
+        var memories = taskMemoryService.readActiveTaskMemories(task.getTaskId(), "execution");
+        assertThat(memories).singleElement()
+            .satisfies(memory -> {
+                assertThat(memory.sourceType()).isEqualTo(MemorySourceType.EXECUTION_RESULT);
+                assertThat(memory.sourceRef()).isEqualTo(recordId);
+                assertThat(memory.lifecycleStage()).isEqualTo("execution");
+                assertThat(memory.tags()).contains("http-execution", "passed", "test");
+                assertThat(memory.metadata())
+                    .containsEntry("taskId", task.getTaskId())
+                    .containsEntry("caseId", testCase.getCaseId())
+                    .containsEntry("executionId", recordId)
+                    .containsEntry("environment", "test")
+                    .containsEntry("status", "PASSED")
+                    .containsEntry("httpStatus", 201);
+                assertThat(((Number) memory.metadata().get("durationMs")).longValue()).isEqualTo(42L);
+            });
 
         assertThat(fakeHttpClient.requests()).singleElement()
             .satisfies(request -> {
@@ -215,6 +238,7 @@ class HttpExecutionApplicationServiceTests {
         assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.SKIPPED);
         assertThat(record.getResponseSnapshot()).containsEntry("dryRun", true);
         assertThat(record.getResponseSnapshot()).containsEntry("durationMs", 0L);
+        assertThat(taskMemoryService.readActiveTaskMemories(task.getTaskId(), "execution")).isEmpty();
     }
 
     @Test
@@ -518,6 +542,23 @@ class HttpExecutionApplicationServiceTests {
         assertThat(record.getErrorMessage()).contains("Connection refused");
         assertThat(record.getResponseSnapshot()).containsEntry("errorType", "NETWORK_ERROR");
         assertThat(record.getResponseSnapshot()).containsEntry("durationMs", 33L);
+
+        var memories = taskMemoryService.readActiveTaskMemories(task.getTaskId(), "execution");
+        assertThat(memories).singleElement()
+            .satisfies(memory -> {
+                assertThat(memory.scopeType()).isEqualTo(MemoryScopeType.FAILURE_PATTERN);
+                assertThat(memory.sourceType()).isEqualTo(MemorySourceType.EXECUTION_RESULT);
+                assertThat(memory.sourceRef()).isEqualTo(record.getExecutionId());
+                assertThat(memory.summary()).contains("HTTP execution ERROR");
+                assertThat(memory.content()).contains("Connection refused");
+                assertThat(memory.metadata())
+                    .containsEntry("caseId", testCase.getCaseId())
+                    .containsEntry("executionId", record.getExecutionId())
+                    .containsEntry("environment", "test")
+                    .containsEntry("status", "ERROR")
+                    .containsEntry("errorSummary", "Connection refused")
+                    .containsEntry("errorType", "NETWORK_ERROR");
+            });
     }
 
     @Test
@@ -624,6 +665,75 @@ class HttpExecutionApplicationServiceTests {
             .containsEntry("expected", 201)
             .containsEntry("actual", 500)
             .containsEntry("status", "FAILED"));
+    }
+
+    @Test
+    void failedExecutionWritesTaskMemoryAndLeavesTestCaseDefinitionUntouched() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = newSingleTestCase(apiSpec.getApiSpecId());
+        testCase.setManualEdited(true);
+        testCase.setLocked(true);
+        testCase.setExpectedResult("HTTP 201 with manually reviewed order payload");
+        var originalDetail = new java.util.LinkedHashMap<>(testCase.getDetail());
+        var originalSteps = List.copyOf(testCase.getSteps());
+        var originalExpectedResult = testCase.getExpectedResult();
+        var savedCase = testCases.save(testCase);
+        fakeHttpClient.respondWith(new HttpClientResponse(
+            500,
+            Map.of("Content-Type", "application/json"),
+            Map.of("error", "internal"),
+            18L
+        ));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(savedCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        var taskCaseExecution = taskCaseExecutions.findFirstByTaskIdAndCaseId(task.getTaskId(), savedCase.getCaseId())
+            .orElseThrow();
+        assertThat(taskCaseExecution.getExecutionStatus()).isEqualTo(TaskCaseExecutionStatus.FAILED);
+        assertThat(taskCaseExecution.getExecutionRecordId()).isEqualTo(record.getExecutionId());
+
+        var memories = taskMemoryService.readActiveTaskMemories(task.getTaskId(), "execution");
+        assertThat(memories).singleElement()
+            .satisfies(memory -> {
+                assertThat(memory.scopeType()).isEqualTo(MemoryScopeType.FAILURE_PATTERN);
+                assertThat(memory.sourceType()).isEqualTo(MemorySourceType.EXECUTION_RESULT);
+                assertThat(memory.sourceRef()).isEqualTo(record.getExecutionId());
+                assertThat(memory.summary()).contains("HTTP execution FAILED");
+                assertThat(memory.metadata())
+                    .containsEntry("taskId", task.getTaskId())
+                    .containsEntry("caseId", savedCase.getCaseId())
+                    .containsEntry("executionId", record.getExecutionId())
+                    .containsEntry("environment", "test")
+                    .containsEntry("status", "FAILED")
+                    .containsEntry("httpStatus", 500);
+
+                @SuppressWarnings("unchecked")
+                var failedAssertions = (List<Map<String, Object>>) memory.metadata().get("failedAssertions");
+                assertThat(failedAssertions).singleElement()
+                    .satisfies(assertion -> assertThat(assertion)
+                        .containsEntry("type", "STATUS_CODE")
+                        .containsEntry("expected", 201)
+                        .containsEntry("actual", 500)
+                        .containsEntry("status", "FAILED"));
+            });
+
+        entityManager.flush();
+        entityManager.clear();
+        var reloadedCase = testCases.findById(savedCase.getCaseId()).orElseThrow();
+        assertThat(reloadedCase.isManualEdited()).isTrue();
+        assertThat(reloadedCase.isLocked()).isTrue();
+        assertThat(reloadedCase.getExpectedResult()).isEqualTo(originalExpectedResult);
+        assertThat(reloadedCase.getDetail()).isEqualTo(originalDetail);
+        assertThat(reloadedCase.getSteps()).isEqualTo(originalSteps);
     }
 
     @Test

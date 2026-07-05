@@ -6,6 +6,10 @@ import com.probeflow.testagent.executionrecord.ExecutionRecord;
 import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.ExecutorType;
 import com.probeflow.testagent.executionrecord.OverallStatus;
+import com.probeflow.testagent.memory.MemoryScopeType;
+import com.probeflow.testagent.memory.MemorySourceType;
+import com.probeflow.testagent.memory.TaskMemoryService;
+import com.probeflow.testagent.memory.TaskMemoryWriteRequest;
 import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.taskcaseexecution.ExecutionMode;
@@ -19,7 +23,9 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -36,6 +42,7 @@ public class HttpExecutionApplicationService {
     private final ExecutableRequestBuilder executableRequestBuilder;
     private final HttpResponseSnapshotFactory responseSnapshotFactory;
     private final BaselineHttpAssertionChecker assertionChecker;
+    private final ObjectProvider<TaskMemoryService> taskMemoryServiceProvider;
 
     public HttpExecutionApplicationService(
         TaskRepository tasks,
@@ -46,7 +53,8 @@ public class HttpExecutionApplicationService {
         HttpClientGateway httpClientGateway,
         ExecutableRequestBuilder executableRequestBuilder,
         HttpResponseSnapshotFactory responseSnapshotFactory,
-        BaselineHttpAssertionChecker assertionChecker
+        BaselineHttpAssertionChecker assertionChecker,
+        ObjectProvider<TaskMemoryService> taskMemoryServiceProvider
     ) {
         this.tasks = tasks;
         this.testCases = testCases;
@@ -57,6 +65,7 @@ public class HttpExecutionApplicationService {
         this.executableRequestBuilder = executableRequestBuilder;
         this.responseSnapshotFactory = responseSnapshotFactory;
         this.assertionChecker = assertionChecker;
+        this.taskMemoryServiceProvider = taskMemoryServiceProvider;
     }
 
     @Transactional
@@ -629,6 +638,229 @@ public class HttpExecutionApplicationService {
         snapshot.put("executionRecordId", record.getExecutionId());
         taskCaseExecution.setSnapshotJson(snapshot);
         taskCaseExecutions.save(taskCaseExecution);
+        writeExecutionMemory(request, caseId, record, outcomeStatus);
+    }
+
+    private void writeExecutionMemory(
+        HttpExecutionRequest request,
+        String caseId,
+        ExecutionRecord record,
+        HttpExecutionOutcomeStatus outcomeStatus
+    ) {
+        if (request.dryRun() || record.getOverallStatus() == OverallStatus.SKIPPED) {
+            return;
+        }
+        var taskMemoryService = taskMemoryServiceProvider.getIfAvailable();
+        if (taskMemoryService == null) {
+            return;
+        }
+
+        var metadata = executionMemoryMetadata(request, caseId, record, outcomeStatus);
+        taskMemoryService.writeTaskMemory(new TaskMemoryWriteRequest(
+            request.taskId(),
+            executionMemoryScope(record.getOverallStatus()),
+            executionMemorySummary(caseId, request.environment(), record.getOverallStatus()),
+            executionMemoryContent(caseId, record, metadata),
+            executionMemoryTags(request.environment(), record.getOverallStatus()),
+            MemorySourceType.EXECUTION_RESULT,
+            record.getExecutionId(),
+            executionMemoryConfidence(record.getOverallStatus()),
+            "execution",
+            metadata,
+            null
+        ));
+    }
+
+    private MemoryScopeType executionMemoryScope(OverallStatus status) {
+        return switch (status) {
+            case FAILED, ERROR, BLOCKED, PASSED_WITH_WARNINGS -> MemoryScopeType.FAILURE_PATTERN;
+            case PASSED -> MemoryScopeType.TESTING_PATTERN;
+            case SKIPPED -> MemoryScopeType.PROJECT_KNOWLEDGE;
+        };
+    }
+
+    private String executionMemorySummary(String caseId, String environment, OverallStatus status) {
+        return "HTTP execution " + status.name() + " for case " + caseId + " in " + environment;
+    }
+
+    private String executionMemoryContent(
+        String caseId,
+        ExecutionRecord record,
+        Map<String, Object> metadata
+    ) {
+        var parts = new ArrayList<String>();
+        parts.add("Execution " + record.getExecutionId() + " for case " + caseId + " finished with status "
+            + record.getOverallStatus().name() + ".");
+        if (record.getStatusCode() != null) {
+            parts.add("HTTP status " + record.getStatusCode() + ".");
+        }
+        parts.add("Duration " + record.getDurationMs() + "ms.");
+        if (metadata.get("errorSummary") instanceof String errorSummary && StringUtils.hasText(errorSummary)) {
+            parts.add("Error: " + errorSummary + ".");
+        }
+        if (metadata.get("failedAssertionSummary") instanceof String failedAssertionSummary
+            && StringUtils.hasText(failedAssertionSummary)) {
+            parts.add("Failed assertions: " + failedAssertionSummary + ".");
+        }
+        if (metadata.get("requestReference") instanceof Map<?, ?> requestReference) {
+            var method = requestReference.get("method");
+            var path = requestReference.get("path");
+            if (method != null || path != null) {
+                parts.add("Request " + stringValue(method) + " " + stringValue(path) + ".");
+            }
+        }
+        return String.join(" ", parts);
+    }
+
+    private List<String> executionMemoryTags(String environment, OverallStatus status) {
+        var tags = new ArrayList<String>();
+        tags.add("http-execution");
+        tags.add(status.name().toLowerCase(Locale.ROOT));
+        if (StringUtils.hasText(environment)) {
+            tags.add(environment);
+        }
+        return List.copyOf(tags);
+    }
+
+    private float executionMemoryConfidence(OverallStatus status) {
+        return switch (status) {
+            case ERROR, BLOCKED -> 0.9f;
+            case FAILED, PASSED_WITH_WARNINGS -> 0.86f;
+            case PASSED -> 0.8f;
+            case SKIPPED -> 0.6f;
+        };
+    }
+
+    private Map<String, Object> executionMemoryMetadata(
+        HttpExecutionRequest request,
+        String caseId,
+        ExecutionRecord record,
+        HttpExecutionOutcomeStatus outcomeStatus
+    ) {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("taskId", request.taskId());
+        metadata.put("caseId", caseId);
+        metadata.put("executionId", record.getExecutionId());
+        metadata.put("environment", request.environment());
+        metadata.put("status", record.getOverallStatus().name());
+        metadata.put("outcomeStatus", outcomeStatus.name());
+        metadata.put("durationMs", record.getDurationMs());
+        if (record.getStatusCode() != null) {
+            metadata.put("httpStatus", record.getStatusCode());
+        }
+        var errorSummary = executionErrorSummary(record);
+        if (StringUtils.hasText(errorSummary)) {
+            metadata.put("errorSummary", errorSummary);
+        }
+        var errorType = record.getResponseSnapshot().get("errorType");
+        if (errorType != null) {
+            metadata.put("errorType", errorType);
+        }
+        var failureType = record.getResponseSnapshot().get("failureType");
+        if (failureType != null) {
+            metadata.put("failureType", failureType);
+        }
+        var failedAssertions = failedAssertions(record.getAssertionResults());
+        if (!failedAssertions.isEmpty()) {
+            metadata.put("failedAssertions", failedAssertions);
+            metadata.put("failedAssertionSummary", failedAssertionSummary(failedAssertions));
+        }
+        metadata.put("sourceReference", record.getExecutionId());
+        metadata.put("requestReference", requestReference(record.getRequestSnapshot()));
+        addSuiteFailureReference(metadata, record.getResponseSnapshot());
+        return metadata;
+    }
+
+    private String executionErrorSummary(ExecutionRecord record) {
+        if (StringUtils.hasText(record.getErrorMessage())) {
+            return record.getErrorMessage();
+        }
+        var failedAssertions = failedAssertions(record.getAssertionResults());
+        if (!failedAssertions.isEmpty()) {
+            return failedAssertionSummary(failedAssertions);
+        }
+        return null;
+    }
+
+    private List<Map<String, Object>> failedAssertions(List<Map<String, Object>> assertionResults) {
+        return assertionResults.stream()
+            .filter(this::assertionFailed)
+            .limit(5)
+            .map(this::compactAssertion)
+            .toList();
+    }
+
+    private Map<String, Object> compactAssertion(Map<String, Object> assertion) {
+        var compact = new LinkedHashMap<String, Object>();
+        copyIfPresent(compact, assertion, "stepId");
+        copyIfPresent(compact, assertion, "stepOrder");
+        copyIfPresent(compact, assertion, "apiSpecId");
+        copyIfPresent(compact, assertion, "name");
+        copyIfPresent(compact, assertion, "type");
+        copyIfPresent(compact, assertion, "path");
+        copyIfPresent(compact, assertion, "expected");
+        copyIfPresent(compact, assertion, "actual");
+        copyIfPresent(compact, assertion, "status");
+        copyIfPresent(compact, assertion, "critical");
+        copyIfPresent(compact, assertion, "message");
+        return compact;
+    }
+
+    private void copyIfPresent(Map<String, Object> target, Map<String, Object> source, String key) {
+        if (source.containsKey(key)) {
+            target.put(key, source.get(key));
+        }
+    }
+
+    private String failedAssertionSummary(List<Map<String, Object>> failedAssertions) {
+        return failedAssertions.stream()
+            .map(assertion -> {
+                var type = stringValue(assertion.get("type"));
+                var message = stringValue(assertion.get("message"));
+                if (StringUtils.hasText(message)) {
+                    return type + ": " + message;
+                }
+                return type + " expected " + stringValue(assertion.get("expected"))
+                    + " but got " + stringValue(assertion.get("actual"));
+            })
+            .collect(java.util.stream.Collectors.joining("; "));
+    }
+
+    private Map<String, Object> requestReference(Map<String, Object> requestSnapshot) {
+        var reference = new LinkedHashMap<String, Object>();
+        copyIfPresent(reference, requestSnapshot, "suite");
+        copyIfPresent(reference, requestSnapshot, "stepCount");
+        copyIfPresent(reference, requestSnapshot, "method");
+        copyIfPresent(reference, requestSnapshot, "path");
+        copyIfPresent(reference, requestSnapshot, "url");
+        return reference;
+    }
+
+    private void addSuiteFailureReference(Map<String, Object> metadata, Map<String, Object> responseSnapshot) {
+        if (!Boolean.TRUE.equals(responseSnapshot.get("suite"))) {
+            return;
+        }
+        @SuppressWarnings("unchecked")
+        var steps = (List<Map<String, Object>>) responseSnapshot.getOrDefault("steps", List.of());
+        metadata.put("suite", true);
+        metadata.put("stepCount", steps.size());
+        steps.stream()
+            .filter(step -> {
+                var status = step.get("overallStatus");
+                return OverallStatus.FAILED.name().equals(status)
+                    || OverallStatus.ERROR.name().equals(status)
+                    || OverallStatus.BLOCKED.name().equals(status);
+            })
+            .findFirst()
+            .ifPresent(step -> {
+                var failedStep = new LinkedHashMap<String, Object>();
+                copyIfPresent(failedStep, step, "stepId");
+                copyIfPresent(failedStep, step, "order");
+                copyIfPresent(failedStep, step, "apiSpecId");
+                copyIfPresent(failedStep, step, "overallStatus");
+                copyIfPresent(failedStep, step, "message");
+                metadata.put("failedStep", failedStep);
+            });
     }
 
     private HttpExecutionCaseResult blockedCaseResult(
