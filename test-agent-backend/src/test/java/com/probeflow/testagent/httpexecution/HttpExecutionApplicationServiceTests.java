@@ -336,6 +336,91 @@ class HttpExecutionApplicationServiceTests {
     }
 
     @Test
+    void blockedHostPolicyBlocksBeforeTransportWithClassification() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 200, requestShape("/api/orders"), List.of()));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "dev",
+            false,
+            HttpExecutionOptions.defaults(),
+            Map.of("baseUrl", "http://127.0.0.1:8080"),
+            Map.of()
+        ));
+
+        assertThat(result.caseResults()).singleElement()
+            .satisfies(caseResult -> {
+                assertThat(caseResult.status()).isEqualTo(HttpExecutionOutcomeStatus.BLOCKED);
+                assertThat(caseResult.message()).contains("Blocked host: 127.0.0.1");
+            });
+        assertThat(fakeHttpClient.requests()).isEmpty();
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.BLOCKED);
+        assertThat(record.getResponseSnapshot()).containsEntry("errorType", "BLOCKED_HOST");
+    }
+
+    @Test
+    void invalidUrlBlocksBeforeTransportWithInvalidRequestClassification() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 200, requestShape("/api/orders"), List.of()));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "dev",
+            false,
+            HttpExecutionOptions.defaults(),
+            Map.of("baseUrl", "http://[bad-host"),
+            Map.of()
+        ));
+
+        assertThat(result.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.BLOCKED);
+        assertThat(fakeHttpClient.requests()).isEmpty();
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getResponseSnapshot()).containsEntry("errorType", "INVALID_REQUEST");
+        assertThat(record.getErrorMessage()).contains("Invalid URL");
+    }
+
+    @Test
+    void requestSnapshotPreservesExplicitRedirectAndRetryPolicyMetadata() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId()));
+        fakeHttpClient.respondWith(new HttpClientResponse(
+            201,
+            Map.of("Content-Type", "application/json"),
+            Map.of("orderId", "order-123"),
+            17L
+        ));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "test",
+            false,
+            new HttpExecutionOptions(30_000L, true, false, HttpRedirectPolicy.NEVER, 0, List.of())
+        ));
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        @SuppressWarnings("unchecked")
+        var executionPolicy = (Map<String, Object>) record.getRequestSnapshot().get("executionPolicy");
+        assertThat(executionPolicy)
+            .containsEntry("redirectPolicy", "NEVER")
+            .containsEntry("maxRetries", 0)
+            .containsEntry("timeoutMs", 30_000L);
+        assertThat(fakeHttpClient.requests()).hasSize(1);
+    }
+
+    @Test
     void successfulResponseSnapshotCapturesHeadersBodyMetadataAndTruncatesLargeText() {
         var apiSpec = apiSpecs.save(newApiSpec());
         var task = tasks.save(newTask(apiSpec.getApiSpecId()));
@@ -532,6 +617,8 @@ class HttpExecutionApplicationServiceTests {
         var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
         assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.FAILED);
         assertThat(record.isCriticalFailed()).isTrue();
+        assertThat(record.getErrorMessage()).isNull();
+        assertThat(record.getResponseSnapshot()).containsEntry("failureType", "ASSERTION_FAILURE");
         assertThat(record.getAssertionResults()).anySatisfy(assertion -> assertThat(assertion)
             .containsEntry("type", "STATUS_CODE")
             .containsEntry("expected", 201)

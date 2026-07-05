@@ -57,14 +57,14 @@ public class ExecutableRequestBuilder {
         applyAuthFallback(headers, apiSpec, values, missingVariables);
 
         var url = buildUrl(baseUrl(executionRequest), path, queryParams);
-        var snapshot = requestSnapshot(testCase, step, method, path, url, headers, queryParams, body);
+        var snapshot = requestSnapshot(testCase, step, method, path, url, headers, queryParams, body, executionRequest.options());
         if (!missingVariables.isEmpty()) {
             return ExecutableRequestBuildResult.blocked("Unresolved variable: " + missingVariables.getFirst(), snapshot);
         }
 
-        var protocolError = protocolError(url);
-        if (protocolError != null) {
-            return ExecutableRequestBuildResult.blocked(protocolError, snapshot);
+        var safetyError = safetyError(url, executionRequest.options());
+        if (safetyError != null) {
+            return ExecutableRequestBuildResult.blocked(safetyError, snapshot);
         }
 
         return ExecutableRequestBuildResult.ready(
@@ -147,7 +147,7 @@ public class ExecutableRequestBuilder {
         return String.join("&", parts);
     }
 
-    private String protocolError(String url) {
+    private String safetyError(String url, HttpExecutionOptions options) {
         if (!StringUtils.hasText(url) || !hasScheme(url)) {
             return null;
         }
@@ -157,10 +157,45 @@ public class ExecutableRequestBuilder {
             if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
                 return "Unsupported protocol: " + scheme.toLowerCase(Locale.ROOT);
             }
+            var host = uri.getHost();
+            if (!StringUtils.hasText(host)) {
+                return "Invalid URL: " + url;
+            }
+            if (blockedHost(host, options)) {
+                return "Blocked host: " + host;
+            }
             return null;
         } catch (IllegalArgumentException exception) {
             return "Invalid URL: " + url;
         }
+    }
+
+    private boolean blockedHost(String host, HttpExecutionOptions options) {
+        var normalized = host.toLowerCase(Locale.ROOT);
+        if (options.blockedHosts().stream().anyMatch(blocked -> normalized.equals(blocked.toLowerCase(Locale.ROOT)))) {
+            return true;
+        }
+        if ("localhost".equals(normalized) || "::1".equals(normalized) || "0.0.0.0".equals(normalized)) {
+            return true;
+        }
+        if (normalized.startsWith("127.") || normalized.startsWith("10.") || normalized.startsWith("192.168.")) {
+            return true;
+        }
+        if (normalized.startsWith("169.254.")) {
+            return true;
+        }
+        if (normalized.startsWith("172.")) {
+            var parts = normalized.split("\\.");
+            if (parts.length > 1) {
+                try {
+                    var secondOctet = Integer.parseInt(parts[1]);
+                    return secondOctet >= 16 && secondOctet <= 31;
+                } catch (NumberFormatException exception) {
+                    return false;
+                }
+            }
+        }
+        return false;
     }
 
     private boolean hasScheme(String value) {
@@ -283,7 +318,8 @@ public class ExecutableRequestBuilder {
         String url,
         Map<String, Object> headers,
         Map<String, Object> queryParams,
-        Object body
+        Object body,
+        HttpExecutionOptions options
     ) {
         var snapshot = new LinkedHashMap<String, Object>();
         snapshot.put("caseId", testCase.getCaseId());
@@ -303,7 +339,17 @@ public class ExecutableRequestBuilder {
         if (body != null) {
             snapshot.put("body", redactSecrets(body, "body"));
         }
+        snapshot.put("executionPolicy", executionPolicy(options));
         return snapshot;
+    }
+
+    private Map<String, Object> executionPolicy(HttpExecutionOptions options) {
+        var policy = new LinkedHashMap<String, Object>();
+        policy.put("timeoutMs", options.timeoutMs());
+        policy.put("redirectPolicy", options.redirectPolicy().name());
+        policy.put("maxRetries", options.maxRetries());
+        policy.put("blockedHosts", options.blockedHosts());
+        return policy;
     }
 
     private Object redactSecrets(Object value, String key) {

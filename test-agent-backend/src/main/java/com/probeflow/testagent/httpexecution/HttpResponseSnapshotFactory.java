@@ -123,6 +123,9 @@ public class HttpResponseSnapshotFactory {
         if (message != null && message.startsWith("Unsupported protocol:")) {
             return "UNSUPPORTED_PROTOCOL";
         }
+        if (message != null && message.startsWith("Blocked host:")) {
+            return "BLOCKED_HOST";
+        }
         return "BLOCKED_REQUEST";
     }
 }

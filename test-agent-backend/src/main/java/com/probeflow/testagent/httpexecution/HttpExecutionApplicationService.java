@@ -174,11 +174,13 @@ public class HttpExecutionApplicationService {
             var assertionResults = assertionChecker.check(testCase, httpResponse, durationMs);
             var overallStatus = overallStatusForResponse(httpResponse.statusCode(), assertionResults);
             var outcomeStatus = outcomeStatusFor(overallStatus);
+            var responseSnapshot = responseSnapshotFactory.success(httpResponse, durationMs);
+            classifyAssertionFailure(responseSnapshot, overallStatus, assertionResults);
             var record = persistExecutionRecord(
                 request,
                 testCase,
                 preparedRequest.requestSnapshot(),
-                responseSnapshotFactory.success(httpResponse, durationMs),
+                responseSnapshot,
                 overallStatus,
                 assertionResults,
                 durationMs,
@@ -337,13 +339,15 @@ public class HttpExecutionApplicationService {
             var durationMs = normalizedDuration(httpResponse.durationMs(), startedAt);
             var assertionResults = assertionChecker.checkStep(step, httpResponse, durationMs);
             var overallStatus = overallStatusForResponse(httpResponse.statusCode(), assertionResults);
+            var responseSnapshot = responseSnapshotFactory.success(httpResponse, durationMs);
+            classifyAssertionFailure(responseSnapshot, overallStatus, assertionResults);
             return terminalStepResult(
                 step,
                 outcomeStatusFor(overallStatus),
                 overallStatus,
                 null,
                 preparedRequest.requestSnapshot(),
-                responseSnapshotFactory.success(httpResponse, durationMs),
+                responseSnapshot,
                 assertionResults,
                 durationMs,
                 httpResponse.statusCode()
@@ -801,6 +805,16 @@ public class HttpExecutionApplicationService {
             return OverallStatus.PASSED_WITH_WARNINGS;
         }
         return OverallStatus.PASSED;
+    }
+
+    private void classifyAssertionFailure(
+        Map<String, Object> responseSnapshot,
+        OverallStatus overallStatus,
+        List<Map<String, Object>> assertionResults
+    ) {
+        if (overallStatus == OverallStatus.FAILED && !assertionResults.isEmpty()) {
+            responseSnapshot.put("failureType", "ASSERTION_FAILURE");
+        }
     }
 
     private HttpExecutionOutcomeStatus outcomeStatusFor(OverallStatus overallStatus) {
