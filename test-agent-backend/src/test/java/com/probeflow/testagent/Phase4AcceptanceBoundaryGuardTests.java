@@ -306,6 +306,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             "ApiAnalysisApplicationService",
             "EmbeddingService",
             "FakeEmbeddingService",
+            "HttpExecutionApplicationService",
             "KnowledgeChunkingService",
             "KnowledgeIngestApplicationService",
             "KnowledgeRetrievalApplicationService",

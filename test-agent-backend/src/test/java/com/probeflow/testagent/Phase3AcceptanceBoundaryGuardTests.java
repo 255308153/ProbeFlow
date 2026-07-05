@@ -238,6 +238,7 @@ class Phase3AcceptanceBoundaryGuardTests {
         assertThat(applicationServices)
             .containsExactly(
                 "ApiAnalysisApplicationService",
+                "HttpExecutionApplicationService",
                 "KnowledgeIngestApplicationService",
                 "KnowledgeRetrievalApplicationService",
                 "TestCaseGenerationApplicationService"
