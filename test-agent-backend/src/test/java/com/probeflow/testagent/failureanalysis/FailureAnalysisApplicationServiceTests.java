@@ -338,6 +338,78 @@ class FailureAnalysisApplicationServiceTests {
         );
     }
 
+    @Test
+    void suiteAnalysisExplainsFirstFailedStepAndDependentSkips() {
+        var record = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("suite", true, "stepCount", 3),
+            Map.of("suite", true, "steps", List.of(
+                suiteStep("create-order", 1, "api-create", "FAILED", "status mismatch", 500),
+                suiteStep("read-order", 2, "api-read", "SKIPPED", "Skipped because prerequisite step failed: create-order", null),
+                suiteStep("pay-order", 3, "api-pay", "SKIPPED", "Skipped because prerequisite step failed: create-order", null)
+            )),
+            List.of(Map.of("type", "STATUS_CODE", "expected", 201, "actual", 500, "status", "FAILED", "stepId", "create-order"))
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
+
+        assertThat(result.classification()).isEqualTo(FailureClassification.SUITE_PREREQUISITE_FAILURE);
+        assertThat(result.riskLevel()).isEqualTo("HIGH");
+        assertThat(result.suiteFailure().suiteExecution()).isTrue();
+        assertThat(result.suiteFailure().failedStepId()).isEqualTo("create-order");
+        assertThat(result.suiteFailure().failedStepOrder()).isEqualTo(1);
+        assertThat(result.suiteFailure().failedStepApiSpecId()).isEqualTo("api-create");
+        assertThat(result.suiteFailure().dependentSkippedStepIds()).containsExactly("read-order", "pay-order");
+        assertThat(result.suiteFailure().impactSummary()).contains("Suite prerequisite step create-order");
+        assertThat(result.nextSuggestion()).contains("Inspect suite prerequisite step create-order");
+        assertThat(result.evidence()).contains("firstFailedStep=create-order order=1");
+
+        var observation = observations.findById(result.observationIds().getFirst()).orElseThrow();
+        assertThat(observation.getSummary()).contains("first failing suite step create-order");
+        assertThat(observation.getFailureReason()).contains("dependent skipped steps: [read-order, pay-order]");
+        assertThat(observation.getNextSuggestion()).contains("downstream skipped steps");
+    }
+
+    @Test
+    void suiteAnalysisHandlesMiddleStepFailureAndAllSkippedSuiteWithoutFalseIndependentFailures() {
+        var middleFailed = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("suite", true, "stepCount", 3),
+            Map.of("suite", true, "steps", List.of(
+                suiteStep("create-order", 1, "api-create", "PASSED", null, 201),
+                suiteStep("read-order", 2, "api-read", "ERROR", "Connection refused", null),
+                suiteStep("pay-order", 3, "api-pay", "SKIPPED", "Skipped because prerequisite step failed: read-order", null)
+            )),
+            List.of()
+        ));
+        var allSkipped = executionRecords.save(newExecutionRecord(
+            OverallStatus.SKIPPED,
+            Map.of("suite", true, "stepCount", 2),
+            Map.of("suite", true, "steps", List.of(
+                suiteStep("create-order", 1, "api-create", "SKIPPED", "Dry run prepared request; transport not called", null),
+                suiteStep("read-order", 2, "api-read", "SKIPPED", "Dry run prepared request; transport not called", null)
+            )),
+            List.of()
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var middleResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(middleFailed.getExecutionId()));
+        var skippedResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(allSkipped.getExecutionId()));
+
+        assertThat(middleResult.classification()).isEqualTo(FailureClassification.SUITE_PREREQUISITE_FAILURE);
+        assertThat(middleResult.suiteFailure().failedStepId()).isEqualTo("read-order");
+        assertThat(middleResult.suiteFailure().failedStepOrder()).isEqualTo(2);
+        assertThat(middleResult.suiteFailure().dependentSkippedStepIds()).containsExactly("pay-order");
+        assertThat(skippedResult.classification()).isEqualTo(FailureClassification.SKIPPED);
+        assertThat(skippedResult.observationIds()).isEmpty();
+        assertThat(skippedResult.suiteFailure().suiteExecution()).isTrue();
+        assertThat(skippedResult.suiteFailure().failedStepId()).isNull();
+        assertThat(skippedResult.suiteFailure().impactSummary()).contains("All suite steps were skipped");
+    }
+
     private ExecutionRecord newExecutionRecord(OverallStatus status) {
         return newExecutionRecord(
             status,
@@ -399,6 +471,32 @@ class FailureAnalysisApplicationServiceTests {
         if (!assertionResults.isEmpty()) {
             assertThat(result.evidence()).anySatisfy(item -> assertThat(item).contains("failedAssertion="));
         }
+    }
+
+    private Map<String, Object> suiteStep(
+        String stepId,
+        int order,
+        String apiSpecId,
+        String overallStatus,
+        String message,
+        Integer statusCode
+    ) {
+        var step = new java.util.LinkedHashMap<String, Object>();
+        step.put("stepId", stepId);
+        step.put("order", order);
+        step.put("apiSpecId", apiSpecId);
+        step.put("status", overallStatus);
+        step.put("overallStatus", overallStatus);
+        step.put("criticalFailed", "FAILED".equals(overallStatus) || "ERROR".equals(overallStatus) || "BLOCKED".equals(overallStatus));
+        step.put("durationMs", 10L);
+        step.put("statusCode", statusCode);
+        if (message != null) {
+            step.put("message", message);
+        }
+        step.put("requestSnapshot", Map.of("stepId", stepId));
+        step.put("responseSnapshot", statusCode == null ? Map.of() : Map.of("statusCode", statusCode));
+        step.put("assertionResults", List.of());
+        return step;
     }
 
     private void assertRecommendation(

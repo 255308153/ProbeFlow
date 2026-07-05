@@ -25,6 +25,7 @@ public record FailureAnalysisResult(
     String failureReason,
     String nextSuggestion,
     boolean retryable,
-    String retryReason
+    String retryReason,
+    SuiteFailureSummary suiteFailure
 ) {
 }

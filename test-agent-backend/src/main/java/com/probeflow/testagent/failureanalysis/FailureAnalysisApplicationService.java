@@ -37,13 +37,14 @@ public class FailureAnalysisApplicationService {
             .orElseThrow(() -> new IllegalArgumentException("ExecutionRecord not found: " + normalized.executionId()));
 
         var failedAssertions = failedAssertions(record);
-        var classification = classify(record, failedAssertions);
-        var riskLevel = riskLevel(record, classification, failedAssertions);
-        var summary = summary(record, classification);
-        var failureReason = failureReason(record, classification, failedAssertions);
+        var suiteFailure = suiteFailure(record);
+        var classification = classify(record, failedAssertions, suiteFailure);
+        var riskLevel = riskLevel(record, classification, failedAssertions, suiteFailure);
+        var summary = summary(record, classification, suiteFailure);
+        var failureReason = failureReason(record, classification, failedAssertions, suiteFailure);
         var retryable = retryable(record, classification);
         var retryReason = retryReason(record, classification, retryable);
-        var nextSuggestion = nextSuggestion(record, classification, retryable);
+        var nextSuggestion = nextSuggestion(record, classification, retryable, suiteFailure);
         var observationIds = writeObservationIfUseful(
             record,
             classification,
@@ -74,7 +75,8 @@ public class FailureAnalysisApplicationService {
             failureReason,
             nextSuggestion,
             retryable,
-            retryReason
+            retryReason,
+            suiteFailure
         );
     }
 
@@ -131,11 +133,20 @@ public class FailureAnalysisApplicationService {
             .toList();
     }
 
-    private FailureClassification classify(ExecutionRecord record, List<FailedAssertionSummary> failedAssertions) {
+    private FailureClassification classify(
+        ExecutionRecord record,
+        List<FailedAssertionSummary> failedAssertions,
+        SuiteFailureSummary suiteFailure
+    ) {
         var response = safeMap(record.getResponseSnapshot());
         var errorType = stringValue(response.get("errorType"));
         var statusCode = record.getStatusCode();
 
+        if (suiteFailure.suiteExecution()
+            && suiteFailure.failedStepId() != null
+            && suiteFailure.dependentSkippedStepCount() > 0) {
+            return FailureClassification.SUITE_PREREQUISITE_FAILURE;
+        }
         if (record.getOverallStatus() == OverallStatus.PASSED) {
             return FailureClassification.NONE;
         }
@@ -240,6 +251,16 @@ public class FailureAnalysisApplicationService {
                 + " actual=" + assertion.actual()
         ));
         evidence.add("classification=" + classification);
+        var suiteFailure = suiteFailure(record);
+        if (suiteFailure.suiteExecution()) {
+            evidence.add("suiteStepCount=" + suiteFailure.totalSteps());
+            if (suiteFailure.failedStepId() != null) {
+                evidence.add("firstFailedStep=" + suiteFailure.failedStepId() + " order=" + suiteFailure.failedStepOrder());
+            }
+            if (!suiteFailure.dependentSkippedStepIds().isEmpty()) {
+                evidence.add("dependentSkippedSteps=" + suiteFailure.dependentSkippedStepIds());
+            }
+        }
         return List.copyOf(evidence);
     }
 
@@ -285,7 +306,7 @@ public class FailureAnalysisApplicationService {
 
     private ObservationType observationType(FailureClassification classification) {
         return switch (classification) {
-            case AUTH_ISSUE, VALIDATION_ISSUE, SERVER_ERROR, DURATION_REGRESSION -> ObservationType.RISK_EVALUATION;
+            case AUTH_ISSUE, VALIDATION_ISSUE, SERVER_ERROR, DURATION_REGRESSION, SUITE_PREREQUISITE_FAILURE -> ObservationType.RISK_EVALUATION;
             case UNKNOWN, NONE, SKIPPED -> ObservationType.GENERAL_COMMENT;
             default -> ObservationType.ASSERTION_FAILURE_ANALYSIS;
         };
@@ -294,9 +315,13 @@ public class FailureAnalysisApplicationService {
     private ObservationRiskLevel riskLevel(
         ExecutionRecord record,
         FailureClassification classification,
-        List<FailedAssertionSummary> failedAssertions
+        List<FailedAssertionSummary> failedAssertions,
+        SuiteFailureSummary suiteFailure
     ) {
-        if (record.isCriticalFailed() || classification == FailureClassification.SERVER_ERROR) {
+        if (record.isCriticalFailed()
+            || classification == FailureClassification.SERVER_ERROR
+            || classification == FailureClassification.SUITE_PREREQUISITE_FAILURE
+            || suiteFailure.dependentSkippedStepCount() > 0) {
             return ObservationRiskLevel.HIGH;
         }
         if (classification == FailureClassification.AUTH_ISSUE
@@ -312,17 +337,31 @@ public class FailureAnalysisApplicationService {
         return ObservationRiskLevel.MEDIUM;
     }
 
-    private String summary(ExecutionRecord record, FailureClassification classification) {
-        return "BASIC failure analysis classified execution " + record.getExecutionId()
+    private String summary(
+        ExecutionRecord record,
+        FailureClassification classification,
+        SuiteFailureSummary suiteFailure
+    ) {
+        var summary = "BASIC failure analysis classified execution " + record.getExecutionId()
             + " as " + classification
             + " with status " + record.getOverallStatus();
+        if (suiteFailure.suiteExecution() && suiteFailure.failedStepId() != null) {
+            summary += "; first failing suite step " + suiteFailure.failedStepId()
+                + " order " + suiteFailure.failedStepOrder()
+                + " apiSpecId " + suiteFailure.failedStepApiSpecId();
+        }
+        return summary;
     }
 
     private String failureReason(
         ExecutionRecord record,
         FailureClassification classification,
-        List<FailedAssertionSummary> failedAssertions
+        List<FailedAssertionSummary> failedAssertions,
+        SuiteFailureSummary suiteFailure
     ) {
+        if (classification == FailureClassification.SUITE_PREREQUISITE_FAILURE) {
+            return suiteFailure.impactSummary();
+        }
         if (record.getErrorMessage() != null && !record.getErrorMessage().isBlank()) {
             return record.getErrorMessage();
         }
@@ -357,7 +396,8 @@ public class FailureAnalysisApplicationService {
     private String nextSuggestion(
         ExecutionRecord record,
         FailureClassification classification,
-        boolean retryable
+        boolean retryable,
+        SuiteFailureSummary suiteFailure
     ) {
         return switch (classification) {
             case TIMEOUT, TRANSPORT_ERROR -> retryable
@@ -375,9 +415,99 @@ public class FailureAnalysisApplicationService {
             case DURATION_REGRESSION -> retryable
                 ? "Retry once to rule out transient latency, then investigate performance regression."
                 : "Investigate API latency and performance regression risk.";
+            case SUITE_PREREQUISITE_FAILURE -> "Inspect suite prerequisite step "
+                + suiteFailure.failedStepId()
+                + " before treating downstream skipped steps as independent failures.";
             case SKIPPED, NONE -> "No failure follow-up is required.";
             default -> "Review deterministic failure analysis evidence.";
         };
+    }
+
+    private SuiteFailureSummary suiteFailure(ExecutionRecord record) {
+        var response = safeMap(record.getResponseSnapshot());
+        if (!Boolean.TRUE.equals(response.get("suite")) || !(response.get("steps") instanceof List<?> rawSteps)) {
+            return SuiteFailureSummary.none();
+        }
+
+        var steps = rawSteps.stream()
+            .filter(Map.class::isInstance)
+            .map(item -> objectMap((Map<?, ?>) item))
+            .toList();
+        if (steps.isEmpty()) {
+            return new SuiteFailureSummary(true, null, null, null, null, 0, 0, 0, List.of(), "Suite snapshot contains no step results.");
+        }
+
+        Map<String, Object> firstFailed = null;
+        for (var step : steps) {
+            if (failedSuiteStep(step)) {
+                firstFailed = step;
+                break;
+            }
+        }
+
+        var skipped = steps.stream()
+            .filter(this::skippedSuiteStep)
+            .toList();
+        var dependentSkipped = new ArrayList<String>();
+        if (firstFailed != null) {
+            var failedOrder = intValue(firstFailed.get("order"));
+            for (var step : skipped) {
+                var stepOrder = intValue(step.get("order"));
+                if ((failedOrder == null || stepOrder == null || stepOrder > failedOrder)
+                    && contains(stringValue(step.get("message")), "prerequisite step failed")) {
+                    dependentSkipped.add(stringValue(step.get("stepId")));
+                }
+            }
+        }
+
+        if (firstFailed == null) {
+            var impact = skipped.size() == steps.size()
+                ? "All suite steps were skipped; no prerequisite failure was identified."
+                : "Suite has no failed, errored, or blocked step.";
+            return new SuiteFailureSummary(true, null, null, null, null, steps.size(), skipped.size(), 0, List.of(), impact);
+        }
+
+        var failedStepId = stringValue(firstFailed.get("stepId"));
+        var failedStepOrder = intValue(firstFailed.get("order"));
+        var failedStepApiSpecId = stringValue(firstFailed.get("apiSpecId"));
+        var failedStepStatus = stringValue(firstFailed.get("overallStatus"));
+        if (failedStepStatus == null) {
+            failedStepStatus = stringValue(firstFailed.get("status"));
+        }
+        var impact = "Suite prerequisite step " + failedStepId
+            + " (order " + failedStepOrder
+            + ", apiSpecId " + failedStepApiSpecId
+            + ") failed with status " + failedStepStatus
+            + "; dependent skipped steps: " + dependentSkipped;
+
+        return new SuiteFailureSummary(
+            true,
+            failedStepId,
+            failedStepOrder,
+            failedStepApiSpecId,
+            failedStepStatus,
+            steps.size(),
+            skipped.size(),
+            dependentSkipped.size(),
+            List.copyOf(dependentSkipped),
+            impact
+        );
+    }
+
+    private boolean failedSuiteStep(Map<String, Object> step) {
+        var overallStatus = stringValue(step.get("overallStatus"));
+        var status = stringValue(step.get("status"));
+        return "FAILED".equals(overallStatus)
+            || "ERROR".equals(overallStatus)
+            || "BLOCKED".equals(overallStatus)
+            || "FAILED".equals(status)
+            || "ERROR".equals(status)
+            || "BLOCKED".equals(status);
+    }
+
+    private boolean skippedSuiteStep(Map<String, Object> step) {
+        return "SKIPPED".equals(stringValue(step.get("overallStatus")))
+            || "SKIPPED".equals(stringValue(step.get("status")));
     }
 
     private boolean assetDriftEvidence(ExecutionRecord record) {
@@ -396,11 +526,15 @@ public class FailureAnalysisApplicationService {
     @SuppressWarnings("unchecked")
     private Map<String, Object> nestedMap(Object value) {
         if (value instanceof Map<?, ?> map) {
-            var copy = new LinkedHashMap<String, Object>();
-            map.forEach((key, item) -> copy.put(String.valueOf(key), item));
-            return copy;
+            return objectMap(map);
         }
         return Map.of();
+    }
+
+    private Map<String, Object> objectMap(Map<?, ?> map) {
+        var copy = new LinkedHashMap<String, Object>();
+        map.forEach((key, item) -> copy.put(String.valueOf(key), item));
+        return copy;
     }
 
     private String clean(String value) {
