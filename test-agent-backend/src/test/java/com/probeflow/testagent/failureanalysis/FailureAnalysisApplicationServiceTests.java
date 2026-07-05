@@ -83,6 +83,8 @@ class FailureAnalysisApplicationServiceTests {
                 assertThat(assertion.actual()).isEqualTo(500);
                 assertThat(assertion.critical()).isTrue();
             });
+        assertThat(result.classification()).isEqualTo(FailureClassification.SERVER_ERROR);
+        assertThat(result.evidence()).contains("overallStatus=FAILED", "statusCode=500", "classification=SERVER_ERROR");
 
         entityManager.flush();
         entityManager.clear();
@@ -129,6 +131,71 @@ class FailureAnalysisApplicationServiceTests {
             .hasMessageContaining("ExecutionRecord not found: missing-execution");
     }
 
+    @Test
+    void deterministicClassificationCoversAssertionTransportBlockedAndStatusEvidence() {
+        assertClassification(
+            OverallStatus.FAILED,
+            409,
+            Map.of("failureType", "ASSERTION_FAILURE", "statusCode", 409),
+            List.of(Map.of("type", "STATUS_CODE", "expected", 201, "actual", 409, "status", "FAILED")),
+            FailureClassification.STATUS_MISMATCH
+        );
+        assertClassification(
+            OverallStatus.FAILED,
+            200,
+            Map.of("statusCode", 200),
+            List.of(Map.of("type", "JSON_FIELD_EXISTS", "path", "$.orderId", "expected", true, "actual", false, "status", "FAILED")),
+            FailureClassification.RESPONSE_SHAPE_MISMATCH
+        );
+        assertClassification(
+            OverallStatus.PASSED_WITH_WARNINGS,
+            200,
+            Map.of("statusCode", 200),
+            List.of(Map.of("type", "JSON_FIELD_EQUALS", "path", "$.status", "expected", "CREATED", "actual", "PENDING", "status", "FAILED", "critical", false)),
+            FailureClassification.RESPONSE_VALUE_MISMATCH
+        );
+        assertClassification(
+            OverallStatus.FAILED,
+            204,
+            Map.of("statusCode", 204),
+            List.of(Map.of("type", "BODY_PRESENT", "expected", true, "actual", false, "status", "FAILED")),
+            FailureClassification.BODY_PRESENCE_FAILURE
+        );
+        assertClassification(
+            OverallStatus.FAILED,
+            200,
+            Map.of("statusCode", 200),
+            List.of(Map.of("type", "DURATION_LESS_THAN_MS", "expected", 100, "actual", 250, "status", "FAILED")),
+            FailureClassification.DURATION_REGRESSION
+        );
+        assertClassification(
+            OverallStatus.ERROR,
+            null,
+            Map.of("errorType", "NETWORK_ERROR"),
+            List.of(),
+            FailureClassification.TRANSPORT_ERROR
+        );
+        assertClassification(
+            OverallStatus.ERROR,
+            null,
+            Map.of("errorType", "TIMEOUT"),
+            List.of(),
+            FailureClassification.TIMEOUT
+        );
+        assertClassification(
+            OverallStatus.BLOCKED,
+            null,
+            Map.of("errorType", "BLOCKED_HOST"),
+            List.of(),
+            FailureClassification.ENVIRONMENT_ISSUE
+        );
+        assertClassification(OverallStatus.FAILED, 401, Map.of("statusCode", 401), List.of(), FailureClassification.AUTH_ISSUE);
+        assertClassification(OverallStatus.FAILED, 403, Map.of("statusCode", 403), List.of(), FailureClassification.AUTH_ISSUE);
+        assertClassification(OverallStatus.FAILED, 400, Map.of("statusCode", 400), List.of(), FailureClassification.VALIDATION_ISSUE);
+        assertClassification(OverallStatus.FAILED, 422, Map.of("statusCode", 422), List.of(), FailureClassification.VALIDATION_ISSUE);
+        assertClassification(OverallStatus.FAILED, 503, Map.of("statusCode", 503), List.of(), FailureClassification.SERVER_ERROR);
+    }
+
     private ExecutionRecord newExecutionRecord(OverallStatus status) {
         return newExecutionRecord(
             status,
@@ -158,5 +225,37 @@ class FailureAnalysisApplicationServiceTests {
         record.setStatusCode(responseSnapshot.get("statusCode") instanceof Number number ? number.intValue() : null);
         record.setErrorMessage(status == OverallStatus.ERROR ? "Connection refused" : null);
         return record;
+    }
+
+    private void assertClassification(
+        OverallStatus status,
+        Integer statusCode,
+        Map<String, Object> responseSnapshot,
+        List<Map<String, Object>> assertionResults,
+        FailureClassification expected
+    ) {
+        var response = new java.util.LinkedHashMap<String, Object>(responseSnapshot);
+        if (statusCode != null) {
+            response.putIfAbsent("statusCode", statusCode);
+        }
+        var record = newExecutionRecord(status, Map.of("method", "GET", "path", "/api/orders"), response, assertionResults);
+        record.setStatusCode(statusCode);
+        if (expected == FailureClassification.TIMEOUT) {
+            record.setErrorMessage("Request timed out");
+        }
+        if (expected == FailureClassification.ENVIRONMENT_ISSUE) {
+            record.setErrorMessage("Blocked host: 127.0.0.1");
+        }
+        record = executionRecords.save(record);
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
+
+        assertThat(result.classification()).isEqualTo(expected);
+        assertThat(result.evidence()).anySatisfy(item -> assertThat(item).contains("classification=" + expected));
+        if (!assertionResults.isEmpty()) {
+            assertThat(result.evidence()).anySatisfy(item -> assertThat(item).contains("failedAssertion="));
+        }
     }
 }

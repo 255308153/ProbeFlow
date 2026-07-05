@@ -16,6 +16,8 @@ public record FailureAnalysisResult(
     RequestFacts request,
     ResponseFacts response,
     List<FailedAssertionSummary> failedAssertions,
-    String errorMessage
+    String errorMessage,
+    FailureClassification classification,
+    List<String> evidence
 ) {
 }
