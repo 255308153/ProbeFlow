@@ -44,6 +44,7 @@ class Phase1BoundaryGuardTests {
             "apispec",
             "changelog",
             "executionrecord",
+            "failureanalysis",
             "httpexecution",
             "knowledge",
             "memory",
