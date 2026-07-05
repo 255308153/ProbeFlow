@@ -29,9 +29,33 @@ public class BaselineHttpAssertionChecker {
         var results = new ArrayList<Map<String, Object>>();
         expectedStatus(testCase).ifPresent(expected -> results.add(statusCodeResult(expected, response.statusCode())));
         for (var definition : assertionDefinitions(testCase)) {
+            addDefinitionResult(results, definition, response, durationMs);
+        }
+        return List.copyOf(results);
+    }
+
+    public List<Map<String, Object>> checkStep(
+        Map<String, Object> step,
+        HttpClientResponse response,
+        long durationMs
+    ) {
+        var results = new ArrayList<Map<String, Object>>();
+        expectedStatus(step).ifPresent(expected -> results.add(statusCodeResult(expected, response.statusCode())));
+        for (var definition : assertionDefinitions(step)) {
+            addDefinitionResult(results, definition, response, durationMs);
+        }
+        return List.copyOf(results);
+    }
+
+    private void addDefinitionResult(
+        List<Map<String, Object>> results,
+        Map<String, Object> definition,
+        HttpClientResponse response,
+        long durationMs
+    ) {
             var type = assertionType(definition);
             if (!StringUtils.hasText(type)) {
-                continue;
+                return;
             }
             switch (type) {
                 case "STATUS_CODE", "EXPECTED_STATUS", "HTTP_STATUS" ->
@@ -51,8 +75,6 @@ public class BaselineHttpAssertionChecker {
                     results.add(result);
                 }
             }
-        }
-        return List.copyOf(results);
     }
 
     private java.util.Optional<Integer> expectedStatus(TestCase testCase) {
@@ -63,10 +85,19 @@ public class BaselineHttpAssertionChecker {
         return value == null ? java.util.Optional.empty() : java.util.Optional.of(integerValue(value));
     }
 
+    private java.util.Optional<Integer> expectedStatus(Map<String, Object> step) {
+        var value = step.get("expectedStatus");
+        return value == null ? java.util.Optional.empty() : java.util.Optional.of(integerValue(value));
+    }
+
     private List<Map<String, Object>> assertionDefinitions(TestCase testCase) {
+        return assertionDefinitions(testCase.getDetail());
+    }
+
+    private List<Map<String, Object>> assertionDefinitions(Map<String, Object> source) {
         var definitions = new ArrayList<Map<String, Object>>();
-        addDefinitions(definitions, testCase.getDetail().get("assertions"));
-        addDefinitions(definitions, testCase.getDetail().get("assertionDefinitions"));
+        addDefinitions(definitions, source.get("assertions"));
+        addDefinitions(definitions, source.get("assertionDefinitions"));
         return definitions;
     }
 

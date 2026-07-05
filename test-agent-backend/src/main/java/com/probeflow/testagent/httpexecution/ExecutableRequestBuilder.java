@@ -21,9 +21,27 @@ public class ExecutableRequestBuilder {
     private static final Pattern SINGLE_BRACE_PLACEHOLDER = Pattern.compile("(?<!\\{)\\{([A-Za-z0-9_.-]+)}(?!})");
 
     public ExecutableRequestBuildResult build(TestCase testCase, ApiSpec apiSpec, HttpExecutionRequest executionRequest) {
+        return build(testCase, null, apiSpec, executionRequest);
+    }
+
+    public ExecutableRequestBuildResult buildStep(
+        TestCase testCase,
+        Map<String, Object> step,
+        ApiSpec apiSpec,
+        HttpExecutionRequest executionRequest
+    ) {
+        return build(testCase, step, apiSpec, executionRequest);
+    }
+
+    private ExecutableRequestBuildResult build(
+        TestCase testCase,
+        Map<String, Object> step,
+        ApiSpec apiSpec,
+        HttpExecutionRequest executionRequest
+    ) {
         var values = mergedValues(executionRequest);
         var missingVariables = new ArrayList<String>();
-        var requestShape = requestShape(testCase);
+        var requestShape = requestShape(testCase, step);
 
         var method = stringValue(resolveValue(requestShape.get("method"), values, missingVariables));
         if (!StringUtils.hasText(method)) {
@@ -39,7 +57,7 @@ public class ExecutableRequestBuilder {
         applyAuthFallback(headers, apiSpec, values, missingVariables);
 
         var url = buildUrl(baseUrl(executionRequest), path, queryParams);
-        var snapshot = requestSnapshot(testCase, method, path, url, headers, queryParams, body);
+        var snapshot = requestSnapshot(testCase, step, method, path, url, headers, queryParams, body);
         if (!missingVariables.isEmpty()) {
             return ExecutableRequestBuildResult.blocked("Unresolved variable: " + missingVariables.getFirst(), snapshot);
         }
@@ -220,6 +238,27 @@ public class ExecutableRequestBuilder {
     }
 
     private Map<String, Object> requestShape(TestCase testCase) {
+        return requestShape(testCase, null);
+    }
+
+    private Map<String, Object> requestShape(TestCase testCase, Map<String, Object> step) {
+        if (step != null) {
+            var stepShape = objectMap(step.get("requestShape"));
+            if (!stepShape.isEmpty()) {
+                return stepShape;
+            }
+            var inlineShape = new LinkedHashMap<String, Object>();
+            copyIfPresent(inlineShape, step, "method");
+            copyIfPresent(inlineShape, step, "path");
+            copyIfPresent(inlineShape, step, "headers");
+            copyIfPresent(inlineShape, step, "queryParams");
+            copyIfPresent(inlineShape, step, "query");
+            copyIfPresent(inlineShape, step, "body");
+            inlineShape.putAll(objectMap(step.get("requestTemplate")));
+            if (!inlineShape.isEmpty()) {
+                return inlineShape;
+            }
+        }
         var detailShape = objectMap(testCase.getDetail().get("requestShape"));
         if (!detailShape.isEmpty()) {
             return detailShape;
@@ -230,8 +269,15 @@ public class ExecutableRequestBuilder {
         return Map.of();
     }
 
+    private void copyIfPresent(Map<String, Object> target, Map<String, Object> source, String key) {
+        if (source.containsKey(key)) {
+            target.put(key, source.get(key));
+        }
+    }
+
     private Map<String, Object> requestSnapshot(
         TestCase testCase,
+        Map<String, Object> step,
         String method,
         String path,
         String url,
@@ -242,6 +288,11 @@ public class ExecutableRequestBuilder {
         var snapshot = new LinkedHashMap<String, Object>();
         snapshot.put("caseId", testCase.getCaseId());
         snapshot.put("apiSpecId", testCase.getPrimaryApiSpecId());
+        if (step != null) {
+            snapshot.put("stepId", firstPresent(step, "stepId", "stepName", "order"));
+            snapshot.put("stepOrder", step.get("order"));
+            snapshot.put("apiSpecId", firstPresent(step, "apiSpecId", "targetApiSpecId"));
+        }
         snapshot.put("method", method);
         snapshot.put("path", path);
         snapshot.put("url", url);

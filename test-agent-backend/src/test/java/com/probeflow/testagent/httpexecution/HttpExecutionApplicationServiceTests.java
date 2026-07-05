@@ -778,12 +778,110 @@ class HttpExecutionApplicationServiceTests {
         assertThat(warningRecord.isCriticalFailed()).isFalse();
     }
 
+    @Test
+    void suiteExecutesOrderedStepsAndPersistsStepDetails() {
+        var createOrder = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/orders", 201));
+        var readOrder = apiSpecs.save(newApiSpec(HttpMethod.GET, "/api/orders/order-123", 200));
+        var task = tasks.save(newTask(List.of(createOrder.getApiSpecId(), readOrder.getApiSpecId())));
+        var suite = testCases.save(newSuiteTestCase(createOrder.getApiSpecId(), List.of(
+            suiteStep(2, "read-order", readOrder.getApiSpecId(), "GET", "/api/orders/order-123", 200),
+            suiteStep(1, "create-order", createOrder.getApiSpecId(), "POST", "/api/orders", 201)
+        )));
+        fakeHttpClient.respondWithSequence(
+            new HttpClientResponse(201, Map.of(), Map.of("orderId", "order-123"), 21L),
+            new HttpClientResponse(200, Map.of(), Map.of("orderId", "order-123", "status", "CREATED"), 13L)
+        );
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(suite.getCaseId()),
+            ExecutionMode.SUITE_STEP,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        assertThat(result.caseResults()).singleElement()
+            .satisfies(caseResult -> {
+                assertThat(caseResult.caseId()).isEqualTo(suite.getCaseId());
+                assertThat(caseResult.status()).isEqualTo(HttpExecutionOutcomeStatus.PASSED);
+                assertThat(caseResult.durationMs()).isEqualTo(34L);
+                assertThat(caseResult.executionRecordId()).isNotBlank();
+            });
+        assertThat(result.counts()).isEqualTo(new HttpExecutionCounts(1, 1, 0, 0, 0, 0));
+        assertThat(fakeHttpClient.requests()).extracting(HttpClientRequest::path)
+            .containsExactly("/api/orders", "/api/orders/order-123");
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.PASSED);
+        assertThat(record.getDurationMs()).isEqualTo(34L);
+        assertThat(record.getRequestSnapshot()).containsEntry("suite", true);
+
+        @SuppressWarnings("unchecked")
+        var steps = (List<Map<String, Object>>) record.getResponseSnapshot().get("steps");
+        assertThat(steps).hasSize(2);
+        assertThat(steps).extracting(step -> step.get("stepId"))
+            .containsExactly("create-order", "read-order");
+        assertThat(steps).extracting(step -> step.get("status"))
+            .containsExactly("PASSED", "PASSED");
+        assertThat(steps.getFirst()).containsKeys("requestSnapshot", "responseSnapshot", "assertionResults");
+        assertThat(record.getAssertionResults()).hasSize(2);
+
+        var taskCaseExecution = taskCaseExecutions.findFirstByTaskIdAndCaseId(task.getTaskId(), suite.getCaseId())
+            .orElseThrow();
+        assertThat(taskCaseExecution.getExecutionRecordId()).isEqualTo(record.getExecutionId());
+        assertThat(taskCaseExecution.getExecutionStatus()).isEqualTo(TaskCaseExecutionStatus.COMPLETED);
+    }
+
+    @Test
+    void suiteStopsDependentStepsAfterFailedPrerequisiteWhenConfigured() {
+        var createOrder = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/orders", 201));
+        var readOrder = apiSpecs.save(newApiSpec(HttpMethod.GET, "/api/orders/order-123", 200));
+        var payOrder = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/orders/order-123/pay", 200));
+        var task = tasks.save(newTask(List.of(createOrder.getApiSpecId(), readOrder.getApiSpecId(), payOrder.getApiSpecId())));
+        var suite = testCases.save(newSuiteTestCase(createOrder.getApiSpecId(), List.of(
+            suiteStep(1, "create-order", createOrder.getApiSpecId(), "POST", "/api/orders", 201),
+            suiteStep(2, "read-order", readOrder.getApiSpecId(), "GET", "/api/orders/order-123", 200),
+            suiteStep(3, "pay-order", payOrder.getApiSpecId(), "POST", "/api/orders/order-123/pay", 200)
+        )));
+        fakeHttpClient.respondWithSequence(new HttpClientResponse(500, Map.of(), Map.of("error", "boom"), 31L));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(suite.getCaseId()),
+            ExecutionMode.SUITE_STEP,
+            "test",
+            false,
+            new HttpExecutionOptions(30_000L, true, true)
+        ));
+
+        assertThat(result.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.FAILED);
+        assertThat(result.counts()).isEqualTo(new HttpExecutionCounts(1, 0, 1, 0, 0, 0));
+        assertThat(fakeHttpClient.requests()).extracting(HttpClientRequest::path)
+            .containsExactly("/api/orders");
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.FAILED);
+        assertThat(record.isCriticalFailed()).isTrue();
+
+        @SuppressWarnings("unchecked")
+        var steps = (List<Map<String, Object>>) record.getResponseSnapshot().get("steps");
+        assertThat(steps).extracting(step -> step.get("status"))
+            .containsExactly("FAILED", "SKIPPED", "SKIPPED");
+        assertThat(steps.get(1).get("message")).asString().contains("prerequisite step failed");
+        assertThat(steps.get(2).get("message")).asString().contains("prerequisite step failed");
+    }
+
     private ApiSpec newApiSpec() {
+        return newApiSpec(HttpMethod.POST, "/api/orders", 201);
+    }
+
+    private ApiSpec newApiSpec(HttpMethod method, String path, int expectedStatus) {
         var apiSpec = new ApiSpec();
         apiSpec.setSystemName("order-platform");
         apiSpec.setModuleName("order");
-        apiSpec.setHttpMethod(HttpMethod.POST);
-        apiSpec.setPath("/api/orders");
+        apiSpec.setHttpMethod(method);
+        apiSpec.setPath(path);
         apiSpec.setSummary("Create order");
         apiSpec.setDescription("Create a new order from a SKU and quantity");
         apiSpec.setOperationId("createOrder");
@@ -807,13 +905,17 @@ class HttpExecutionApplicationServiceTests {
     }
 
     private Task newTask(String apiSpecId) {
+        return newTask(List.of(apiSpecId));
+    }
+
+    private Task newTask(List<String> apiSpecIds) {
         var task = new Task();
         task.setTaskType(TaskType.API_TEST);
         task.setTaskName("Execute order API cases");
         task.setStatus(TaskStatus.EXECUTING);
         task.setSourceType(TaskSourceType.MANUAL);
         task.setSourceRef("phase6-issue-01");
-        task.setTargetApiSpecIds(List.of(apiSpecId));
+        task.setTargetApiSpecIds(apiSpecIds);
         task.setPromotionMode(PromotionMode.MANUAL);
         task.setMemoryRefinementStatus(MemoryRefinementStatus.NOT_REQUIRED);
         task.setPriority(TaskPriority.MEDIUM);
@@ -882,6 +984,39 @@ class HttpExecutionApplicationServiceTests {
         )));
         testCase.setBasedOnApiSpecVersions(Map.of(apiSpecId, 3));
         return testCase;
+    }
+
+    private TestCase newSuiteTestCase(String primaryApiSpecId, List<Map<String, Object>> steps) {
+        var testCase = newSingleTestCase(primaryApiSpecId);
+        testCase.setMode(TestCaseMode.SUITE);
+        testCase.setTitle("Order suite flow");
+        testCase.setExpectedResult("Suite steps complete in order");
+        testCase.setDetail(Map.of("suite", true));
+        testCase.setSteps(steps);
+        return testCase;
+    }
+
+    private Map<String, Object> suiteStep(
+        int order,
+        String stepId,
+        String apiSpecId,
+        String method,
+        String path,
+        int expectedStatus
+    ) {
+        return Map.of(
+            "order", order,
+            "stepId", stepId,
+            "apiSpecId", apiSpecId,
+            "method", method,
+            "path", path,
+            "expectedStatus", expectedStatus,
+            "requestShape", Map.of(
+                "method", method,
+                "path", path,
+                "headers", Map.of("Content-Type", "application/json")
+            )
+        );
     }
 
     @TestConfiguration
