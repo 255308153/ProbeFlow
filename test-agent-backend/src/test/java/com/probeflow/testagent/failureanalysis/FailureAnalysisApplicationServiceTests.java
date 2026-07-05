@@ -238,7 +238,8 @@ class FailureAnalysisApplicationServiceTests {
                 assertThat(observation.getRiskLevel()).isEqualTo(ObservationRiskLevel.HIGH);
                 assertThat(observation.getSummary()).contains("SERVER_ERROR");
                 assertThat(observation.getFailureReason()).contains("STATUS_CODE expected 201 but got 500");
-                assertThat(observation.getNextSuggestion()).contains("Review deterministic failure analysis evidence");
+                assertThat(observation.getNextSuggestion()).isEqualTo(first.nextSuggestion());
+                assertThat(observation.getNextSuggestion()).contains("Investigate API regression");
             });
 
         entityManager.flush();
@@ -268,6 +269,73 @@ class FailureAnalysisApplicationServiceTests {
             skipped.getExecutionId(),
             AnalysisLevel.BASIC
         )).isEmpty();
+    }
+
+    @Test
+    void retrySuggestionAndNextActionAreConservativeAndClassificationAware() {
+        assertRecommendation(
+            OverallStatus.ERROR,
+            null,
+            Map.of("errorType", "TIMEOUT"),
+            List.of(),
+            true,
+            "Timeouts are often transient",
+            "Retry execution"
+        );
+        assertRecommendation(
+            OverallStatus.FAILED,
+            503,
+            Map.of("statusCode", 503),
+            List.of(),
+            true,
+            "HTTP 503",
+            "Retry once"
+        );
+        assertRecommendation(
+            OverallStatus.FAILED,
+            409,
+            Map.of("statusCode", 409),
+            List.of(Map.of("type", "STATUS_CODE", "expected", 201, "actual", 409, "status", "FAILED")),
+            false,
+            "deterministic or non-retryable",
+            "Investigate API behavior versus TestCase expectations"
+        );
+        assertRecommendation(
+            OverallStatus.BLOCKED,
+            null,
+            Map.of("errorType", "INVALID_REQUEST"),
+            List.of(),
+            false,
+            "deterministic or non-retryable",
+            "Inspect environment variables"
+        );
+        assertRecommendation(
+            OverallStatus.FAILED,
+            401,
+            Map.of("statusCode", 401),
+            List.of(),
+            false,
+            "deterministic or non-retryable",
+            "Inspect auth variables"
+        );
+        assertRecommendation(
+            OverallStatus.FAILED,
+            422,
+            Map.of("statusCode", 422),
+            List.of(),
+            false,
+            "deterministic or non-retryable",
+            "Review request data"
+        );
+        assertRecommendation(
+            OverallStatus.FAILED,
+            200,
+            Map.of("statusCode", 200, "message", "expected payload appears stale after API drift"),
+            List.of(Map.of("type", "JSON_FIELD_EQUALS", "path", "$.status", "expected", "CREATED", "actual", "PENDING", "status", "FAILED")),
+            false,
+            "deterministic or non-retryable",
+            "update TestCase expectations"
+        );
     }
 
     private ExecutionRecord newExecutionRecord(OverallStatus status) {
@@ -330,6 +398,39 @@ class FailureAnalysisApplicationServiceTests {
         assertThat(result.evidence()).anySatisfy(item -> assertThat(item).contains("classification=" + expected));
         if (!assertionResults.isEmpty()) {
             assertThat(result.evidence()).anySatisfy(item -> assertThat(item).contains("failedAssertion="));
+        }
+    }
+
+    private void assertRecommendation(
+        OverallStatus status,
+        Integer statusCode,
+        Map<String, Object> responseSnapshot,
+        List<Map<String, Object>> assertionResults,
+        boolean retryable,
+        String retryReason,
+        String nextSuggestion
+    ) {
+        var response = new java.util.LinkedHashMap<String, Object>(responseSnapshot);
+        if (statusCode != null) {
+            response.putIfAbsent("statusCode", statusCode);
+        }
+        var record = newExecutionRecord(status, Map.of("method", "GET", "path", "/api/orders"), response, assertionResults);
+        record.setStatusCode(statusCode);
+        if (response.containsKey("errorType")) {
+            record.setErrorMessage(String.valueOf(response.get("errorType")));
+        }
+        record = executionRecords.save(record);
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
+
+        assertThat(result.retryable()).isEqualTo(retryable);
+        assertThat(result.retryReason()).contains(retryReason);
+        assertThat(result.nextSuggestion()).contains(nextSuggestion);
+        if (!result.observationIds().isEmpty()) {
+            var observation = observations.findById(result.observationIds().getFirst()).orElseThrow();
+            assertThat(observation.getNextSuggestion()).isEqualTo(result.nextSuggestion());
         }
     }
 }

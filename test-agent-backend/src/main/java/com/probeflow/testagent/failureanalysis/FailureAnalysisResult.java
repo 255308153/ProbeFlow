@@ -23,6 +23,8 @@ public record FailureAnalysisResult(
     String riskLevel,
     String summary,
     String failureReason,
-    String nextSuggestion
+    String nextSuggestion,
+    boolean retryable,
+    String retryReason
 ) {
 }

@@ -41,7 +41,9 @@ public class FailureAnalysisApplicationService {
         var riskLevel = riskLevel(record, classification, failedAssertions);
         var summary = summary(record, classification);
         var failureReason = failureReason(record, classification, failedAssertions);
-        var nextSuggestion = "Review deterministic failure analysis evidence.";
+        var retryable = retryable(record, classification);
+        var retryReason = retryReason(record, classification, retryable);
+        var nextSuggestion = nextSuggestion(record, classification, retryable);
         var observationIds = writeObservationIfUseful(
             record,
             classification,
@@ -70,7 +72,9 @@ public class FailureAnalysisApplicationService {
             riskLevel.name(),
             summary,
             failureReason,
-            nextSuggestion
+            nextSuggestion,
+            retryable,
+            retryReason
         );
     }
 
@@ -327,6 +331,62 @@ public class FailureAnalysisApplicationService {
             return first.type() + " expected " + first.expected() + " but got " + first.actual();
         }
         return "Execution evidence indicates " + classification;
+    }
+
+    private boolean retryable(ExecutionRecord record, FailureClassification classification) {
+        if (classification == FailureClassification.TIMEOUT || classification == FailureClassification.TRANSPORT_ERROR) {
+            return true;
+        }
+        var statusCode = record.getStatusCode();
+        return statusCode != null && (statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504);
+    }
+
+    private String retryReason(ExecutionRecord record, FailureClassification classification, boolean retryable) {
+        if (!retryable) {
+            return "Evidence points to a deterministic or non-retryable failure.";
+        }
+        if (classification == FailureClassification.TIMEOUT) {
+            return "Timeouts are often transient and may succeed on a later attempt.";
+        }
+        if (classification == FailureClassification.TRANSPORT_ERROR) {
+            return "Transport errors can be caused by temporary network or environment instability.";
+        }
+        return "HTTP " + record.getStatusCode() + " is commonly transient or rate-limit related.";
+    }
+
+    private String nextSuggestion(
+        ExecutionRecord record,
+        FailureClassification classification,
+        boolean retryable
+    ) {
+        return switch (classification) {
+            case TIMEOUT, TRANSPORT_ERROR -> retryable
+                ? "Retry execution after checking network and target environment health."
+                : "Inspect network and target environment health before retrying.";
+            case ENVIRONMENT_ISSUE, BLOCKED_REQUEST -> "Inspect environment variables, URL, protocol, and safety policy before retrying.";
+            case AUTH_ISSUE -> "Inspect auth variables, token freshness, and token scope.";
+            case VALIDATION_ISSUE -> "Review request data, generated TestCase inputs, and API contract expectations.";
+            case SERVER_ERROR -> retryable
+                ? "Retry once, then investigate API regression or service health if it reproduces."
+                : "Investigate API regression or service health.";
+            case STATUS_MISMATCH, RESPONSE_SHAPE_MISMATCH, RESPONSE_VALUE_MISMATCH, BODY_PRESENCE_FAILURE -> assetDriftEvidence(record)
+                ? "Review API behavior change and update TestCase expectations if the change is intentional."
+                : "Investigate API behavior versus TestCase expectations.";
+            case DURATION_REGRESSION -> retryable
+                ? "Retry once to rule out transient latency, then investigate performance regression."
+                : "Investigate API latency and performance regression risk.";
+            case SKIPPED, NONE -> "No failure follow-up is required.";
+            default -> "Review deterministic failure analysis evidence.";
+        };
+    }
+
+    private boolean assetDriftEvidence(ExecutionRecord record) {
+        var response = safeMap(record.getResponseSnapshot());
+        return contains(record.getErrorMessage(), "stale")
+            || contains(record.getErrorMessage(), "drift")
+            || contains(stringValue(response.get("failureType")), "DRIFT")
+            || contains(stringValue(response.get("message")), "stale")
+            || contains(stringValue(response.get("message")), "drift");
     }
 
     private Map<String, Object> safeMap(Map<String, Object> value) {
