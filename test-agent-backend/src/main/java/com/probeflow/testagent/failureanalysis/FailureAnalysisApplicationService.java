@@ -5,6 +5,9 @@ import com.probeflow.testagent.executionrecord.ExecutionRecord;
 import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.OverallStatus;
 import com.probeflow.testagent.memory.MemoryScopeType;
+import com.probeflow.testagent.memory.MemoryCandidateRequest;
+import com.probeflow.testagent.memory.MemoryRefineryResult;
+import com.probeflow.testagent.memory.MemoryRefineryService;
 import com.probeflow.testagent.memory.MemorySourceType;
 import com.probeflow.testagent.memory.TaskMemoryService;
 import com.probeflow.testagent.memory.TaskMemoryWriteRequest;
@@ -37,6 +40,7 @@ public class FailureAnalysisApplicationService {
     private final TestCaseRepository testCases;
     private final ApiSpecRepository apiSpecs;
     private final TaskMemoryService taskMemoryService;
+    private final MemoryRefineryService memoryRefineryService;
     private final TaskRepository tasks;
 
     public FailureAnalysisApplicationService(
@@ -45,6 +49,7 @@ public class FailureAnalysisApplicationService {
         TestCaseRepository testCases,
         ApiSpecRepository apiSpecs,
         TaskMemoryService taskMemoryService,
+        MemoryRefineryService memoryRefineryService,
         TaskRepository tasks
     ) {
         this.executionRecords = executionRecords;
@@ -52,6 +57,7 @@ public class FailureAnalysisApplicationService {
         this.testCases = testCases;
         this.apiSpecs = apiSpecs;
         this.taskMemoryService = taskMemoryService;
+        this.memoryRefineryService = memoryRefineryService;
         this.tasks = tasks;
     }
 
@@ -89,6 +95,15 @@ public class FailureAnalysisApplicationService {
             retryable,
             evidence
         );
+        var memoryCandidate = refineSingleExecutionMemoryCandidate(
+            record,
+            classification,
+            riskLevel,
+            summary,
+            failureReason,
+            retryable,
+            evidence
+        );
         return new FailureAnalysisResult(
             record.getExecutionId(),
             record.getTaskId(),
@@ -113,6 +128,7 @@ public class FailureAnalysisApplicationService {
             retryable,
             retryReason,
             taskMemoryIds,
+            memoryCandidate,
             suiteFailure
         );
     }
@@ -125,11 +141,13 @@ public class FailureAnalysisApplicationService {
             .map(record -> analyzeExecution(new FailureAnalysisRequest(record.getExecutionId(), normalized.mode())))
             .toList();
         var groups = groupedFailures(records, results);
+        var taskCandidateResults = refineTaskMemoryCandidates(normalized.taskId(), groups, results);
+        var enrichedResults = attachTaskMemoryCandidates(results, taskCandidateResults);
         return new TaskFailureAnalysisResult(
             normalized.taskId(),
             normalized.mode(),
-            counts(results),
-            results,
+            counts(enrichedResults),
+            enrichedResults,
             groups
         );
     }
@@ -473,6 +491,277 @@ public class FailureAnalysisApplicationService {
             return 0.88f;
         }
         return 0.78f;
+    }
+
+    private MemoryCandidateAnalysisResult refineSingleExecutionMemoryCandidate(
+        ExecutionRecord record,
+        FailureClassification classification,
+        ObservationRiskLevel riskLevel,
+        String summary,
+        String failureReason,
+        boolean retryable,
+        List<String> evidence
+    ) {
+        if (record.getOverallStatus() == OverallStatus.PASSED || record.getOverallStatus() == OverallStatus.SKIPPED) {
+            return MemoryCandidateAnalysisResult.notAttempted();
+        }
+        if (classification == FailureClassification.NONE || classification == FailureClassification.SKIPPED) {
+            return MemoryCandidateAnalysisResult.notAttempted();
+        }
+
+        var confidence = memoryCandidateConfidence(classification, riskLevel);
+        var result = memoryRefineryService.refine(new MemoryCandidateRequest(
+            memoryCandidateSummary(record, classification),
+            memoryCandidateContent(record, classification, failureReason, retryable),
+            MemorySourceType.EXECUTION_RESULT,
+            record.getExecutionId(),
+            record.getTaskId(),
+            memoryCandidateTags(classification, retryable, false),
+            confidence,
+            rawEvidence(summary, evidence),
+            memoryCandidateMetadata(record, classification, riskLevel, retryable, evidence, 1)
+        ));
+        if (result.accepted()) {
+            markTaskMemoryRefinementPending(record.getTaskId());
+        }
+        return memoryCandidateResult(result);
+    }
+
+    private Map<String, MemoryCandidateAnalysisResult> refineTaskMemoryCandidates(
+        String taskId,
+        List<GroupedFailureSummary> groups,
+        List<FailureAnalysisResult> results
+    ) {
+        var byExecutionId = new LinkedHashMap<String, MemoryCandidateAnalysisResult>();
+        var resultById = results.stream()
+            .collect(Collectors.toMap(FailureAnalysisResult::executionId, Function.identity()));
+        for (var group : groups) {
+            if (group.occurrenceCount() < 2 || group.classification() == FailureClassification.DATA_QUALITY_ISSUE) {
+                continue;
+            }
+            var firstExecutionId = group.executionIds().getFirst();
+            var first = resultById.get(firstExecutionId);
+            if (first == null || first.memoryCandidate().accepted()) {
+                continue;
+            }
+            var retryable = group.retryable();
+            var result = memoryRefineryService.refine(new MemoryCandidateRequest(
+                "Repeated " + group.classification() + " pattern for " + group.apiReference(),
+                "Task " + taskId + " saw " + group.occurrenceCount()
+                    + " similar executions with classification " + group.classification()
+                    + ". Next action: " + first.nextSuggestion(),
+                MemorySourceType.EXECUTION_RESULT,
+                taskId + ":" + group.classification() + ":" + group.apiReference() + ":" + group.statusCode(),
+                taskId,
+                memoryCandidateTags(group.classification(), retryable, true),
+                0.90f,
+                "Repeated task-level failure executions: " + group.executionIds()
+                    + ". Cases: " + group.affectedCaseIds()
+                    + ". Evidence: " + first.evidence(),
+                groupedMemoryCandidateMetadata(group, taskId, first)
+            ));
+            var candidateResult = memoryCandidateResult(result);
+            group.executionIds().forEach(executionId -> byExecutionId.put(executionId, candidateResult));
+            if (result.accepted()) {
+                markTaskMemoryRefinementPending(taskId);
+            }
+        }
+        return byExecutionId;
+    }
+
+    private List<FailureAnalysisResult> attachTaskMemoryCandidates(
+        List<FailureAnalysisResult> results,
+        Map<String, MemoryCandidateAnalysisResult> taskCandidateResults
+    ) {
+        if (taskCandidateResults.isEmpty()) {
+            return results;
+        }
+        return results.stream()
+            .map(result -> {
+                var taskCandidate = taskCandidateResults.get(result.executionId());
+                if (taskCandidate == null) {
+                    return result;
+                }
+                return withMemoryCandidate(result, taskCandidate);
+            })
+            .toList();
+    }
+
+    private FailureAnalysisResult withMemoryCandidate(
+        FailureAnalysisResult result,
+        MemoryCandidateAnalysisResult memoryCandidate
+    ) {
+        return new FailureAnalysisResult(
+            result.executionId(),
+            result.taskId(),
+            result.caseId(),
+            result.stepId(),
+            result.mode(),
+            result.overallStatus(),
+            result.statusCode(),
+            result.durationMs(),
+            result.environment(),
+            result.request(),
+            result.response(),
+            result.failedAssertions(),
+            result.errorMessage(),
+            result.classification(),
+            result.evidence(),
+            result.observationIds(),
+            result.riskLevel(),
+            result.summary(),
+            result.failureReason(),
+            result.nextSuggestion(),
+            result.retryable(),
+            result.retryReason(),
+            result.taskMemoryIds(),
+            memoryCandidate,
+            result.suiteFailure()
+        );
+    }
+
+    private MemoryCandidateAnalysisResult memoryCandidateResult(MemoryRefineryResult result) {
+        var memoryId = result.memory() == null ? null : result.memory().memoryId();
+        return new MemoryCandidateAnalysisResult(
+            true,
+            result.accepted(),
+            result.created(),
+            result.accepted() && !result.created() && result.duplicateSuppressed(),
+            result.rejectionReason(),
+            memoryId
+        );
+    }
+
+    private float memoryCandidateConfidence(FailureClassification classification, ObservationRiskLevel riskLevel) {
+        if (riskLevel == ObservationRiskLevel.HIGH || riskLevel == ObservationRiskLevel.CRITICAL) {
+            return 0.91f;
+        }
+        return switch (classification) {
+            case AUTH_ISSUE, ENVIRONMENT_ISSUE, VALIDATION_ISSUE, TIMEOUT, TRANSPORT_ERROR -> 0.82f;
+            default -> 0.42f;
+        };
+    }
+
+    private String memoryCandidateSummary(ExecutionRecord record, FailureClassification classification) {
+        return classification + " failure pattern for " + requestPath(record)
+            + " in environment " + record.getEnvironment();
+    }
+
+    private String memoryCandidateContent(
+        ExecutionRecord record,
+        FailureClassification classification,
+        String failureReason,
+        boolean retryable
+    ) {
+        return "Execution " + record.getExecutionId()
+            + " classified as " + classification
+            + " for case " + record.getCaseId()
+            + ". Reason: " + failureReason
+            + ". Retryable: " + retryable + ".";
+    }
+
+    private List<String> memoryCandidateTags(
+        FailureClassification classification,
+        boolean retryable,
+        boolean repeated
+    ) {
+        var tags = new LinkedHashSet<String>();
+        tags.add("phase7");
+        tags.add("failure-analysis");
+        tags.add(classification.name().toLowerCase());
+        switch (classification) {
+            case AUTH_ISSUE -> tags.add("auth");
+            case ENVIRONMENT_ISSUE, BLOCKED_REQUEST, TIMEOUT, TRANSPORT_ERROR -> tags.add("environment");
+            case VALIDATION_ISSUE -> tags.add("validation");
+            case SERVER_ERROR, SUITE_PREREQUISITE_FAILURE -> tags.add("regression-risk");
+            default -> {
+            }
+        }
+        if (retryable) {
+            tags.add("retry");
+        }
+        if (repeated) {
+            tags.add("historical-failure-pattern");
+        }
+        return tags.stream().sorted().toList();
+    }
+
+    private Map<String, Object> memoryCandidateMetadata(
+        ExecutionRecord record,
+        FailureClassification classification,
+        ObservationRiskLevel riskLevel,
+        boolean retryable,
+        List<String> evidence,
+        int occurrenceCount
+    ) {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("executionIds", List.of(record.getExecutionId()));
+        metadata.put("caseIds", List.of(record.getCaseId()));
+        metadata.put("classification", classification.name());
+        metadata.put("riskLevel", riskLevel.name());
+        metadata.put("retryable", retryable);
+        metadata.put("sourceEvidence", evidence.stream().limit(6).toList());
+        metadata.put("occurrenceCount", occurrenceCount);
+        metadata.put("apiPath", requestPath(record));
+        metadata.put("module", requestModule(record));
+        if (record.getStatusCode() != null) {
+            metadata.put("statusCode", record.getStatusCode());
+            metadata.put("errorCode", classification.name() + "_" + record.getStatusCode());
+        } else {
+            metadata.put("errorCode", classification.name());
+        }
+        metadata.put("environment", record.getEnvironment());
+        return metadata;
+    }
+
+    private Map<String, Object> groupedMemoryCandidateMetadata(
+        GroupedFailureSummary group,
+        String taskId,
+        FailureAnalysisResult first
+    ) {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("taskId", taskId);
+        metadata.put("executionIds", group.executionIds());
+        metadata.put("caseIds", group.affectedCaseIds());
+        metadata.put("classification", group.classification().name());
+        metadata.put("riskLevel", group.riskLevel());
+        metadata.put("retryable", group.retryable());
+        metadata.put("sourceEvidence", first.evidence().stream().limit(6).toList());
+        metadata.put("occurrenceCount", group.occurrenceCount());
+        metadata.put("apiPath", group.apiReference());
+        metadata.put("module", group.apiReference());
+        if (group.statusCode() != null) {
+            metadata.put("statusCode", group.statusCode());
+            metadata.put("errorCode", group.classification().name() + "_" + group.statusCode());
+        } else {
+            metadata.put("errorCode", group.classification().name());
+        }
+        return metadata;
+    }
+
+    private String rawEvidence(String summary, List<String> evidence) {
+        return summary + " Evidence: " + evidence;
+    }
+
+    private String requestPath(ExecutionRecord record) {
+        var request = safeMap(record.getRequestSnapshot());
+        var path = stringValue(request.get("path"));
+        if (path != null) {
+            return path;
+        }
+        var url = stringValue(request.get("url"));
+        return url == null ? "unknown-api-path" : url;
+    }
+
+    private String requestModule(ExecutionRecord record) {
+        var path = requestPath(record);
+        var parts = path.split("/");
+        for (var part : parts) {
+            if (!part.isBlank() && !"api".equals(part)) {
+                return part;
+            }
+        }
+        return path;
     }
 
     private void markTaskMemoryRefinementPending(String taskId) {

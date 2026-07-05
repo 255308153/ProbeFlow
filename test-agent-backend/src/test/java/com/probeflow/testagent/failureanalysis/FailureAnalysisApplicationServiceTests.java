@@ -12,6 +12,7 @@ import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.ExecutorType;
 import com.probeflow.testagent.executionrecord.OverallStatus;
 import com.probeflow.testagent.observation.AnalysisLevel;
+import com.probeflow.testagent.memory.LongTermMemoryRepository;
 import com.probeflow.testagent.observation.ObservationRepository;
 import com.probeflow.testagent.observation.ObservationRiskLevel;
 import com.probeflow.testagent.observation.ObservationSource;
@@ -66,6 +67,9 @@ class FailureAnalysisApplicationServiceTests {
 
     @Autowired
     private TaskMemoryService taskMemoryService;
+
+    @Autowired
+    private LongTermMemoryRepository longTermMemories;
 
     @Autowired
     private TaskRepository tasks;
@@ -580,6 +584,131 @@ class FailureAnalysisApplicationServiceTests {
             });
         assertThat(tasks.findById("task-1").orElseThrow().getMemoryRefinementStatus())
             .isEqualTo(MemoryRefinementStatus.PENDING);
+    }
+
+    @Test
+    void severeSingleExecutionProducesAcceptedLongTermMemoryCandidateThroughRefinery() {
+        tasks.save(newTask("task-1"));
+        var record = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("method", "POST", "path", "/api/orders/pay"),
+            Map.of("statusCode", 503),
+            List.of()
+        ));
+        record.setStatusCode(503);
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
+
+        assertThat(result.memoryCandidate().attempted()).isTrue();
+        assertThat(result.memoryCandidate().accepted()).isTrue();
+        assertThat(result.memoryCandidate().created()).isTrue();
+        assertThat(result.memoryCandidate().merged()).isFalse();
+        assertThat(result.memoryCandidate().rejectionReason()).isNull();
+        assertThat(result.memoryCandidate().memoryId()).isNotBlank();
+
+        var memory = longTermMemories.findById(result.memoryCandidate().memoryId()).orElseThrow();
+        assertThat(memory.getSourceRef()).isEqualTo(record.getExecutionId());
+        assertThat(memory.getSummary()).contains("SERVER_ERROR");
+        assertThat(memory.getTags()).contains("failure-analysis", "regression-risk", "server_error");
+        assertThat(memory.getMetadata())
+            .containsEntry("classification", "SERVER_ERROR")
+            .containsEntry("riskLevel", "HIGH")
+            .containsEntry("retryable", true)
+            .containsEntry("statusCode", 503)
+            .containsEntry("errorCode", "SERVER_ERROR_503");
+        assertThat((List<String>) memory.getMetadata().get("executionIds")).containsExactly(record.getExecutionId());
+        assertThat((List<String>) memory.getMetadata().get("caseIds")).containsExactly("case-1");
+        assertThat(memory.getMetadata()).containsKey("sourceEvidence");
+        assertThat(tasks.findById("task-1").orElseThrow().getMemoryRefinementStatus())
+            .isEqualTo(MemoryRefinementStatus.PENDING);
+    }
+
+    @Test
+    void lowValueOneOffAndNoisyPassedExecutionsDoNotBecomeReusableLongTermMemory() {
+        var deterministicMismatch = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("method", "POST", "path", "/api/orders"),
+            Map.of("statusCode", 409),
+            List.of(Map.of("type", "STATUS_CODE", "expected", 201, "actual", 409, "status", "FAILED"))
+        ));
+        deterministicMismatch.setCriticalFailed(false);
+        deterministicMismatch.setStatusCode(409);
+        var passed = executionRecords.save(newExecutionRecord(
+            OverallStatus.PASSED,
+            Map.of("method", "GET", "path", "/api/orders"),
+            Map.of("statusCode", 200),
+            List.of()
+        ));
+        passed.setStatusCode(200);
+        entityManager.flush();
+        entityManager.clear();
+
+        var rejected = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(deterministicMismatch.getExecutionId()));
+        var skipped = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(passed.getExecutionId()));
+
+        assertThat(rejected.memoryCandidate().attempted()).isTrue();
+        assertThat(rejected.memoryCandidate().accepted()).isFalse();
+        assertThat(rejected.memoryCandidate().created()).isFalse();
+        assertThat(rejected.memoryCandidate().rejectionReason()).isEqualTo("low-confidence");
+        assertThat(rejected.memoryCandidate().memoryId()).isNull();
+        assertThat(skipped.memoryCandidate().attempted()).isFalse();
+        assertThat(longTermMemories.findAll()).isEmpty();
+    }
+
+    @Test
+    void repeatedTaskFailuresProduceMergedLongTermMemoryCandidateThroughExistingRefinery() {
+        tasks.save(newTask("task-1"));
+        var first = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("method", "POST", "path", "/api/orders"),
+            Map.of("statusCode", 409),
+            List.of(Map.of("type", "STATUS_CODE", "expected", 201, "actual", 409, "status", "FAILED"))
+        ));
+        first.setStatusCode(409);
+        first.setCriticalFailed(false);
+        var second = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("method", "POST", "path", "/api/orders"),
+            Map.of("statusCode", 409),
+            List.of(Map.of("type", "STATUS_CODE", "expected", 201, "actual", 409, "status", "FAILED"))
+        ));
+        second.setStatusCode(409);
+        second.setCriticalFailed(false);
+        entityManager.flush();
+        entityManager.clear();
+
+        var firstTaskAnalysis = failureAnalysis.analyzeTask(TaskFailureAnalysisRequest.basic("task-1"));
+        var secondTaskAnalysis = failureAnalysis.analyzeTask(TaskFailureAnalysisRequest.basic("task-1"));
+
+        assertThat(firstTaskAnalysis.groupedFailures()).filteredOn(group -> group.classification() == FailureClassification.STATUS_MISMATCH)
+            .singleElement()
+            .satisfies(group -> assertThat(group.occurrenceCount()).isEqualTo(2));
+        assertThat(firstTaskAnalysis.executionResults()).extracting(FailureAnalysisResult::memoryCandidate)
+            .allSatisfy(candidate -> {
+                assertThat(candidate.attempted()).isTrue();
+                assertThat(candidate.accepted()).isTrue();
+                assertThat(candidate.created()).isTrue();
+                assertThat(candidate.memoryId()).isNotBlank();
+            });
+        assertThat(secondTaskAnalysis.executionResults()).extracting(FailureAnalysisResult::memoryCandidate)
+            .allSatisfy(candidate -> {
+                assertThat(candidate.attempted()).isTrue();
+                assertThat(candidate.accepted()).isTrue();
+                assertThat(candidate.created()).isFalse();
+                assertThat(candidate.merged()).isTrue();
+                assertThat(candidate.memoryId()).isEqualTo(firstTaskAnalysis.executionResults().getFirst().memoryCandidate().memoryId());
+            });
+
+        var memory = longTermMemories.findById(secondTaskAnalysis.executionResults().getFirst().memoryCandidate().memoryId()).orElseThrow();
+        assertThat(memory.getTags()).contains("historical-failure-pattern", "status_mismatch");
+        assertThat(memory.getMetadata())
+            .containsEntry("classification", "STATUS_MISMATCH")
+            .containsEntry("occurrenceCount", 2)
+            .containsEntry("mergeCount", 2);
+        assertThat((List<String>) memory.getMetadata().get("executionIds"))
+            .contains(first.getExecutionId(), second.getExecutionId());
     }
 
     private ExecutionRecord newExecutionRecord(OverallStatus status) {
