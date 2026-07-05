@@ -26,6 +26,7 @@ public record FailureAnalysisResult(
     String nextSuggestion,
     boolean retryable,
     String retryReason,
+    List<String> taskMemoryIds,
     SuiteFailureSummary suiteFailure
 ) {
 }

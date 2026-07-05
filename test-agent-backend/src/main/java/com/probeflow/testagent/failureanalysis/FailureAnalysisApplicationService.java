@@ -4,12 +4,18 @@ import com.probeflow.testagent.apispec.ApiSpecRepository;
 import com.probeflow.testagent.executionrecord.ExecutionRecord;
 import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.OverallStatus;
+import com.probeflow.testagent.memory.MemoryScopeType;
+import com.probeflow.testagent.memory.MemorySourceType;
+import com.probeflow.testagent.memory.TaskMemoryService;
+import com.probeflow.testagent.memory.TaskMemoryWriteRequest;
 import com.probeflow.testagent.observation.AnalysisLevel;
 import com.probeflow.testagent.observation.Observation;
 import com.probeflow.testagent.observation.ObservationRepository;
 import com.probeflow.testagent.observation.ObservationRiskLevel;
 import com.probeflow.testagent.observation.ObservationSource;
 import com.probeflow.testagent.observation.ObservationType;
+import com.probeflow.testagent.task.MemoryRefinementStatus;
+import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.testcase.TestCaseRepository;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -30,17 +36,23 @@ public class FailureAnalysisApplicationService {
     private final ObservationRepository observations;
     private final TestCaseRepository testCases;
     private final ApiSpecRepository apiSpecs;
+    private final TaskMemoryService taskMemoryService;
+    private final TaskRepository tasks;
 
     public FailureAnalysisApplicationService(
         ExecutionRecordRepository executionRecords,
         ObservationRepository observations,
         TestCaseRepository testCases,
-        ApiSpecRepository apiSpecs
+        ApiSpecRepository apiSpecs,
+        TaskMemoryService taskMemoryService,
+        TaskRepository tasks
     ) {
         this.executionRecords = executionRecords;
         this.observations = observations;
         this.testCases = testCases;
         this.apiSpecs = apiSpecs;
+        this.taskMemoryService = taskMemoryService;
+        this.tasks = tasks;
     }
 
     @Transactional
@@ -66,6 +78,17 @@ public class FailureAnalysisApplicationService {
             failureReason,
             nextSuggestion
         );
+        var evidence = evidence(record, failedAssertions, classification);
+        var taskMemoryIds = writeTaskMemoryIfUseful(
+            record,
+            classification,
+            riskLevel,
+            summary,
+            failureReason,
+            nextSuggestion,
+            retryable,
+            evidence
+        );
         return new FailureAnalysisResult(
             record.getExecutionId(),
             record.getTaskId(),
@@ -81,7 +104,7 @@ public class FailureAnalysisApplicationService {
             failedAssertions,
             record.getErrorMessage(),
             classification,
-            evidence(record, failedAssertions, classification),
+            evidence,
             observationIds,
             riskLevel.name(),
             summary,
@@ -89,6 +112,7 @@ public class FailureAnalysisApplicationService {
             nextSuggestion,
             retryable,
             retryReason,
+            taskMemoryIds,
             suiteFailure
         );
     }
@@ -357,6 +381,105 @@ public class FailureAnalysisApplicationService {
         observation.setSource(ObservationSource.SYSTEM);
         var saved = observations.save(observation);
         return List.of(saved.getObservationId());
+    }
+
+    private List<String> writeTaskMemoryIfUseful(
+        ExecutionRecord record,
+        FailureClassification classification,
+        ObservationRiskLevel riskLevel,
+        String summary,
+        String failureReason,
+        String nextSuggestion,
+        boolean retryable,
+        List<String> evidence
+    ) {
+        if (!shouldWriteTaskMemory(record)) {
+            return List.of();
+        }
+
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("classification", classification.name());
+        metadata.put("riskLevel", riskLevel.name());
+        metadata.put("retryable", retryable);
+        metadata.put("nextAction", nextSuggestion);
+        metadata.put("executionId", record.getExecutionId());
+        metadata.put("caseId", record.getCaseId());
+        metadata.put("environment", record.getEnvironment());
+        metadata.put("overallStatus", record.getOverallStatus().name());
+        if (record.getStatusCode() != null) {
+            metadata.put("statusCode", record.getStatusCode());
+        }
+        var apiReference = apiReference(record);
+        if (apiReference != null) {
+            metadata.put("apiSpecId", apiReference);
+        }
+        metadata.put("evidence", evidence.stream().limit(5).toList());
+
+        var content = "Failure analysis: " + failureReason
+            + " Next action: " + nextSuggestion
+            + " Retryable: " + retryable + ".";
+        var write = taskMemoryService.writeTaskMemory(new TaskMemoryWriteRequest(
+            record.getTaskId(),
+            memoryScopeType(classification),
+            memorySummary(record, classification),
+            content,
+            memoryTags(classification, retryable),
+            MemorySourceType.EXECUTION_RESULT,
+            record.getExecutionId(),
+            memoryConfidence(classification, riskLevel),
+            "execution",
+            metadata,
+            null
+        ));
+        markTaskMemoryRefinementPending(record.getTaskId());
+        return List.of(write.memoryId());
+    }
+
+    private boolean shouldWriteTaskMemory(ExecutionRecord record) {
+        return record.getOverallStatus() == OverallStatus.FAILED
+            || record.getOverallStatus() == OverallStatus.ERROR
+            || record.getOverallStatus() == OverallStatus.BLOCKED
+            || record.getOverallStatus() == OverallStatus.PASSED_WITH_WARNINGS;
+    }
+
+    private MemoryScopeType memoryScopeType(FailureClassification classification) {
+        return switch (classification) {
+            case AUTH_ISSUE, ENVIRONMENT_ISSUE, VALIDATION_ISSUE, DATA_QUALITY_ISSUE -> MemoryScopeType.TESTING_PATTERN;
+            default -> MemoryScopeType.FAILURE_PATTERN;
+        };
+    }
+
+    private String memorySummary(ExecutionRecord record, FailureClassification classification) {
+        return classification + " in execution " + record.getExecutionId()
+            + " for case " + record.getCaseId();
+    }
+
+    private List<String> memoryTags(FailureClassification classification, boolean retryable) {
+        var tags = new ArrayList<String>();
+        tags.add("phase7");
+        tags.add("failure-analysis");
+        tags.add(classification.name().toLowerCase());
+        if (retryable) {
+            tags.add("retryable");
+        }
+        return List.copyOf(tags);
+    }
+
+    private Float memoryConfidence(FailureClassification classification, ObservationRiskLevel riskLevel) {
+        if (classification == FailureClassification.UNKNOWN) {
+            return 0.60f;
+        }
+        if (riskLevel == ObservationRiskLevel.HIGH || riskLevel == ObservationRiskLevel.CRITICAL) {
+            return 0.88f;
+        }
+        return 0.78f;
+    }
+
+    private void markTaskMemoryRefinementPending(String taskId) {
+        tasks.findById(taskId).ifPresent(task -> {
+            task.setMemoryRefinementStatus(MemoryRefinementStatus.PENDING);
+            tasks.save(task);
+        });
     }
 
     private TaskFailureAnalysisCounts counts(List<FailureAnalysisResult> results) {

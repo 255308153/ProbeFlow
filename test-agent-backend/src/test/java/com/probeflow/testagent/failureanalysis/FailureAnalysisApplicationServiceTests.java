@@ -16,6 +16,15 @@ import com.probeflow.testagent.observation.ObservationRepository;
 import com.probeflow.testagent.observation.ObservationRiskLevel;
 import com.probeflow.testagent.observation.ObservationSource;
 import com.probeflow.testagent.observation.ObservationType;
+import com.probeflow.testagent.memory.MemoryScopeType;
+import com.probeflow.testagent.memory.TaskMemoryService;
+import com.probeflow.testagent.task.MemoryRefinementStatus;
+import com.probeflow.testagent.task.Task;
+import com.probeflow.testagent.task.TaskPriority;
+import com.probeflow.testagent.task.TaskRepository;
+import com.probeflow.testagent.task.TaskSourceType;
+import com.probeflow.testagent.task.TaskStatus;
+import com.probeflow.testagent.task.TaskType;
 import com.probeflow.testagent.testcase.CaseCategory;
 import com.probeflow.testagent.testcase.CasePriority;
 import com.probeflow.testagent.testcase.CaseRiskLevel;
@@ -25,6 +34,7 @@ import com.probeflow.testagent.testcase.DetailType;
 import com.probeflow.testagent.testcase.TestCase;
 import com.probeflow.testagent.testcase.TestCaseMode;
 import com.probeflow.testagent.testcase.TestCaseRepository;
+import com.probeflow.testagent.testcasedraft.PromotionMode;
 import jakarta.persistence.EntityManager;
 import java.util.List;
 import java.util.Map;
@@ -53,6 +63,12 @@ class FailureAnalysisApplicationServiceTests {
 
     @Autowired
     private TestCaseRepository testCases;
+
+    @Autowired
+    private TaskMemoryService taskMemoryService;
+
+    @Autowired
+    private TaskRepository tasks;
 
     @Autowired
     private EntityManager entityManager;
@@ -516,6 +532,56 @@ class FailureAnalysisApplicationServiceTests {
             .satisfies(group -> assertThat(group.executionIds()).containsExactly(duplicateOne.getExecutionId()));
     }
 
+    @Test
+    void analysisWritesCompactTaskMemoryOnceForMeaningfulExecutionsAndSkipsNoisyPassedRuns() {
+        tasks.save(newTask("task-1"));
+        var record = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("method", "POST", "path", "/api/orders", "apiSpecId", "api-memory"),
+            Map.of("statusCode", 409),
+            List.of(Map.of("type", "STATUS_CODE", "expected", 201, "actual", 409, "status", "FAILED"))
+        ));
+        record.setStatusCode(409);
+        var passed = executionRecords.save(newExecutionRecord(
+            OverallStatus.PASSED,
+            Map.of("method", "GET", "path", "/api/orders", "apiSpecId", "api-memory"),
+            Map.of("statusCode", 200),
+            List.of()
+        ));
+        passed.setStatusCode(200);
+        entityManager.flush();
+        entityManager.clear();
+
+        var first = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
+        var second = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
+        var passedResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(passed.getExecutionId()));
+        var memories = taskMemoryService.readActiveTaskMemories("task-1", "execution");
+
+        assertThat(first.taskMemoryIds()).hasSize(1);
+        assertThat(second.taskMemoryIds()).isEqualTo(first.taskMemoryIds());
+        assertThat(passedResult.taskMemoryIds()).isEmpty();
+        assertThat(memories).singleElement()
+            .satisfies(memory -> {
+                assertThat(memory.memoryId()).isEqualTo(first.taskMemoryIds().getFirst());
+                assertThat(memory.scopeType()).isEqualTo(MemoryScopeType.FAILURE_PATTERN);
+                assertThat(memory.sourceRef()).isEqualTo(record.getExecutionId());
+                assertThat(memory.summary()).contains("STATUS_MISMATCH", record.getExecutionId(), "case-1");
+                assertThat(memory.content()).contains("STATUS_CODE expected 201 but got 409", "Retryable: false");
+                assertThat(memory.tags()).contains("phase7", "failure-analysis", "status_mismatch");
+                assertThat(memory.metadata())
+                    .containsEntry("classification", "STATUS_MISMATCH")
+                    .containsEntry("riskLevel", "HIGH")
+                    .containsEntry("retryable", false)
+                    .containsEntry("executionId", record.getExecutionId())
+                    .containsEntry("caseId", "case-1")
+                    .containsEntry("environment", "test")
+                    .containsEntry("statusCode", 409)
+                    .containsEntry("apiSpecId", "api-memory");
+            });
+        assertThat(tasks.findById("task-1").orElseThrow().getMemoryRefinementStatus())
+            .isEqualTo(MemoryRefinementStatus.PENDING);
+    }
+
     private ExecutionRecord newExecutionRecord(OverallStatus status) {
         return newExecutionRecord(
             status,
@@ -592,6 +658,23 @@ class FailureAnalysisApplicationServiceTests {
         testCase.setBasedOnApiSpecVersions(Map.of(apiSpecId, 1));
         testCase.setGeneratedFromSingleCaseIds(List.of());
         return testCase;
+    }
+
+    private Task newTask(String taskId) {
+        var task = new Task();
+        task.setTaskId(taskId);
+        task.setTaskType(TaskType.API_TEST);
+        task.setTaskName("Phase 7 task");
+        task.setStatus(TaskStatus.ANALYZING_RESULTS);
+        task.setSourceType(TaskSourceType.MANUAL);
+        task.setSourceRef("manual");
+        task.setTargetApiSpecIds(List.of());
+        task.setPromotionMode(PromotionMode.MANUAL);
+        task.setMemoryRefinementStatus(MemoryRefinementStatus.NOT_REQUIRED);
+        task.setPriority(TaskPriority.MEDIUM);
+        task.setCreator("phase7-test");
+        task.setMetadata(Map.of());
+        return task;
     }
 
     private void assertClassification(
