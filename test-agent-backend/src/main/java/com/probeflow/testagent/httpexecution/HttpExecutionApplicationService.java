@@ -30,6 +30,7 @@ public class HttpExecutionApplicationService {
     private final ExecutionRecordRepository executionRecords;
     private final TaskCaseExecutionRepository taskCaseExecutions;
     private final HttpClientGateway httpClientGateway;
+    private final ExecutableRequestBuilder executableRequestBuilder;
 
     public HttpExecutionApplicationService(
         TaskRepository tasks,
@@ -37,7 +38,8 @@ public class HttpExecutionApplicationService {
         ApiSpecRepository apiSpecs,
         ExecutionRecordRepository executionRecords,
         TaskCaseExecutionRepository taskCaseExecutions,
-        HttpClientGateway httpClientGateway
+        HttpClientGateway httpClientGateway,
+        ExecutableRequestBuilder executableRequestBuilder
     ) {
         this.tasks = tasks;
         this.testCases = testCases;
@@ -45,6 +47,7 @@ public class HttpExecutionApplicationService {
         this.executionRecords = executionRecords;
         this.taskCaseExecutions = taskCaseExecutions;
         this.httpClientGateway = httpClientGateway;
+        this.executableRequestBuilder = executableRequestBuilder;
     }
 
     @Transactional
@@ -52,9 +55,6 @@ public class HttpExecutionApplicationService {
         validateRequest(request);
         var task = tasks.findById(request.taskId())
             .orElseThrow(() -> new IllegalArgumentException("Task not found: " + request.taskId()));
-        if (request.dryRun()) {
-            throw new UnsupportedOperationException("Dry-run request preparation is implemented in Phase 6 issue 02");
-        }
         if (request.executionMode() != ExecutionMode.SINGLE || request.selectedCaseIds().size() != 1) {
             throw new IllegalArgumentException("Issue 01 supports exactly one selected case in SINGLE mode");
         }
@@ -72,12 +72,34 @@ public class HttpExecutionApplicationService {
             throw new IllegalArgumentException("TestCase " + caseId + " is not selected by Task " + task.getTaskId());
         }
 
-        var httpRequest = buildBasicRequest(testCase, apiSpec);
+        var preparedRequest = executableRequestBuilder.build(testCase, apiSpec, request);
+        if (preparedRequest.blocked()) {
+            return resultWithoutTransport(
+                task.getTaskId(),
+                request,
+                testCase.getCaseId(),
+                HttpExecutionOutcomeStatus.BLOCKED,
+                preparedRequest.message(),
+                preparedRequest.requestSnapshot()
+            );
+        }
+        if (request.dryRun()) {
+            return resultWithoutTransport(
+                task.getTaskId(),
+                request,
+                testCase.getCaseId(),
+                HttpExecutionOutcomeStatus.SKIPPED,
+                "Dry run prepared request; transport not called",
+                preparedRequest.requestSnapshot()
+            );
+        }
+
+        var httpRequest = preparedRequest.clientRequest();
         var startedAt = System.nanoTime();
         var httpResponse = httpClientGateway.execute(httpRequest, request.options());
         var durationMs = normalizedDuration(httpResponse.durationMs(), startedAt);
         var outcomeStatus = statusFor(httpResponse.statusCode());
-        var record = persistExecutionRecord(request, testCase, httpRequest, httpResponse, durationMs, outcomeStatus);
+        var record = persistExecutionRecord(request, testCase, preparedRequest.requestSnapshot(), httpResponse, durationMs, outcomeStatus);
         updateTaskCaseExecution(request, testCase, record, outcomeStatus);
 
         var caseResult = new HttpExecutionCaseResult(
@@ -86,7 +108,8 @@ public class HttpExecutionApplicationService {
             outcomeStatus,
             durationMs,
             httpResponse.statusCode(),
-            null
+            null,
+            preparedRequest.requestSnapshot()
         );
         var caseResults = List.of(caseResult);
         return new HttpExecutionResult(
@@ -113,39 +136,10 @@ public class HttpExecutionApplicationService {
         }
     }
 
-    private HttpClientRequest buildBasicRequest(TestCase testCase, ApiSpec apiSpec) {
-        var requestShape = requestShape(testCase);
-        var method = stringValue(requestShape.get("method"));
-        if (!StringUtils.hasText(method)) {
-            method = apiSpec.getHttpMethod().name();
-        }
-        var path = stringValue(requestShape.get("path"));
-        if (!StringUtils.hasText(path)) {
-            path = apiSpec.getPath();
-        }
-        return new HttpClientRequest(
-            method,
-            path,
-            objectMap(requestShape.get("headers")),
-            requestShape.get("body")
-        );
-    }
-
-    private Map<String, Object> requestShape(TestCase testCase) {
-        var detailShape = objectMap(testCase.getDetail().get("requestShape"));
-        if (!detailShape.isEmpty()) {
-            return detailShape;
-        }
-        if (!testCase.getSteps().isEmpty()) {
-            return objectMap(testCase.getSteps().getFirst().get("requestShape"));
-        }
-        return Map.of();
-    }
-
     private ExecutionRecord persistExecutionRecord(
         HttpExecutionRequest request,
         TestCase testCase,
-        HttpClientRequest httpRequest,
+        Map<String, Object> requestSnapshot,
         HttpClientResponse httpResponse,
         long durationMs,
         HttpExecutionOutcomeStatus outcomeStatus
@@ -155,7 +149,7 @@ public class HttpExecutionApplicationService {
         record.setCaseId(testCase.getCaseId());
         record.setExecutorType(ExecutorType.HTTP);
         record.setEnvironment(request.environment());
-        record.setRequestSnapshot(requestSnapshot(testCase, httpRequest));
+        record.setRequestSnapshot(requestSnapshot);
         record.setResponseSnapshot(responseSnapshot(httpResponse, durationMs));
         record.setAssertionResults(List.of());
         record.setOverallStatus(outcomeStatus == HttpExecutionOutcomeStatus.PASSED ? OverallStatus.PASSED : OverallStatus.FAILED);
@@ -190,17 +184,23 @@ public class HttpExecutionApplicationService {
         taskCaseExecutions.save(taskCaseExecution);
     }
 
-    private Map<String, Object> requestSnapshot(TestCase testCase, HttpClientRequest request) {
-        var snapshot = new LinkedHashMap<String, Object>();
-        snapshot.put("caseId", testCase.getCaseId());
-        snapshot.put("apiSpecId", testCase.getPrimaryApiSpecId());
-        snapshot.put("method", request.method());
-        snapshot.put("path", request.path());
-        snapshot.put("headers", request.headers());
-        if (request.body() != null) {
-            snapshot.put("body", request.body());
-        }
-        return snapshot;
+    private HttpExecutionResult resultWithoutTransport(
+        String taskId,
+        HttpExecutionRequest request,
+        String caseId,
+        HttpExecutionOutcomeStatus status,
+        String message,
+        Map<String, Object> requestSnapshot
+    ) {
+        var caseResult = new HttpExecutionCaseResult(caseId, null, status, 0L, null, message, requestSnapshot);
+        var caseResults = List.of(caseResult);
+        return new HttpExecutionResult(
+            taskId,
+            request.environment(),
+            request.executionMode(),
+            caseResults,
+            HttpExecutionCounts.from(caseResults)
+        );
     }
 
     private Map<String, Object> responseSnapshot(HttpClientResponse response, long durationMs) {
@@ -225,22 +225,5 @@ public class HttpExecutionApplicationService {
             return reportedDurationMs;
         }
         return Math.max(0L, (System.nanoTime() - startedAt) / 1_000_000);
-    }
-
-    private String stringValue(Object value) {
-        return value == null ? null : value.toString();
-    }
-
-    private Map<String, Object> objectMap(Object value) {
-        if (!(value instanceof Map<?, ?> incoming)) {
-            return Map.of();
-        }
-        var copied = new LinkedHashMap<String, Object>();
-        incoming.forEach((key, mapValue) -> {
-            if (key != null) {
-                copied.put(key.toString(), mapValue);
-            }
-        });
-        return copied;
     }
 }

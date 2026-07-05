@@ -156,6 +156,177 @@ class HttpExecutionApplicationServiceTests {
             .hasMessageContaining("Task not found: missing-task");
     }
 
+    @Test
+    void dryRunResolvesEnvironmentAndAuthPlaceholdersRedactsSecretsAndSkipsTransport() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), Map.of(
+            "method", "POST",
+            "path", "/api/orders/{{orderId}}",
+            "headers", Map.of(
+                "Authorization", "Bearer {{authToken}}",
+                "X-Tenant", "{{tenantId}}"
+            ),
+            "body", Map.of(
+                "skuId", "{{skuId}}",
+                "password", "{{apiPassword}}"
+            )
+        )));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "staging",
+            true,
+            HttpExecutionOptions.defaults(),
+            Map.of(
+                "baseUrl", "https://api.staging.example",
+                "orderId", "order-123",
+                "tenantId", "tenant-a",
+                "skuId", "A-100",
+                "apiPassword", "secret-password"
+            ),
+            Map.of("authToken", "token-abc")
+        ));
+
+        assertThat(result.caseResults()).singleElement()
+            .satisfies(caseResult -> {
+                assertThat(caseResult.status()).isEqualTo(HttpExecutionOutcomeStatus.SKIPPED);
+                assertThat(caseResult.executionRecordId()).isNull();
+                assertThat(caseResult.message()).contains("Dry run prepared request");
+                assertThat(caseResult.requestSnapshot()).containsEntry("url", "https://api.staging.example/api/orders/order-123");
+                assertThat(caseResult.requestSnapshot()).containsEntry("path", "/api/orders/order-123");
+
+                @SuppressWarnings("unchecked")
+                var headers = (Map<String, Object>) caseResult.requestSnapshot().get("headers");
+                assertThat(headers).containsEntry("Authorization", "[REDACTED]");
+                assertThat(headers).containsEntry("X-Tenant", "tenant-a");
+
+                @SuppressWarnings("unchecked")
+                var body = (Map<String, Object>) caseResult.requestSnapshot().get("body");
+                assertThat(body).containsEntry("skuId", "A-100");
+                assertThat(body).containsEntry("password", "[REDACTED]");
+            });
+        assertThat(result.counts()).isEqualTo(new HttpExecutionCounts(1, 0, 0, 0, 1, 0));
+        assertThat(fakeHttpClient.requests()).isEmpty();
+        assertThat(executionRecords.findAll()).isEmpty();
+    }
+
+    @Test
+    void executionUsesApiSpecFallbackRouteAndAuthMetadataWhenRequestShapeOmitsThem() {
+        var apiSpec = newApiSpec();
+        apiSpec.setHttpMethod(HttpMethod.GET);
+        apiSpec.setPath("/api/orders/status");
+        apiSpec.setAuth(Map.of(
+            "type", "bearer",
+            "header", "Authorization",
+            "tokenVariable", "apiToken"
+        ));
+        apiSpec = apiSpecs.save(apiSpec);
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), Map.of(
+            "body", Map.of("ping", true)
+        )));
+        fakeHttpClient.respondWith(new HttpClientResponse(
+            200,
+            Map.of("Content-Type", "application/json"),
+            Map.of("healthy", true),
+            12L
+        ));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "dev",
+            false,
+            HttpExecutionOptions.defaults(),
+            Map.of("baseUrl", "https://api.dev.example"),
+            Map.of("apiToken", "token-xyz")
+        ));
+
+        assertThat(result.caseResults()).singleElement()
+            .satisfies(caseResult -> {
+                assertThat(caseResult.status()).isEqualTo(HttpExecutionOutcomeStatus.PASSED);
+                assertThat(caseResult.requestSnapshot()).containsEntry("method", "GET");
+                assertThat(caseResult.requestSnapshot()).containsEntry("url", "https://api.dev.example/api/orders/status");
+            });
+        assertThat(fakeHttpClient.requests()).singleElement()
+            .satisfies(request -> {
+                assertThat(request.method()).isEqualTo("GET");
+                assertThat(request.path()).isEqualTo("/api/orders/status");
+                assertThat(request.url()).isEqualTo("https://api.dev.example/api/orders/status");
+                assertThat(request.headers()).containsEntry("Authorization", "Bearer token-xyz");
+            });
+
+        var recordId = result.caseResults().getFirst().executionRecordId();
+        var record = executionRecords.findById(recordId).orElseThrow();
+        @SuppressWarnings("unchecked")
+        var persistedHeaders = (Map<String, Object>) record.getRequestSnapshot().get("headers");
+        assertThat(persistedHeaders).containsEntry("Authorization", "[REDACTED]");
+    }
+
+    @Test
+    void unresolvedEnvironmentVariableBlocksBeforeTransport() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), Map.of(
+            "method", "GET",
+            "path", "/api/orders/{{orderId}}"
+        )));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "dev",
+            false,
+            HttpExecutionOptions.defaults(),
+            Map.of("baseUrl", "https://api.dev.example"),
+            Map.of()
+        ));
+
+        assertThat(result.caseResults()).singleElement()
+            .satisfies(caseResult -> {
+                assertThat(caseResult.status()).isEqualTo(HttpExecutionOutcomeStatus.BLOCKED);
+                assertThat(caseResult.executionRecordId()).isNull();
+                assertThat(caseResult.message()).contains("Unresolved variable: orderId");
+            });
+        assertThat(result.counts()).isEqualTo(new HttpExecutionCounts(1, 0, 0, 0, 0, 1));
+        assertThat(fakeHttpClient.requests()).isEmpty();
+        assertThat(executionRecords.findAll()).isEmpty();
+    }
+
+    @Test
+    void unsupportedProtocolBlocksBeforeTransport() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), Map.of(
+            "method", "GET",
+            "path", "/api/orders"
+        )));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "dev",
+            false,
+            HttpExecutionOptions.defaults(),
+            Map.of("baseUrl", "ftp://api.dev.example"),
+            Map.of()
+        ));
+
+        assertThat(result.caseResults()).singleElement()
+            .satisfies(caseResult -> {
+                assertThat(caseResult.status()).isEqualTo(HttpExecutionOutcomeStatus.BLOCKED);
+                assertThat(caseResult.message()).contains("Unsupported protocol: ftp");
+            });
+        assertThat(result.counts()).isEqualTo(new HttpExecutionCounts(1, 0, 0, 0, 0, 1));
+        assertThat(fakeHttpClient.requests()).isEmpty();
+    }
+
     private ApiSpec newApiSpec() {
         var apiSpec = new ApiSpec();
         apiSpec.setSystemName("order-platform");
@@ -201,6 +372,15 @@ class HttpExecutionApplicationServiceTests {
     }
 
     private TestCase newSingleTestCase(String apiSpecId) {
+        return newSingleTestCase(apiSpecId, Map.of(
+            "method", "POST",
+            "path", "/api/orders",
+            "headers", Map.of("Content-Type", "application/json"),
+            "body", Map.of("skuId", "A-100", "quantity", 2)
+        ));
+    }
+
+    private TestCase newSingleTestCase(String apiSpecId, Map<String, Object> requestShape) {
         var testCase = new TestCase();
         testCase.setPrimaryApiSpecId(apiSpecId);
         testCase.setCaseCategory(CaseCategory.API);
@@ -221,23 +401,13 @@ class HttpExecutionApplicationServiceTests {
         testCase.setDetailType(DetailType.API);
         testCase.setDetail(Map.of(
             "expectedStatus", 201,
-            "requestShape", Map.of(
-                "method", "POST",
-                "path", "/api/orders",
-                "headers", Map.of("Content-Type", "application/json"),
-                "body", Map.of("skuId", "A-100", "quantity", 2)
-            )
+            "requestShape", requestShape
         ));
         testCase.setSteps(List.of(Map.of(
             "order", 1,
             "apiSpecId", apiSpecId,
             "expectedStatus", 201,
-            "requestShape", Map.of(
-                "method", "POST",
-                "path", "/api/orders",
-                "headers", Map.of("Content-Type", "application/json"),
-                "body", Map.of("skuId", "A-100", "quantity", 2)
-            )
+            "requestShape", requestShape
         )));
         testCase.setBasedOnApiSpecVersions(Map.of(apiSpecId, 3));
         return testCase;

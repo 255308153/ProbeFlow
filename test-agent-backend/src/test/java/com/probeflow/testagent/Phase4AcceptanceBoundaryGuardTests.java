@@ -305,6 +305,7 @@ class Phase4AcceptanceBoundaryGuardTests {
         assertThat(entryPoints).containsExactly(
             "ApiAnalysisApplicationService",
             "EmbeddingService",
+            "ExecutableRequestBuilder",
             "FakeEmbeddingService",
             "HttpExecutionApplicationService",
             "KnowledgeChunkingService",
