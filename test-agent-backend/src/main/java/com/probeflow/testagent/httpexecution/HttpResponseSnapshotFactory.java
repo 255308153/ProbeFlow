@@ -35,11 +35,26 @@ public class HttpResponseSnapshotFactory {
         return snapshot;
     }
 
+    public Map<String, Object> skipped(String reason) {
+        var snapshot = new LinkedHashMap<String, Object>();
+        snapshot.put("skipReason", reason);
+        snapshot.put("durationMs", 0L);
+        return snapshot;
+    }
+
     public Map<String, Object> blocked(String message) {
         var snapshot = new LinkedHashMap<String, Object>();
         snapshot.put("errorType", blockedErrorType(message));
         snapshot.put("errorMessage", message);
         snapshot.put("durationMs", 0L);
+        return snapshot;
+    }
+
+    public Map<String, Object> error(String errorType, String message, long durationMs) {
+        var snapshot = new LinkedHashMap<String, Object>();
+        snapshot.put("errorType", errorType);
+        snapshot.put("errorMessage", message);
+        snapshot.put("durationMs", Math.max(0L, durationMs));
         return snapshot;
     }
 

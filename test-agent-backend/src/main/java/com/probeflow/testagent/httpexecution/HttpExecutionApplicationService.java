@@ -6,6 +6,7 @@ import com.probeflow.testagent.executionrecord.ExecutionRecord;
 import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.ExecutorType;
 import com.probeflow.testagent.executionrecord.OverallStatus;
+import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.taskcaseexecution.ExecutionMode;
 import com.probeflow.testagent.taskcaseexecution.TaskCaseExecution;
@@ -14,6 +15,7 @@ import com.probeflow.testagent.taskcaseexecution.TaskCaseExecutionStatus;
 import com.probeflow.testagent.testcase.TestCase;
 import com.probeflow.testagent.testcase.TestCaseMode;
 import com.probeflow.testagent.testcase.TestCaseRepository;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -61,49 +63,78 @@ public class HttpExecutionApplicationService {
         validateRequest(request);
         var task = tasks.findById(request.taskId())
             .orElseThrow(() -> new IllegalArgumentException("Task not found: " + request.taskId()));
+        if (request.executionMode() == ExecutionMode.BATCH) {
+            return executeBatch(task, request);
+        }
         if (request.executionMode() != ExecutionMode.SINGLE || request.selectedCaseIds().size() != 1) {
             throw new IllegalArgumentException("Issue 01 supports exactly one selected case in SINGLE mode");
         }
 
-        var caseId = request.selectedCaseIds().getFirst();
-        var testCase = testCases.findById(caseId)
-            .orElseThrow(() -> new IllegalArgumentException("TestCase not found: " + caseId));
+        var caseResult = executeSelectedCase(task, request, request.selectedCaseIds().getFirst(), true);
+        return executionResult(task.getTaskId(), request, List.of(caseResult));
+    }
+
+    private HttpExecutionResult executeBatch(Task task, HttpExecutionRequest request) {
+        var caseResults = new ArrayList<HttpExecutionCaseResult>();
+        var halted = false;
+        var skipReason = "";
+        for (var caseId : request.selectedCaseIds()) {
+            if (halted) {
+                caseResults.add(skipSelectedCase(request, caseId, skipReason));
+                continue;
+            }
+
+            var caseResult = executeSelectedCase(task, request, caseId, false);
+            caseResults.add(caseResult);
+            if (shouldHaltBatch(request, caseResult)) {
+                halted = true;
+                skipReason = haltReason(request, caseResult);
+            }
+        }
+        return executionResult(task.getTaskId(), request, caseResults);
+    }
+
+    private HttpExecutionCaseResult executeSelectedCase(
+        Task task,
+        HttpExecutionRequest request,
+        String caseId,
+        boolean strictReferences
+    ) {
+        var testCase = testCases.findById(caseId).orElse(null);
+        if (testCase == null) {
+            if (strictReferences) {
+                throw new IllegalArgumentException("TestCase not found: " + caseId);
+            }
+            return selectionErrorCaseResult(request, caseId, "TestCase not found: " + caseId);
+        }
         if (testCase.getMode() != TestCaseMode.SINGLE) {
-            throw new IllegalArgumentException("Issue 01 supports only SINGLE TestCase execution: " + caseId);
+            var message = "Batch execution supports only SINGLE TestCase before SUITE support: " + caseId;
+            if (strictReferences) {
+                throw new IllegalArgumentException(message);
+            }
+            return blockedCaseResult(request, testCase, message, minimalRequestSnapshot(testCase.getCaseId()));
         }
 
-        var apiSpec = apiSpecs.findById(testCase.getPrimaryApiSpecId())
-            .orElseThrow(() -> new IllegalArgumentException("ApiSpec not found: " + testCase.getPrimaryApiSpecId()));
+        var apiSpec = apiSpecs.findById(testCase.getPrimaryApiSpecId()).orElse(null);
+        if (apiSpec == null) {
+            var message = "ApiSpec not found: " + testCase.getPrimaryApiSpecId();
+            if (strictReferences) {
+                throw new IllegalArgumentException(message);
+            }
+            return selectionErrorCaseResult(request, testCase.getCaseId(), message);
+        }
         if (!task.getTargetApiSpecIds().isEmpty() && !task.getTargetApiSpecIds().contains(apiSpec.getApiSpecId())) {
-            throw new IllegalArgumentException("TestCase " + caseId + " is not selected by Task " + task.getTaskId());
+            var message = "TestCase " + caseId + " is not selected by Task " + task.getTaskId();
+            if (strictReferences) {
+                throw new IllegalArgumentException(message);
+            }
+            return blockedCaseResult(request, testCase, message, minimalRequestSnapshot(testCase.getCaseId()));
         }
 
         var preparedRequest = executableRequestBuilder.build(testCase, apiSpec, request);
         if (preparedRequest.blocked()) {
             var message = preparedRequest.message();
-            var record = persistExecutionRecord(
-                request,
-                testCase,
-                preparedRequest.requestSnapshot(),
-                responseSnapshotFactory.blocked(message),
-                OverallStatus.BLOCKED,
-                List.of(),
-                0L,
-                null,
-                message
-            );
-            updateTaskCaseExecution(request, testCase, record, HttpExecutionOutcomeStatus.BLOCKED);
-            return singleCaseResult(
-                task.getTaskId(),
-                request,
-                testCase.getCaseId(),
-                record,
-                HttpExecutionOutcomeStatus.BLOCKED,
-                0L,
-                null,
-                message,
-                preparedRequest.requestSnapshot()
-            );
+            return blockedCaseResult(request, testCase, message, preparedRequest.requestSnapshot());
         }
         if (request.dryRun()) {
             var message = "Dry run prepared request; transport not called";
@@ -119,9 +150,7 @@ public class HttpExecutionApplicationService {
                 null
             );
             updateTaskCaseExecution(request, testCase, record, HttpExecutionOutcomeStatus.SKIPPED);
-            return singleCaseResult(
-                task.getTaskId(),
-                request,
+            return caseResult(
                 testCase.getCaseId(),
                 record,
                 HttpExecutionOutcomeStatus.SKIPPED,
@@ -152,9 +181,7 @@ public class HttpExecutionApplicationService {
                 null
             );
             updateTaskCaseExecution(request, testCase, record, outcomeStatus);
-            return singleCaseResult(
-                task.getTaskId(),
-                request,
+            return caseResult(
                 testCase.getCaseId(),
                 record,
                 outcomeStatus,
@@ -176,9 +203,7 @@ public class HttpExecutionApplicationService {
                 exception.getMessage()
             );
             updateTaskCaseExecution(request, testCase, record, HttpExecutionOutcomeStatus.ERROR);
-            return singleCaseResult(
-                task.getTaskId(),
-                request,
+            return caseResult(
                 testCase.getCaseId(),
                 record,
                 HttpExecutionOutcomeStatus.ERROR,
@@ -204,9 +229,7 @@ public class HttpExecutionApplicationService {
                 message
             );
             updateTaskCaseExecution(request, testCase, record, HttpExecutionOutcomeStatus.ERROR);
-            return singleCaseResult(
-                task.getTaskId(),
-                request,
+            return caseResult(
                 testCase.getCaseId(),
                 record,
                 HttpExecutionOutcomeStatus.ERROR,
@@ -244,9 +267,33 @@ public class HttpExecutionApplicationService {
         Integer statusCode,
         String errorMessage
     ) {
+        return persistExecutionRecord(
+            request,
+            testCase.getCaseId(),
+            requestSnapshot,
+            responseSnapshot,
+            overallStatus,
+            assertionResults,
+            durationMs,
+            statusCode,
+            errorMessage
+        );
+    }
+
+    private ExecutionRecord persistExecutionRecord(
+        HttpExecutionRequest request,
+        String caseId,
+        Map<String, Object> requestSnapshot,
+        Map<String, Object> responseSnapshot,
+        OverallStatus overallStatus,
+        List<Map<String, Object>> assertionResults,
+        long durationMs,
+        Integer statusCode,
+        String errorMessage
+    ) {
         var record = new ExecutionRecord();
         record.setTaskId(request.taskId());
-        record.setCaseId(testCase.getCaseId());
+        record.setCaseId(caseId);
         record.setExecutorType(ExecutorType.HTTP);
         record.setEnvironment(request.environment());
         record.setRequestSnapshot(requestSnapshot);
@@ -268,10 +315,19 @@ public class HttpExecutionApplicationService {
         ExecutionRecord record,
         HttpExecutionOutcomeStatus outcomeStatus
     ) {
-        var taskCaseExecution = taskCaseExecutions.findFirstByTaskIdAndCaseId(request.taskId(), testCase.getCaseId())
+        updateTaskCaseExecution(request, testCase.getCaseId(), record, outcomeStatus);
+    }
+
+    private void updateTaskCaseExecution(
+        HttpExecutionRequest request,
+        String caseId,
+        ExecutionRecord record,
+        HttpExecutionOutcomeStatus outcomeStatus
+    ) {
+        var taskCaseExecution = taskCaseExecutions.findFirstByTaskIdAndCaseId(request.taskId(), caseId)
             .orElseGet(TaskCaseExecution::new);
         taskCaseExecution.setTaskId(request.taskId());
-        taskCaseExecution.setCaseId(testCase.getCaseId());
+        taskCaseExecution.setCaseId(caseId);
         taskCaseExecution.setExecutionMode(request.executionMode());
         taskCaseExecution.setExecutionStatus(taskCaseExecutionStatusFor(outcomeStatus));
         taskCaseExecution.setExecutionRecordId(record.getExecutionId());
@@ -285,9 +341,99 @@ public class HttpExecutionApplicationService {
         taskCaseExecutions.save(taskCaseExecution);
     }
 
-    private HttpExecutionResult singleCaseResult(
-        String taskId,
+    private HttpExecutionCaseResult blockedCaseResult(
         HttpExecutionRequest request,
+        TestCase testCase,
+        String message,
+        Map<String, Object> requestSnapshot
+    ) {
+        var record = persistExecutionRecord(
+            request,
+            testCase,
+            requestSnapshot,
+            responseSnapshotFactory.blocked(message),
+            OverallStatus.BLOCKED,
+            List.of(),
+            0L,
+            null,
+            message
+        );
+        updateTaskCaseExecution(request, testCase, record, HttpExecutionOutcomeStatus.BLOCKED);
+        return caseResult(
+            testCase.getCaseId(),
+            record,
+            HttpExecutionOutcomeStatus.BLOCKED,
+            0L,
+            null,
+            message,
+            requestSnapshot
+        );
+    }
+
+    private HttpExecutionCaseResult selectionErrorCaseResult(
+        HttpExecutionRequest request,
+        String caseId,
+        String message
+    ) {
+        var requestSnapshot = minimalRequestSnapshot(caseId);
+        var record = persistExecutionRecord(
+            request,
+            caseId,
+            requestSnapshot,
+            responseSnapshotFactory.error("SELECTION_ERROR", message, 0L),
+            OverallStatus.ERROR,
+            List.of(),
+            0L,
+            null,
+            message
+        );
+        updateTaskCaseExecution(request, caseId, record, HttpExecutionOutcomeStatus.ERROR);
+        return caseResult(
+            caseId,
+            record,
+            HttpExecutionOutcomeStatus.ERROR,
+            0L,
+            null,
+            message,
+            requestSnapshot
+        );
+    }
+
+    private HttpExecutionCaseResult skipSelectedCase(
+        HttpExecutionRequest request,
+        String caseId,
+        String reason
+    ) {
+        var testCase = testCases.findById(caseId).orElse(null);
+        var requestSnapshot = minimalRequestSnapshot(caseId);
+        var record = persistExecutionRecord(
+            request,
+            caseId,
+            requestSnapshot,
+            responseSnapshotFactory.skipped(reason),
+            OverallStatus.SKIPPED,
+            List.of(),
+            0L,
+            null,
+            null
+        );
+        if (testCase == null) {
+            updateTaskCaseExecution(request, caseId, record, HttpExecutionOutcomeStatus.SKIPPED);
+        } else {
+            updateTaskCaseExecution(request, testCase, record, HttpExecutionOutcomeStatus.SKIPPED);
+        }
+        return caseResult(
+            caseId,
+            record,
+            HttpExecutionOutcomeStatus.SKIPPED,
+            0L,
+            null,
+            reason,
+            requestSnapshot
+        );
+    }
+
+    private HttpExecutionCaseResult caseResult(
         String caseId,
         ExecutionRecord record,
         HttpExecutionOutcomeStatus status,
@@ -296,7 +442,7 @@ public class HttpExecutionApplicationService {
         String message,
         Map<String, Object> requestSnapshot
     ) {
-        var caseResult = new HttpExecutionCaseResult(
+        return new HttpExecutionCaseResult(
             caseId,
             record.getExecutionId(),
             status,
@@ -305,7 +451,13 @@ public class HttpExecutionApplicationService {
             message,
             requestSnapshot
         );
-        var caseResults = List.of(caseResult);
+    }
+
+    private HttpExecutionResult executionResult(
+        String taskId,
+        HttpExecutionRequest request,
+        List<HttpExecutionCaseResult> caseResults
+    ) {
         return new HttpExecutionResult(
             taskId,
             request.environment(),
@@ -313,6 +465,35 @@ public class HttpExecutionApplicationService {
             caseResults,
             HttpExecutionCounts.from(caseResults)
         );
+    }
+
+    private boolean shouldHaltBatch(HttpExecutionRequest request, HttpExecutionCaseResult caseResult) {
+        if (request.options().stopOnCriticalFailure() && criticalFailure(caseResult)) {
+            return true;
+        }
+        return !request.options().continueOnFailure() && caseResult.status() != HttpExecutionOutcomeStatus.PASSED;
+    }
+
+    private String haltReason(HttpExecutionRequest request, HttpExecutionCaseResult caseResult) {
+        if (request.options().stopOnCriticalFailure() && criticalFailure(caseResult)) {
+            return "Skipped because a prior critical failure stopped the batch";
+        }
+        return "Skipped because continue-on-failure is disabled";
+    }
+
+    private boolean criticalFailure(HttpExecutionCaseResult caseResult) {
+        if (caseResult.executionRecordId() == null) {
+            return caseResult.status() == HttpExecutionOutcomeStatus.FAILED
+                || caseResult.status() == HttpExecutionOutcomeStatus.ERROR
+                || caseResult.status() == HttpExecutionOutcomeStatus.BLOCKED;
+        }
+        return executionRecords.findById(caseResult.executionRecordId())
+            .map(ExecutionRecord::isCriticalFailed)
+            .orElse(false);
+    }
+
+    private Map<String, Object> minimalRequestSnapshot(String caseId) {
+        return Map.of("caseId", caseId);
     }
 
     private HttpExecutionOutcomeStatus statusFor(int statusCode) {

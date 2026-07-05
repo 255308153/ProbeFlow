@@ -652,6 +652,132 @@ class HttpExecutionApplicationServiceTests {
             .contains("valid JSON"));
     }
 
+    @Test
+    void batchExecutesSelectedCasesInDeterministicOrderAndAggregatesCounts() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var first = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 201, requestShape("/api/orders/first"), List.of()));
+        var second = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 201, requestShape("/api/orders/second"), List.of()));
+        var third = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 200, requestShape("/api/orders/third"), List.of()));
+        fakeHttpClient.respondWithSequence(
+            new HttpClientResponse(201, Map.of(), Map.of("id", "first"), 10L),
+            new HttpClientResponse(500, Map.of(), Map.of("error", "boom"), 11L),
+            new HttpClientResponse(200, Map.of(), Map.of("id", "third"), 12L)
+        );
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(first.getCaseId(), second.getCaseId(), third.getCaseId()),
+            ExecutionMode.BATCH,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        assertThat(result.caseResults()).extracting(HttpExecutionCaseResult::caseId)
+            .containsExactly(first.getCaseId(), second.getCaseId(), third.getCaseId());
+        assertThat(result.caseResults()).extracting(HttpExecutionCaseResult::status)
+            .containsExactly(HttpExecutionOutcomeStatus.PASSED, HttpExecutionOutcomeStatus.FAILED, HttpExecutionOutcomeStatus.PASSED);
+        assertThat(result.counts()).isEqualTo(new HttpExecutionCounts(3, 2, 1, 0, 0, 0));
+        assertThat(fakeHttpClient.requests()).extracting(HttpClientRequest::path)
+            .containsExactly("/api/orders/first", "/api/orders/second", "/api/orders/third");
+        assertThat(result.caseResults()).allSatisfy(caseResult -> assertThat(caseResult.executionRecordId()).isNotBlank());
+    }
+
+    @Test
+    void batchStopOnCriticalFailureSkipsLaterCasesWithReasons() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var first = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 201, requestShape("/api/orders/first"), List.of()));
+        var second = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 201, requestShape("/api/orders/second"), List.of()));
+        var third = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 201, requestShape("/api/orders/third"), List.of()));
+        fakeHttpClient.respondWithSequence(new HttpClientResponse(500, Map.of(), Map.of("error", "boom"), 9L));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(first.getCaseId(), second.getCaseId(), third.getCaseId()),
+            ExecutionMode.BATCH,
+            "test",
+            false,
+            new HttpExecutionOptions(30_000L, true, true)
+        ));
+
+        assertThat(result.caseResults()).extracting(HttpExecutionCaseResult::status)
+            .containsExactly(HttpExecutionOutcomeStatus.FAILED, HttpExecutionOutcomeStatus.SKIPPED, HttpExecutionOutcomeStatus.SKIPPED);
+        assertThat(result.counts()).isEqualTo(new HttpExecutionCounts(3, 0, 1, 0, 2, 0));
+        assertThat(fakeHttpClient.requests()).extracting(HttpClientRequest::path)
+            .containsExactly("/api/orders/first");
+        assertThat(result.caseResults().get(1).message()).contains("prior critical failure");
+        assertThat(result.caseResults().get(2).message()).contains("prior critical failure");
+
+        var skippedRecord = executionRecords.findById(result.caseResults().get(1).executionRecordId()).orElseThrow();
+        assertThat(skippedRecord.getOverallStatus()).isEqualTo(OverallStatus.SKIPPED);
+        assertThat(skippedRecord.getResponseSnapshot()).containsEntry("skipReason", "Skipped because a prior critical failure stopped the batch");
+    }
+
+    @Test
+    void batchRepresentsMissingAndBlockedCasesWithoutHidingSuccessfulCases() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var success = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 201, requestShape("/api/orders/success"), List.of()));
+        var blocked = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 201, requestShape("/api/orders/{{missingOrderId}}"), List.of()));
+        fakeHttpClient.respondWithSequence(new HttpClientResponse(201, Map.of(), Map.of("id", "success"), 8L));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(success.getCaseId(), "missing-case", blocked.getCaseId()),
+            ExecutionMode.BATCH,
+            "test",
+            false,
+            HttpExecutionOptions.defaults(),
+            Map.of(),
+            Map.of()
+        ));
+
+        assertThat(result.caseResults()).extracting(HttpExecutionCaseResult::caseId)
+            .containsExactly(success.getCaseId(), "missing-case", blocked.getCaseId());
+        assertThat(result.caseResults()).extracting(HttpExecutionCaseResult::status)
+            .containsExactly(HttpExecutionOutcomeStatus.PASSED, HttpExecutionOutcomeStatus.ERROR, HttpExecutionOutcomeStatus.BLOCKED);
+        assertThat(result.counts()).isEqualTo(new HttpExecutionCounts(3, 1, 0, 1, 0, 1));
+        assertThat(fakeHttpClient.requests()).extracting(HttpClientRequest::path)
+            .containsExactly("/api/orders/success");
+        assertThat(result.caseResults().get(1).message()).contains("TestCase not found");
+        assertThat(result.caseResults().get(2).message()).contains("Unresolved variable");
+    }
+
+    @Test
+    void batchContinuesAfterNonCriticalAssertionWarning() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var warning = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 200, requestShape("/api/orders/warning"), List.of(
+            Map.of("type", "JSON_FIELD_EQUALS", "path", "$.status", "expected", "CREATED", "critical", false)
+        )));
+        var success = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 201, requestShape("/api/orders/success"), List.of()));
+        fakeHttpClient.respondWithSequence(
+            new HttpClientResponse(200, Map.of(), Map.of("status", "PENDING"), 6L),
+            new HttpClientResponse(201, Map.of(), Map.of("id", "success"), 7L)
+        );
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(warning.getCaseId(), success.getCaseId()),
+            ExecutionMode.BATCH,
+            "test",
+            false,
+            new HttpExecutionOptions(30_000L, true, true)
+        ));
+
+        assertThat(result.caseResults()).extracting(HttpExecutionCaseResult::status)
+            .containsExactly(HttpExecutionOutcomeStatus.PASSED, HttpExecutionOutcomeStatus.PASSED);
+        assertThat(result.counts()).isEqualTo(new HttpExecutionCounts(2, 2, 0, 0, 0, 0));
+        assertThat(fakeHttpClient.requests()).extracting(HttpClientRequest::path)
+            .containsExactly("/api/orders/warning", "/api/orders/success");
+
+        var warningRecord = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(warningRecord.getOverallStatus()).isEqualTo(OverallStatus.PASSED_WITH_WARNINGS);
+        assertThat(warningRecord.isCriticalFailed()).isFalse();
+    }
+
     private ApiSpec newApiSpec() {
         var apiSpec = new ApiSpec();
         apiSpec.setSystemName("order-platform");
@@ -701,9 +827,13 @@ class HttpExecutionApplicationServiceTests {
     }
 
     private Map<String, Object> defaultRequestShape() {
+        return requestShape("/api/orders");
+    }
+
+    private Map<String, Object> requestShape(String path) {
         return Map.of(
             "method", "POST",
-            "path", "/api/orders",
+            "path", path,
             "headers", Map.of("Content-Type", "application/json"),
             "body", Map.of("skuId", "A-100", "quantity", 2)
         );
