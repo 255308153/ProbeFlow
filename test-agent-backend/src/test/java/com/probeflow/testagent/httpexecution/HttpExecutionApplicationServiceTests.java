@@ -229,9 +229,9 @@ class HttpExecutionApplicationServiceTests {
         ));
         apiSpec = apiSpecs.save(apiSpec);
         var task = tasks.save(newTask(apiSpec.getApiSpecId()));
-        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), Map.of(
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 200, Map.of(
             "body", Map.of("ping", true)
-        )));
+        ), List.of()));
         fakeHttpClient.respondWith(new HttpClientResponse(
             200,
             Map.of("Content-Type", "application/json"),
@@ -339,7 +339,7 @@ class HttpExecutionApplicationServiceTests {
     void successfulResponseSnapshotCapturesHeadersBodyMetadataAndTruncatesLargeText() {
         var apiSpec = apiSpecs.save(newApiSpec());
         var task = tasks.save(newTask(apiSpec.getApiSpecId()));
-        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 200, defaultRequestShape(), List.of()));
         var largeBody = "0123456789".repeat(200);
         fakeHttpClient.respondWith(new HttpClientResponse(
             200,
@@ -378,7 +378,7 @@ class HttpExecutionApplicationServiceTests {
     void binaryResponseSnapshotStoresMetadataWithoutRawBytes() {
         var apiSpec = apiSpecs.save(newApiSpec());
         var task = tasks.save(newTask(apiSpec.getApiSpecId()));
-        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 200, defaultRequestShape(), List.of()));
         fakeHttpClient.respondWith(new HttpClientResponse(
             200,
             Map.of("Content-Type", "application/octet-stream"),
@@ -459,6 +459,199 @@ class HttpExecutionApplicationServiceTests {
         assertThat(record.getErrorMessage()).contains("Request timed out");
     }
 
+    @Test
+    void passingBaselineAssertionsArePersistedStructurally() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 201, defaultRequestShape(), List.of(
+            Map.of("name", "response body present", "type", "BODY_PRESENT", "expected", true),
+            Map.of("name", "order id exists", "type", "JSON_FIELD_EXISTS", "path", "$.orderId"),
+            Map.of("name", "status equals created", "type", "JSON_FIELD_EQUALS", "path", "$.status", "expected", "CREATED"),
+            Map.of("name", "fast enough", "type", "DURATION_LESS_THAN_MS", "expected", 100)
+        )));
+        fakeHttpClient.respondWith(new HttpClientResponse(
+            201,
+            Map.of("Content-Type", "application/json"),
+            Map.of("orderId", "order-123", "status", "CREATED"),
+            42L
+        ));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        assertThat(result.caseResults()).singleElement()
+            .satisfies(caseResult -> assertThat(caseResult.status()).isEqualTo(HttpExecutionOutcomeStatus.PASSED));
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.PASSED);
+        assertThat(record.isCriticalFailed()).isFalse();
+        assertThat(record.getAssertionResults()).hasSize(5);
+        assertThat(record.getAssertionResults()).allSatisfy(assertion -> assertThat(assertion)
+            .containsEntry("status", "PASSED")
+            .containsEntry("critical", true));
+        assertThat(record.getAssertionResults()).anySatisfy(assertion -> assertThat(assertion)
+            .containsEntry("type", "STATUS_CODE")
+            .containsEntry("expected", 201)
+            .containsEntry("actual", 201));
+        assertThat(record.getAssertionResults()).anySatisfy(assertion -> assertThat(assertion)
+            .containsEntry("type", "JSON_FIELD_EQUALS")
+            .containsEntry("expected", "CREATED")
+            .containsEntry("actual", "CREATED"));
+    }
+
+    @Test
+    void failedExpectedStatusAssertionFailsExecutionRecord() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId()));
+        fakeHttpClient.respondWith(new HttpClientResponse(
+            500,
+            Map.of("Content-Type", "application/json"),
+            Map.of("error", "internal"),
+            18L
+        ));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        assertThat(result.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.FAILED);
+        assertThat(result.counts()).isEqualTo(new HttpExecutionCounts(1, 0, 1, 0, 0, 0));
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.FAILED);
+        assertThat(record.isCriticalFailed()).isTrue();
+        assertThat(record.getAssertionResults()).anySatisfy(assertion -> assertThat(assertion)
+            .containsEntry("type", "STATUS_CODE")
+            .containsEntry("expected", 201)
+            .containsEntry("actual", 500)
+            .containsEntry("status", "FAILED"));
+    }
+
+    @Test
+    void bodyPresenceAndDurationAssertionsCanFail() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 204, defaultRequestShape(), List.of(
+            Map.of("type", "BODY_PRESENT", "expected", true),
+            Map.of("type", "DURATION_LESS_THAN_MS", "expected", 10)
+        )));
+        fakeHttpClient.respondWith(new HttpClientResponse(
+            204,
+            Map.of(),
+            null,
+            25L
+        ));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        assertThat(result.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.FAILED);
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getAssertionResults()).anySatisfy(assertion -> assertThat(assertion)
+            .containsEntry("type", "BODY_PRESENT")
+            .containsEntry("expected", true)
+            .containsEntry("actual", false)
+            .containsEntry("status", "FAILED"));
+        assertThat(record.getAssertionResults()).anySatisfy(assertion -> assertThat(assertion)
+            .containsEntry("type", "DURATION_LESS_THAN_MS")
+            .containsEntry("expected", 10L)
+            .containsEntry("actual", 25L)
+            .containsEntry("status", "FAILED"));
+    }
+
+    @Test
+    void nonCriticalAssertionFailurePersistsWarningOverallStatus() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 200, defaultRequestShape(), List.of(
+            Map.of(
+                "type", "JSON_FIELD_EQUALS",
+                "path", "$.status",
+                "expected", "CREATED",
+                "critical", false
+            )
+        )));
+        fakeHttpClient.respondWith(new HttpClientResponse(
+            200,
+            Map.of("Content-Type", "application/json"),
+            Map.of("status", "PENDING"),
+            7L
+        ));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        assertThat(result.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.PASSED);
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.PASSED_WITH_WARNINGS);
+        assertThat(record.isCriticalFailed()).isFalse();
+        assertThat(record.getAssertionResults()).anySatisfy(assertion -> assertThat(assertion)
+            .containsEntry("type", "JSON_FIELD_EQUALS")
+            .containsEntry("status", "FAILED")
+            .containsEntry("critical", false));
+    }
+
+    @Test
+    void malformedJsonBodyFailsJsonFieldAssertionWithoutThrowing() {
+        var apiSpec = apiSpecs.save(newApiSpec());
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var testCase = testCases.save(newSingleTestCase(apiSpec.getApiSpecId(), 200, defaultRequestShape(), List.of(
+            Map.of("type", "JSON_FIELD_EXISTS", "path", "$.orderId")
+        )));
+        fakeHttpClient.respondWith(new HttpClientResponse(
+            200,
+            Map.of("Content-Type", "application/json"),
+            "{not-json",
+            5L
+        ));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SINGLE,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        assertThat(result.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.FAILED);
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.FAILED);
+        assertThat(record.getAssertionResults()).anySatisfy(assertion -> assertThat(assertion)
+            .containsEntry("type", "JSON_FIELD_EXISTS")
+            .containsEntry("status", "FAILED")
+            .containsEntry("actual", false));
+        assertThat(record.getAssertionResults()).anySatisfy(assertion -> assertThat(assertion.get("message")).asString()
+            .contains("valid JSON"));
+    }
+
     private ApiSpec newApiSpec() {
         var apiSpec = new ApiSpec();
         apiSpec.setSystemName("order-platform");
@@ -504,15 +697,28 @@ class HttpExecutionApplicationServiceTests {
     }
 
     private TestCase newSingleTestCase(String apiSpecId) {
-        return newSingleTestCase(apiSpecId, Map.of(
+        return newSingleTestCase(apiSpecId, defaultRequestShape());
+    }
+
+    private Map<String, Object> defaultRequestShape() {
+        return Map.of(
             "method", "POST",
             "path", "/api/orders",
             "headers", Map.of("Content-Type", "application/json"),
             "body", Map.of("skuId", "A-100", "quantity", 2)
-        ));
+        );
     }
 
     private TestCase newSingleTestCase(String apiSpecId, Map<String, Object> requestShape) {
+        return newSingleTestCase(apiSpecId, 201, requestShape, List.of());
+    }
+
+    private TestCase newSingleTestCase(
+        String apiSpecId,
+        int expectedStatus,
+        Map<String, Object> requestShape,
+        List<Map<String, Object>> assertions
+    ) {
         var testCase = new TestCase();
         testCase.setPrimaryApiSpecId(apiSpecId);
         testCase.setCaseCategory(CaseCategory.API);
@@ -531,14 +737,17 @@ class HttpExecutionApplicationServiceTests {
         testCase.setManualEdited(false);
         testCase.setLocked(false);
         testCase.setDetailType(DetailType.API);
-        testCase.setDetail(Map.of(
-            "expectedStatus", 201,
-            "requestShape", requestShape
-        ));
+        var detail = new java.util.LinkedHashMap<String, Object>();
+        detail.put("expectedStatus", expectedStatus);
+        detail.put("requestShape", requestShape);
+        if (!assertions.isEmpty()) {
+            detail.put("assertions", assertions);
+        }
+        testCase.setDetail(detail);
         testCase.setSteps(List.of(Map.of(
             "order", 1,
             "apiSpecId", apiSpecId,
-            "expectedStatus", 201,
+            "expectedStatus", expectedStatus,
             "requestShape", requestShape
         )));
         testCase.setBasedOnApiSpecVersions(Map.of(apiSpecId, 3));

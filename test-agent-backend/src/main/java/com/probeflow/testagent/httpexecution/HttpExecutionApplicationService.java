@@ -32,6 +32,7 @@ public class HttpExecutionApplicationService {
     private final HttpClientGateway httpClientGateway;
     private final ExecutableRequestBuilder executableRequestBuilder;
     private final HttpResponseSnapshotFactory responseSnapshotFactory;
+    private final BaselineHttpAssertionChecker assertionChecker;
 
     public HttpExecutionApplicationService(
         TaskRepository tasks,
@@ -41,7 +42,8 @@ public class HttpExecutionApplicationService {
         TaskCaseExecutionRepository taskCaseExecutions,
         HttpClientGateway httpClientGateway,
         ExecutableRequestBuilder executableRequestBuilder,
-        HttpResponseSnapshotFactory responseSnapshotFactory
+        HttpResponseSnapshotFactory responseSnapshotFactory,
+        BaselineHttpAssertionChecker assertionChecker
     ) {
         this.tasks = tasks;
         this.testCases = testCases;
@@ -51,6 +53,7 @@ public class HttpExecutionApplicationService {
         this.httpClientGateway = httpClientGateway;
         this.executableRequestBuilder = executableRequestBuilder;
         this.responseSnapshotFactory = responseSnapshotFactory;
+        this.assertionChecker = assertionChecker;
     }
 
     @Transactional
@@ -83,7 +86,8 @@ public class HttpExecutionApplicationService {
                 testCase,
                 preparedRequest.requestSnapshot(),
                 responseSnapshotFactory.blocked(message),
-                HttpExecutionOutcomeStatus.BLOCKED,
+                OverallStatus.BLOCKED,
+                List.of(),
                 0L,
                 null,
                 message
@@ -108,7 +112,8 @@ public class HttpExecutionApplicationService {
                 testCase,
                 preparedRequest.requestSnapshot(),
                 responseSnapshotFactory.dryRun(message),
-                HttpExecutionOutcomeStatus.SKIPPED,
+                OverallStatus.SKIPPED,
+                List.of(),
                 0L,
                 null,
                 null
@@ -132,13 +137,16 @@ public class HttpExecutionApplicationService {
         try {
             var httpResponse = httpClientGateway.execute(httpRequest, request.options());
             var durationMs = normalizedDuration(httpResponse.durationMs(), startedAt);
-            var outcomeStatus = statusFor(httpResponse.statusCode());
+            var assertionResults = assertionChecker.check(testCase, httpResponse, durationMs);
+            var overallStatus = overallStatusForResponse(httpResponse.statusCode(), assertionResults);
+            var outcomeStatus = outcomeStatusFor(overallStatus);
             var record = persistExecutionRecord(
                 request,
                 testCase,
                 preparedRequest.requestSnapshot(),
                 responseSnapshotFactory.success(httpResponse, durationMs),
-                outcomeStatus,
+                overallStatus,
+                assertionResults,
                 durationMs,
                 httpResponse.statusCode(),
                 null
@@ -161,7 +169,8 @@ public class HttpExecutionApplicationService {
                 testCase,
                 preparedRequest.requestSnapshot(),
                 responseSnapshotFactory.transportError(exception),
-                HttpExecutionOutcomeStatus.ERROR,
+                OverallStatus.ERROR,
+                List.of(),
                 exception.durationMs(),
                 null,
                 exception.getMessage()
@@ -188,7 +197,8 @@ public class HttpExecutionApplicationService {
                 testCase,
                 preparedRequest.requestSnapshot(),
                 responseSnapshotFactory.transportError(message, durationMs),
-                HttpExecutionOutcomeStatus.ERROR,
+                OverallStatus.ERROR,
+                List.of(),
                 durationMs,
                 null,
                 message
@@ -228,7 +238,8 @@ public class HttpExecutionApplicationService {
         TestCase testCase,
         Map<String, Object> requestSnapshot,
         Map<String, Object> responseSnapshot,
-        HttpExecutionOutcomeStatus outcomeStatus,
+        OverallStatus overallStatus,
+        List<Map<String, Object>> assertionResults,
         long durationMs,
         Integer statusCode,
         String errorMessage
@@ -240,11 +251,11 @@ public class HttpExecutionApplicationService {
         record.setEnvironment(request.environment());
         record.setRequestSnapshot(requestSnapshot);
         record.setResponseSnapshot(responseSnapshot);
-        record.setAssertionResults(List.of());
-        record.setOverallStatus(overallStatusFor(outcomeStatus));
-        record.setCriticalFailed(outcomeStatus == HttpExecutionOutcomeStatus.FAILED
-            || outcomeStatus == HttpExecutionOutcomeStatus.ERROR
-            || outcomeStatus == HttpExecutionOutcomeStatus.BLOCKED);
+        record.setAssertionResults(assertionResults);
+        record.setOverallStatus(overallStatus);
+        record.setCriticalFailed(overallStatus == OverallStatus.FAILED
+            || overallStatus == OverallStatus.ERROR
+            || overallStatus == OverallStatus.BLOCKED);
         record.setDurationMs(durationMs);
         record.setStatusCode(statusCode);
         record.setErrorMessage(errorMessage);
@@ -310,14 +321,37 @@ public class HttpExecutionApplicationService {
             : HttpExecutionOutcomeStatus.FAILED;
     }
 
-    private OverallStatus overallStatusFor(HttpExecutionOutcomeStatus outcomeStatus) {
-        return switch (outcomeStatus) {
-            case PASSED -> OverallStatus.PASSED;
-            case FAILED -> OverallStatus.FAILED;
-            case ERROR -> OverallStatus.ERROR;
-            case SKIPPED -> OverallStatus.SKIPPED;
-            case BLOCKED -> OverallStatus.BLOCKED;
+    private OverallStatus overallStatusForResponse(int statusCode, List<Map<String, Object>> assertionResults) {
+        if (assertionResults.isEmpty()) {
+            return statusFor(statusCode) == HttpExecutionOutcomeStatus.PASSED
+                ? OverallStatus.PASSED
+                : OverallStatus.FAILED;
+        }
+        if (assertionResults.stream().anyMatch(this::criticalAssertionFailed)) {
+            return OverallStatus.FAILED;
+        }
+        if (assertionResults.stream().anyMatch(this::assertionFailed)) {
+            return OverallStatus.PASSED_WITH_WARNINGS;
+        }
+        return OverallStatus.PASSED;
+    }
+
+    private HttpExecutionOutcomeStatus outcomeStatusFor(OverallStatus overallStatus) {
+        return switch (overallStatus) {
+            case PASSED, PASSED_WITH_WARNINGS -> HttpExecutionOutcomeStatus.PASSED;
+            case FAILED -> HttpExecutionOutcomeStatus.FAILED;
+            case ERROR -> HttpExecutionOutcomeStatus.ERROR;
+            case SKIPPED -> HttpExecutionOutcomeStatus.SKIPPED;
+            case BLOCKED -> HttpExecutionOutcomeStatus.BLOCKED;
         };
+    }
+
+    private boolean criticalAssertionFailed(Map<String, Object> assertionResult) {
+        return assertionFailed(assertionResult) && Boolean.TRUE.equals(assertionResult.get("critical"));
+    }
+
+    private boolean assertionFailed(Map<String, Object> assertionResult) {
+        return !"PASSED".equals(assertionResult.get("status"));
     }
 
     private TaskCaseExecutionStatus taskCaseExecutionStatusFor(HttpExecutionOutcomeStatus outcomeStatus) {
