@@ -3,6 +3,10 @@ package com.probeflow.testagent.failureanalysis;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.probeflow.testagent.apispec.ApiSpec;
+import com.probeflow.testagent.apispec.ApiSpecRepository;
+import com.probeflow.testagent.apispec.ApiSpecSourceType;
+import com.probeflow.testagent.apispec.HttpMethod;
 import com.probeflow.testagent.executionrecord.ExecutionRecord;
 import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.ExecutorType;
@@ -12,6 +16,15 @@ import com.probeflow.testagent.observation.ObservationRepository;
 import com.probeflow.testagent.observation.ObservationRiskLevel;
 import com.probeflow.testagent.observation.ObservationSource;
 import com.probeflow.testagent.observation.ObservationType;
+import com.probeflow.testagent.testcase.CaseCategory;
+import com.probeflow.testagent.testcase.CasePriority;
+import com.probeflow.testagent.testcase.CaseRiskLevel;
+import com.probeflow.testagent.testcase.CaseSource;
+import com.probeflow.testagent.testcase.CaseStatus;
+import com.probeflow.testagent.testcase.DetailType;
+import com.probeflow.testagent.testcase.TestCase;
+import com.probeflow.testagent.testcase.TestCaseMode;
+import com.probeflow.testagent.testcase.TestCaseRepository;
 import jakarta.persistence.EntityManager;
 import java.util.List;
 import java.util.Map;
@@ -34,6 +47,12 @@ class FailureAnalysisApplicationServiceTests {
 
     @Autowired
     private ObservationRepository observations;
+
+    @Autowired
+    private ApiSpecRepository apiSpecs;
+
+    @Autowired
+    private TestCaseRepository testCases;
 
     @Autowired
     private EntityManager entityManager;
@@ -410,6 +429,93 @@ class FailureAnalysisApplicationServiceTests {
         assertThat(skippedResult.suiteFailure().impactSummary()).contains("All suite steps were skipped");
     }
 
+    @Test
+    void taskAnalysisAggregatesDeduplicatesOrdersAndFlagsMissingLinkedRecords() {
+        var api = apiSpecs.save(newApiSpec("/api/orders"));
+        var caseOne = testCases.save(newTestCase("case-one", api.getApiSpecId()));
+        var caseTwo = testCases.save(newTestCase("case-two", api.getApiSpecId()));
+        var retryable = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("method", "POST", "path", "/api/orders", "apiSpecId", api.getApiSpecId()),
+            Map.of("statusCode", 503),
+            List.of()
+        ));
+        retryable.setCaseId(caseOne.getCaseId());
+        retryable.setStatusCode(503);
+        var duplicateOne = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("method", "POST", "path", "/api/orders", "apiSpecId", api.getApiSpecId()),
+            Map.of("statusCode", 409),
+            List.of(Map.of("type", "STATUS_CODE", "expected", 201, "actual", 409, "status", "FAILED"))
+        ));
+        duplicateOne.setCaseId(caseOne.getCaseId());
+        duplicateOne.setStatusCode(409);
+        var duplicateTwo = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("method", "POST", "path", "/api/orders", "apiSpecId", api.getApiSpecId()),
+            Map.of("statusCode", 409),
+            List.of(Map.of("type", "STATUS_CODE", "expected", 201, "actual", 409, "status", "FAILED"))
+        ));
+        duplicateTwo.setCaseId(caseOne.getCaseId());
+        duplicateTwo.setStatusCode(409);
+        var passed = executionRecords.save(newExecutionRecord(
+            OverallStatus.PASSED,
+            Map.of("method", "POST", "path", "/api/orders", "apiSpecId", api.getApiSpecId()),
+            Map.of("statusCode", 201),
+            List.of()
+        ));
+        passed.setCaseId(caseTwo.getCaseId());
+        passed.setStatusCode(201);
+        var missingLinks = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("method", "GET", "path", "/api/missing", "apiSpecId", "missing-api"),
+            Map.of("statusCode", 400),
+            List.of()
+        ));
+        missingLinks.setCaseId("missing-case");
+        missingLinks.setStatusCode(400);
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = failureAnalysis.analyzeTask(TaskFailureAnalysisRequest.basic("task-1"));
+
+        assertThat(result.taskId()).isEqualTo("task-1");
+        assertThat(result.counts().totalExecutions()).isEqualTo(5);
+        assertThat(result.counts().retryableExecutions()).isEqualTo(1);
+        assertThat(result.counts().byOverallStatus()).containsEntry("PASSED", 1L).containsEntry("FAILED", 4L);
+        assertThat(result.counts().byClassification()).containsEntry("SERVER_ERROR", 1L)
+            .containsEntry("STATUS_MISMATCH", 2L)
+            .containsEntry("VALIDATION_ISSUE", 1L)
+            .containsEntry("NONE", 1L);
+        assertThat(result.groupedFailures()).extracting(GroupedFailureSummary::classification)
+            .containsSubsequence(FailureClassification.SERVER_ERROR, FailureClassification.STATUS_MISMATCH)
+            .contains(FailureClassification.DATA_QUALITY_ISSUE);
+        assertThat(result.groupedFailures()).filteredOn(group -> group.classification() == FailureClassification.STATUS_MISMATCH)
+            .singleElement()
+            .satisfies(group -> {
+                assertThat(group.occurrenceCount()).isEqualTo(2);
+                assertThat(group.executionIds()).containsExactly(duplicateOne.getExecutionId(), duplicateTwo.getExecutionId());
+                assertThat(group.affectedCaseIds()).containsExactly(caseOne.getCaseId());
+                assertThat(group.failedAssertionType()).isEqualTo("STATUS_CODE");
+                assertThat(group.apiReference()).isEqualTo(api.getApiSpecId());
+            });
+        assertThat(result.groupedFailures()).filteredOn(group -> group.classification() == FailureClassification.DATA_QUALITY_ISSUE)
+            .singleElement()
+            .satisfies(group -> {
+                assertThat(group.caseReference()).isEqualTo("missing-case");
+                assertThat(group.apiReference()).isEqualTo("missing-api");
+                assertThat(group.summary()).contains("TestCase missing-case", "ApiSpec missing-api");
+            });
+
+        var subset = failureAnalysis.analyzeTask(TaskFailureAnalysisRequest.basic(
+            "task-1",
+            List.of(duplicateOne.getExecutionId(), passed.getExecutionId())
+        ));
+        assertThat(subset.counts().totalExecutions()).isEqualTo(2);
+        assertThat(subset.groupedFailures()).singleElement()
+            .satisfies(group -> assertThat(group.executionIds()).containsExactly(duplicateOne.getExecutionId()));
+    }
+
     private ExecutionRecord newExecutionRecord(OverallStatus status) {
         return newExecutionRecord(
             status,
@@ -439,6 +545,53 @@ class FailureAnalysisApplicationServiceTests {
         record.setStatusCode(responseSnapshot.get("statusCode") instanceof Number number ? number.intValue() : null);
         record.setErrorMessage(status == OverallStatus.ERROR ? "Connection refused" : null);
         return record;
+    }
+
+    private ApiSpec newApiSpec(String path) {
+        var apiSpec = new ApiSpec();
+        apiSpec.setSystemName("order-platform");
+        apiSpec.setModuleName("orders");
+        apiSpec.setHttpMethod(HttpMethod.POST);
+        apiSpec.setPath(path);
+        apiSpec.setSummary("Orders API");
+        apiSpec.setDescription("Orders API");
+        apiSpec.setOperationId("orders");
+        apiSpec.setParameters(Map.of());
+        apiSpec.setConstraints(Map.of());
+        apiSpec.setAuth(Map.of());
+        apiSpec.setSourceType(ApiSpecSourceType.MANUAL);
+        apiSpec.setSourceRef("manual");
+        apiSpec.setSourceLocation(Map.of());
+        apiSpec.setRouteReady(true);
+        apiSpec.setBasicParamReady(true);
+        apiSpec.setDtoExpanded(true);
+        apiSpec.setValidationReady(true);
+        apiSpec.setAuthReady(true);
+        apiSpec.setKnowledgeContextReady(true);
+        return apiSpec;
+    }
+
+    private TestCase newTestCase(String caseId, String apiSpecId) {
+        var testCase = new TestCase();
+        testCase.setCaseId(caseId);
+        testCase.setPrimaryApiSpecId(apiSpecId);
+        testCase.setCaseCategory(CaseCategory.API);
+        testCase.setMode(TestCaseMode.SINGLE);
+        testCase.setTitle("Generated case " + caseId);
+        testCase.setDescription("Generated case");
+        testCase.setPreconditions(List.of());
+        testCase.setExpectedResult("Request succeeds");
+        testCase.setPriority(CasePriority.MEDIUM);
+        testCase.setRiskLevel(CaseRiskLevel.MEDIUM);
+        testCase.setTags(List.of("phase7"));
+        testCase.setStatus(CaseStatus.READY);
+        testCase.setSource(CaseSource.MANUAL);
+        testCase.setDetailType(DetailType.API);
+        testCase.setDetail(Map.of());
+        testCase.setSteps(List.of());
+        testCase.setBasedOnApiSpecVersions(Map.of(apiSpecId, 1));
+        testCase.setGeneratedFromSingleCaseIds(List.of());
+        return testCase;
     }
 
     private void assertClassification(

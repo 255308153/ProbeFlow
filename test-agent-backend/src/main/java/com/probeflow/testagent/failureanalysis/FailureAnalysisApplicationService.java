@@ -1,5 +1,6 @@
 package com.probeflow.testagent.failureanalysis;
 
+import com.probeflow.testagent.apispec.ApiSpecRepository;
 import com.probeflow.testagent.executionrecord.ExecutionRecord;
 import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.OverallStatus;
@@ -9,10 +10,16 @@ import com.probeflow.testagent.observation.ObservationRepository;
 import com.probeflow.testagent.observation.ObservationRiskLevel;
 import com.probeflow.testagent.observation.ObservationSource;
 import com.probeflow.testagent.observation.ObservationType;
+import com.probeflow.testagent.testcase.TestCaseRepository;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -21,13 +28,19 @@ public class FailureAnalysisApplicationService {
 
     private final ExecutionRecordRepository executionRecords;
     private final ObservationRepository observations;
+    private final TestCaseRepository testCases;
+    private final ApiSpecRepository apiSpecs;
 
     public FailureAnalysisApplicationService(
         ExecutionRecordRepository executionRecords,
-        ObservationRepository observations
+        ObservationRepository observations,
+        TestCaseRepository testCases,
+        ApiSpecRepository apiSpecs
     ) {
         this.executionRecords = executionRecords;
         this.observations = observations;
+        this.testCases = testCases;
+        this.apiSpecs = apiSpecs;
     }
 
     @Transactional
@@ -80,6 +93,23 @@ public class FailureAnalysisApplicationService {
         );
     }
 
+    @Transactional
+    public TaskFailureAnalysisResult analyzeTask(TaskFailureAnalysisRequest request) {
+        var normalized = normalize(request);
+        var records = loadTaskRecords(normalized);
+        var results = records.stream()
+            .map(record -> analyzeExecution(new FailureAnalysisRequest(record.getExecutionId(), normalized.mode())))
+            .toList();
+        var groups = groupedFailures(records, results);
+        return new TaskFailureAnalysisResult(
+            normalized.taskId(),
+            normalized.mode(),
+            counts(results),
+            results,
+            groups
+        );
+    }
+
     private FailureAnalysisRequest normalize(FailureAnalysisRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("FailureAnalysisRequest is required");
@@ -93,6 +123,38 @@ public class FailureAnalysisApplicationService {
             throw new IllegalArgumentException("DEEP failure analysis is reserved for a future phase");
         }
         return new FailureAnalysisRequest(executionId, mode);
+    }
+
+    private TaskFailureAnalysisRequest normalize(TaskFailureAnalysisRequest request) {
+        if (request == null) {
+            throw new IllegalArgumentException("TaskFailureAnalysisRequest is required");
+        }
+        var taskId = clean(request.taskId());
+        if (taskId == null) {
+            throw new IllegalArgumentException("taskId is required");
+        }
+        var mode = request.mode() == null ? FailureAnalysisMode.BASIC : request.mode();
+        if (mode == FailureAnalysisMode.DEEP) {
+            throw new IllegalArgumentException("DEEP failure analysis is reserved for a future phase");
+        }
+        var executionIds = request.executionIds() == null
+            ? List.<String>of()
+            : request.executionIds().stream()
+                .map(this::clean)
+                .filter(id -> id != null)
+                .distinct()
+                .toList();
+        return new TaskFailureAnalysisRequest(taskId, executionIds, mode);
+    }
+
+    private List<ExecutionRecord> loadTaskRecords(TaskFailureAnalysisRequest request) {
+        if (request.executionIds().isEmpty()) {
+            return executionRecords.findAllByTaskIdOrderByCreatedAtAscExecutionIdAsc(request.taskId());
+        }
+        return executionRecords.findAllByTaskIdAndExecutionIdInOrderByCreatedAtAscExecutionIdAsc(
+            request.taskId(),
+            request.executionIds()
+        );
     }
 
     private RequestFacts requestFacts(ExecutionRecord record) {
@@ -295,6 +357,199 @@ public class FailureAnalysisApplicationService {
         observation.setSource(ObservationSource.SYSTEM);
         var saved = observations.save(observation);
         return List.of(saved.getObservationId());
+    }
+
+    private TaskFailureAnalysisCounts counts(List<FailureAnalysisResult> results) {
+        return new TaskFailureAnalysisCounts(
+            results.size(),
+            (int) results.stream().filter(FailureAnalysisResult::retryable).count(),
+            (int) results.stream().filter(result -> !result.retryable()).count(),
+            enumCounts(results, result -> result.classification().name()),
+            stringCounts(results, FailureAnalysisResult::riskLevel),
+            retryabilityCounts(results),
+            enumCounts(results, result -> result.overallStatus().name())
+        );
+    }
+
+    private Map<String, Long> retryabilityCounts(List<FailureAnalysisResult> results) {
+        var counts = new TreeMap<String, Long>();
+        counts.put("non_retryable", results.stream().filter(result -> !result.retryable()).count());
+        counts.put("retryable", results.stream().filter(FailureAnalysisResult::retryable).count());
+        return new LinkedHashMap<>(counts);
+    }
+
+    private Map<String, Long> enumCounts(List<FailureAnalysisResult> results, Function<FailureAnalysisResult, String> extractor) {
+        return stringCounts(results, extractor);
+    }
+
+    private Map<String, Long> stringCounts(List<FailureAnalysisResult> results, Function<FailureAnalysisResult, String> extractor) {
+        var counts = new TreeMap<String, Long>();
+        for (var result : results) {
+            counts.merge(extractor.apply(result), 1L, Long::sum);
+        }
+        return new LinkedHashMap<>(counts);
+    }
+
+    private List<GroupedFailureSummary> groupedFailures(
+        List<ExecutionRecord> records,
+        List<FailureAnalysisResult> results
+    ) {
+        var recordById = records.stream()
+            .collect(Collectors.toMap(ExecutionRecord::getExecutionId, Function.identity()));
+        var grouped = results.stream()
+            .filter(result -> result.classification() != FailureClassification.NONE)
+            .filter(result -> result.classification() != FailureClassification.SKIPPED)
+            .collect(Collectors.groupingBy(
+                result -> groupingKey(result, recordById.get(result.executionId())),
+                LinkedHashMap::new,
+                Collectors.toList()
+            ));
+
+        var summaries = new ArrayList<GroupedFailureSummary>();
+        grouped.values().forEach(group -> summaries.add(groupSummary(group, recordById)));
+        dataQualityGroups(records).forEach(summaries::add);
+        summaries.sort(
+            Comparator.comparingInt((GroupedFailureSummary group) -> severityRank(group.riskLevel())).reversed()
+                .thenComparing(group -> group.classification().name())
+                .thenComparing(GroupedFailureSummary::apiReference, Comparator.nullsLast(String::compareTo))
+                .thenComparing(GroupedFailureSummary::caseReference, Comparator.nullsLast(String::compareTo))
+                .thenComparing(group -> group.statusCode() == null ? -1 : group.statusCode())
+                .thenComparing(group -> group.executionIds().isEmpty() ? "" : group.executionIds().getFirst())
+        );
+        return List.copyOf(summaries);
+    }
+
+    private String groupingKey(FailureAnalysisResult result, ExecutionRecord record) {
+        return result.classification()
+            + "|" + apiReference(result, record)
+            + "|" + result.caseId()
+            + "|" + result.statusCode()
+            + "|" + firstFailedAssertionType(result)
+            + "|" + result.response().errorType();
+    }
+
+    private GroupedFailureSummary groupSummary(
+        List<FailureAnalysisResult> group,
+        Map<String, ExecutionRecord> recordById
+    ) {
+        var first = group.getFirst();
+        var record = recordById.get(first.executionId());
+        return new GroupedFailureSummary(
+            first.classification(),
+            highestRisk(group),
+            group.stream().anyMatch(FailureAnalysisResult::retryable),
+            first.statusCode(),
+            apiReference(first, record),
+            first.caseId(),
+            firstFailedAssertionType(first),
+            first.response().errorType(),
+            distinct(group.stream().map(FailureAnalysisResult::caseId).toList()),
+            distinct(group.stream().map(FailureAnalysisResult::executionId).toList()),
+            group.size(),
+            first.summary()
+        );
+    }
+
+    private List<GroupedFailureSummary> dataQualityGroups(List<ExecutionRecord> records) {
+        var groups = new ArrayList<GroupedFailureSummary>();
+        for (var record : records) {
+            var missing = missingLinkedRecords(record);
+            if (missing.isEmpty()) {
+                continue;
+            }
+            var apiReference = apiReference(record);
+            groups.add(new GroupedFailureSummary(
+                FailureClassification.DATA_QUALITY_ISSUE,
+                ObservationRiskLevel.MEDIUM.name(),
+                false,
+                record.getStatusCode(),
+                apiReference,
+                record.getCaseId(),
+                null,
+                responseFacts(record).errorType(),
+                List.of(record.getCaseId()),
+                List.of(record.getExecutionId()),
+                1,
+                "Execution " + record.getExecutionId() + " references missing linked records: " + missing
+            ));
+        }
+        return groups;
+    }
+
+    private List<String> missingLinkedRecords(ExecutionRecord record) {
+        var missing = new ArrayList<String>();
+        if (!testCases.existsById(record.getCaseId())) {
+            missing.add("TestCase " + record.getCaseId());
+        }
+        var apiReference = apiReference(record);
+        if (apiReference != null && !apiSpecs.existsById(apiReference)) {
+            missing.add("ApiSpec " + apiReference);
+        }
+        return List.copyOf(missing);
+    }
+
+    private String highestRisk(List<FailureAnalysisResult> group) {
+        return group.stream()
+            .map(FailureAnalysisResult::riskLevel)
+            .max(Comparator.comparingInt(this::severityRank))
+            .orElse(ObservationRiskLevel.LOW.name());
+    }
+
+    private int severityRank(String riskLevel) {
+        if (ObservationRiskLevel.CRITICAL.name().equals(riskLevel)) {
+            return 4;
+        }
+        if (ObservationRiskLevel.HIGH.name().equals(riskLevel)) {
+            return 3;
+        }
+        if (ObservationRiskLevel.MEDIUM.name().equals(riskLevel)) {
+            return 2;
+        }
+        return 1;
+    }
+
+    private String firstFailedAssertionType(FailureAnalysisResult result) {
+        return result.failedAssertions().isEmpty()
+            ? null
+            : result.failedAssertions().getFirst().type();
+    }
+
+    private String apiReference(FailureAnalysisResult result, ExecutionRecord record) {
+        if (result.suiteFailure().failedStepApiSpecId() != null) {
+            return result.suiteFailure().failedStepApiSpecId();
+        }
+        return apiReference(record);
+    }
+
+    private String apiReference(ExecutionRecord record) {
+        if (record == null) {
+            return null;
+        }
+        var request = safeMap(record.getRequestSnapshot());
+        var apiSpecId = stringValue(request.get("apiSpecId"));
+        if (apiSpecId != null) {
+            return apiSpecId;
+        }
+        var response = safeMap(record.getResponseSnapshot());
+        if (Boolean.TRUE.equals(response.get("suite")) && response.get("steps") instanceof List<?> steps) {
+            return steps.stream()
+                .filter(Map.class::isInstance)
+                .map(item -> objectMap((Map<?, ?>) item))
+                .filter(this::failedSuiteStep)
+                .map(step -> stringValue(step.get("apiSpecId")))
+                .filter(value -> value != null)
+                .findFirst()
+                .orElse(null);
+        }
+        return null;
+    }
+
+    private List<String> distinct(List<String> values) {
+        var ordered = new LinkedHashSet<String>();
+        values.stream()
+            .filter(value -> value != null && !value.isBlank())
+            .forEach(ordered::add);
+        return List.copyOf(ordered);
     }
 
     private boolean shouldWriteObservation(ExecutionRecord record) {
