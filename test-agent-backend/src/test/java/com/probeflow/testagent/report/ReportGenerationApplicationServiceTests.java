@@ -99,6 +99,18 @@ class ReportGenerationApplicationServiceTests {
             .containsEntry("state", "NO_CASES")
             .containsEntry("scope", "HTTP_API_TESTING")
             .containsEntry("environment", "staging");
+        assertThat((Map<String, Object>) report.getMetadata().get("executionSummary"))
+            .containsEntry("total", 0)
+            .containsEntry("executionCount", 0)
+            .containsEntry("passed", 0)
+            .containsEntry("failed", 0)
+            .containsEntry("warning", 0)
+            .containsEntry("error", 0)
+            .containsEntry("blocked", 0)
+            .containsEntry("skipped", 0)
+            .containsEntry("unexecuted", 0)
+            .containsEntry("passRate", "0.0000")
+            .containsEntry("totalDurationMs", 0L);
         assertThat((Map<String, Object>) report.getMetadata().get("task"))
             .containsEntry("taskId", task.getTaskId())
             .containsEntry("taskName", "Phase 8 report task")
@@ -125,10 +137,23 @@ class ReportGenerationApplicationServiceTests {
         assertThat(report.getFindings()).singleElement()
             .satisfies(finding -> assertThat(finding)
                 .containsEntry("state", "NO_EXECUTIONS")
-                .containsEntry("caseCount", 2));
+                .containsEntry("caseCount", 2)
+                .containsEntry("unexecutedCaseIds", List.of(createCase.getCaseId(), readCase.getCaseId())));
         assertThat((List<String>) report.getMetadata().get("caseIds"))
             .containsExactly(createCase.getCaseId(), readCase.getCaseId());
         assertThat(report.getMetadata()).containsEntry("environment", "qa");
+        assertThat((Map<String, Object>) report.getMetadata().get("executionSummary"))
+            .containsEntry("total", 2)
+            .containsEntry("executionCount", 0)
+            .containsEntry("unexecuted", 2)
+            .containsEntry("passRate", "0.0000");
+        assertThat((List<String>) ((Map<String, Object>) report.getMetadata().get("executionSummary")).get("unexecutedCaseIds"))
+            .containsExactly(createCase.getCaseId(), readCase.getCaseId());
+        assertThat((Map<String, Object>) report.getMetadata().get("coverage"))
+            .containsEntry("targetApiSpecIds", List.of("api-create", "api-read"))
+            .containsEntry("testedApiSpecIds", List.of())
+            .containsEntry("untestedApiSpecIds", List.of("api-create", "api-read"))
+            .containsEntry("coverageRate", "0.0000");
 
         entityManager.flush();
         entityManager.clear();
@@ -158,10 +183,31 @@ class ReportGenerationApplicationServiceTests {
 
         var report = reports.findById(result.reportId()).orElseThrow();
         assertThat(report.getCaseCount()).isEqualTo(1);
+        assertThat(report.getPassCount()).isEqualTo(1);
+        assertThat(report.getFailCount()).isZero();
+        assertThat(report.getWarningCount()).isZero();
+        assertThat(report.getSummary()).contains("passRate=1.0000", "unexecuted=0");
+        assertThat(report.getRiskSummary()).contains("All executed records passed");
         assertThat(report.getMetadata()).containsEntry("environment", "prod");
         assertThat((List<String>) report.getMetadata().get("environments")).containsExactly("prod", "qa");
         assertThat((List<String>) report.getMetadata().get("executionIds")).containsExactly(execution.getExecutionId());
         assertThat(report.getMetadata()).containsEntry("taskCaseExecutionCount", 1);
+        assertThat((Map<String, Object>) report.getMetadata().get("executionSummary"))
+            .containsEntry("total", 1)
+            .containsEntry("executionCount", 1)
+            .containsEntry("passed", 1)
+            .containsEntry("failed", 0)
+            .containsEntry("warning", 0)
+            .containsEntry("error", 0)
+            .containsEntry("blocked", 0)
+            .containsEntry("skipped", 0)
+            .containsEntry("unexecuted", 0)
+            .containsEntry("passRate", "1.0000")
+            .containsEntry("totalDurationMs", 42L);
+        assertThat((Map<String, Object>) report.getMetadata().get("coverage"))
+            .containsEntry("testedApiSpecIds", List.of("api-create"))
+            .containsEntry("untestedApiSpecIds", List.of())
+            .containsEntry("coverageRate", "1.0000");
         assertThat(report.getFindings()).singleElement()
             .satisfies(finding -> assertThat(finding).containsEntry("state", "BASIC_SNAPSHOT"));
 
@@ -173,6 +219,131 @@ class ReportGenerationApplicationServiceTests {
             .isEqualTo(TaskCaseExecutionStatus.COMPLETED);
         assertThat(executionRecords.findById(execution.getExecutionId()).orElseThrow().getOverallStatus())
             .isEqualTo(OverallStatus.PASSED);
+    }
+
+    @Test
+    void aggregatesMixedExecutionOutcomesCoverageDurationAndModes() {
+        var apiSpecIds = List.of("api-pass", "api-fail", "api-warning", "api-error", "api-blocked", "api-skipped", "api-unexecuted");
+        var task = tasks.save(newTask("task-mixed", apiSpecIds, Map.of("environment", "qa")));
+        var passedCase = testCases.save(newTestCase("case-pass", "api-pass"));
+        var failedCase = testCases.save(newTestCase("case-fail", "api-fail"));
+        var warningCase = testCases.save(newTestCase("case-warning", "api-warning"));
+        var errorCase = testCases.save(newTestCase("case-error", "api-error"));
+        var blockedCase = testCases.save(newTestCase("case-blocked", "api-blocked"));
+        var skippedCase = testCases.save(newTestCase("case-skipped", "api-skipped"));
+        var unexecutedCase = testCases.save(newTestCase("case-unexecuted", "api-unexecuted"));
+
+        var passed = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            passedCase.getCaseId(),
+            "qa",
+            "api-pass",
+            OverallStatus.PASSED,
+            12L
+        ));
+        var failed = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            failedCase.getCaseId(),
+            "qa",
+            "api-fail",
+            OverallStatus.FAILED,
+            75L
+        ));
+        var warning = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            warningCase.getCaseId(),
+            "qa",
+            "api-warning",
+            OverallStatus.PASSED_WITH_WARNINGS,
+            99L
+        ));
+        var error = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            errorCase.getCaseId(),
+            "qa",
+            "api-error",
+            OverallStatus.ERROR,
+            30L
+        ));
+        var blocked = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            blockedCase.getCaseId(),
+            "qa",
+            "api-blocked",
+            OverallStatus.BLOCKED,
+            1L
+        ));
+        var skipped = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            skippedCase.getCaseId(),
+            "qa",
+            "api-skipped",
+            OverallStatus.SKIPPED,
+            0L
+        ));
+        taskCaseExecutions.save(newTaskCaseExecution(task.getTaskId(), passedCase.getCaseId(), passed.getExecutionId(), ExecutionMode.SINGLE));
+        taskCaseExecutions.save(newTaskCaseExecution(task.getTaskId(), failedCase.getCaseId(), failed.getExecutionId(), ExecutionMode.BATCH));
+        taskCaseExecutions.save(newTaskCaseExecution(task.getTaskId(), warningCase.getCaseId(), warning.getExecutionId(), ExecutionMode.SUITE_STEP));
+        taskCaseExecutions.save(newTaskCaseExecution(task.getTaskId(), errorCase.getCaseId(), error.getExecutionId(), ExecutionMode.BATCH));
+        taskCaseExecutions.save(newTaskCaseExecution(task.getTaskId(), blockedCase.getCaseId(), blocked.getExecutionId(), ExecutionMode.SUITE_STEP));
+        taskCaseExecutions.save(newTaskCaseExecution(task.getTaskId(), skippedCase.getCaseId(), skipped.getExecutionId(), ExecutionMode.SINGLE));
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = reportGeneration.generateTaskReport(ReportGenerationRequest.forTask(task.getTaskId()));
+
+        assertThat(result.state()).isEqualTo("BASIC_SNAPSHOT");
+        assertThat(result.caseCount()).isEqualTo(7);
+        assertThat(result.executionCount()).isEqualTo(6);
+
+        var report = reports.findById(result.reportId()).orElseThrow();
+        assertThat(report.getCaseCount()).isEqualTo(7);
+        assertThat(report.getPassCount()).isEqualTo(1);
+        assertThat(report.getFailCount()).isEqualTo(1);
+        assertThat(report.getWarningCount()).isEqualTo(1);
+        assertThat(report.getSummary()).contains("passRate=0.1667", "unexecuted=1");
+        assertThat(report.getRiskSummary()).contains("blocking risk", "error=1", "blocked=1", "failed=1");
+
+        @SuppressWarnings("unchecked")
+        var executionSummary = (Map<String, Object>) report.getMetadata().get("executionSummary");
+        assertThat(executionSummary)
+            .containsEntry("total", 7)
+            .containsEntry("executionCount", 6)
+            .containsEntry("passed", 1)
+            .containsEntry("failed", 1)
+            .containsEntry("warning", 1)
+            .containsEntry("error", 1)
+            .containsEntry("blocked", 1)
+            .containsEntry("skipped", 1)
+            .containsEntry("unexecuted", 1)
+            .containsEntry("passRate", "0.1667")
+            .containsEntry("totalDurationMs", 217L);
+        assertThat((List<String>) executionSummary.get("unexecutedCaseIds"))
+            .containsExactly(unexecutedCase.getCaseId());
+        assertThat((List<Map<String, Object>>) executionSummary.get("slowestCases"))
+            .extracting(entry -> entry.get("caseId"))
+            .containsExactly(
+                warningCase.getCaseId(),
+                failedCase.getCaseId(),
+                errorCase.getCaseId(),
+                passedCase.getCaseId(),
+                blockedCase.getCaseId()
+            );
+
+        assertThat((Map<String, Object>) report.getMetadata().get("coverage"))
+            .containsEntry("testedApiSpecIds", List.of("api-blocked", "api-error", "api-fail", "api-pass", "api-skipped", "api-warning"))
+            .containsEntry("untestedApiSpecIds", List.of("api-unexecuted"))
+            .containsEntry("totalTargetApiCount", 7)
+            .containsEntry("testedTargetApiCount", 6)
+            .containsEntry("coverageRate", "0.8571");
+        assertThat((Map<String, Object>) report.getMetadata().get("executionModes"))
+            .containsEntry("SINGLE", 2)
+            .containsEntry("BATCH", 2)
+            .containsEntry("SUITE_STEP", 2);
+        assertThat(report.getFindings()).singleElement()
+            .satisfies(finding -> assertThat(finding)
+                .containsEntry("state", "BASIC_SNAPSHOT")
+                .containsEntry("unexecutedCaseIds", List.of(unexecutedCase.getCaseId())));
     }
 
     @Test
@@ -223,26 +394,48 @@ class ReportGenerationApplicationServiceTests {
     }
 
     private ExecutionRecord newExecutionRecord(String taskId, String caseId, String environment) {
+        return newExecutionRecord(taskId, caseId, environment, "api-create", OverallStatus.PASSED, 42L);
+    }
+
+    private ExecutionRecord newExecutionRecord(
+        String taskId,
+        String caseId,
+        String environment,
+        String apiSpecId,
+        OverallStatus overallStatus,
+        long durationMs
+    ) {
         var record = new ExecutionRecord();
         record.setTaskId(taskId);
         record.setCaseId(caseId);
         record.setExecutorType(ExecutorType.HTTP);
         record.setEnvironment(environment);
-        record.setRequestSnapshot(Map.of("method", "GET", "path", "/api/orders", "apiSpecId", "api-create"));
+        record.setRequestSnapshot(Map.of("method", "GET", "path", "/api/orders", "apiSpecId", apiSpecId));
         record.setResponseSnapshot(Map.of("statusCode", 200));
         record.setAssertionResults(List.of());
-        record.setOverallStatus(OverallStatus.PASSED);
-        record.setCriticalFailed(false);
-        record.setDurationMs(42L);
+        record.setOverallStatus(overallStatus);
+        record.setCriticalFailed(overallStatus == OverallStatus.FAILED
+            || overallStatus == OverallStatus.ERROR
+            || overallStatus == OverallStatus.BLOCKED);
+        record.setDurationMs(durationMs);
         record.setStatusCode(200);
         return record;
     }
 
     private TaskCaseExecution newTaskCaseExecution(String taskId, String caseId, String executionId) {
+        return newTaskCaseExecution(taskId, caseId, executionId, ExecutionMode.SINGLE);
+    }
+
+    private TaskCaseExecution newTaskCaseExecution(
+        String taskId,
+        String caseId,
+        String executionId,
+        ExecutionMode executionMode
+    ) {
         var execution = new TaskCaseExecution();
         execution.setTaskId(taskId);
         execution.setCaseId(caseId);
-        execution.setExecutionMode(ExecutionMode.SINGLE);
+        execution.setExecutionMode(executionMode);
         execution.setExecutionStatus(TaskCaseExecutionStatus.COMPLETED);
         execution.setExecutionRecordId(executionId);
         execution.setSnapshotJson(Map.of("caseId", caseId, "path", "/api/orders"));
