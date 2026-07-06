@@ -1,6 +1,8 @@
 package com.probeflow.testagent.controlledplanner;
 
 import com.probeflow.testagent.orchestration.StepOutcome;
+import com.probeflow.testagent.task.PlanStep;
+import java.util.ArrayList;
 import java.util.List;
 
 public record LastStepOutcomeSnapshot(
@@ -9,7 +11,10 @@ public record LastStepOutcomeSnapshot(
     String summary,
     List<String> resultRefs,
     List<String> blockers,
-    boolean stopOrchestration
+    boolean stopOrchestration,
+    String sourceStepId,
+    String sourceStepType,
+    String sourceStepStatus
 ) {
 
     public LastStepOutcomeSnapshot {
@@ -24,13 +29,20 @@ public record LastStepOutcomeSnapshot(
             .map(LastStepOutcomeSnapshot::clean)
             .filter(value -> value != null)
             .toList();
+        sourceStepId = clean(sourceStepId);
+        sourceStepType = clean(sourceStepType);
+        sourceStepStatus = clean(sourceStepStatus);
     }
 
     public static LastStepOutcomeSnapshot none() {
-        return new LastStepOutcomeSnapshot(null, null, "", List.of(), List.of(), false);
+        return new LastStepOutcomeSnapshot(null, null, "", List.of(), List.of(), false, null, null, null);
     }
 
     public static LastStepOutcomeSnapshot from(StepOutcome outcome) {
+        return from(outcome, null);
+    }
+
+    public static LastStepOutcomeSnapshot from(StepOutcome outcome, PlanStep sourceStep) {
         if (outcome == null) {
             return none();
         }
@@ -38,14 +50,27 @@ public record LastStepOutcomeSnapshot(
             outcome.stepStatus().name(),
             outcome.taskStatus() == null ? null : outcome.taskStatus().name(),
             outcome.summary(),
-            outcome.resultRefs(),
+            resultRefs(outcome),
             outcome.blockerDetails(),
-            outcome.stopOrchestration()
+            outcome.stopOrchestration(),
+            sourceStep == null ? null : sourceStep.getStepId(),
+            sourceStep == null || sourceStep.getStepType() == null ? null : sourceStep.getStepType().name(),
+            sourceStep == null || sourceStep.getStepStatus() == null ? null : sourceStep.getStepStatus().name()
         );
     }
 
     public boolean hasBlockers() {
         return !blockers.isEmpty();
+    }
+
+    private static List<String> resultRefs(StepOutcome outcome) {
+        var refs = new ArrayList<String>();
+        refs.addAll(outcome.resultRefs());
+        var resultRef = clean(outcome.resultRef());
+        if (resultRef != null) {
+            refs.add(resultRef);
+        }
+        return refs;
     }
 
     private static String clean(String value) {

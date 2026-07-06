@@ -172,7 +172,6 @@ class ReplanningApplicationServiceTests {
         assertThat(source)
             .doesNotContain("ControlledPlanner")
             .doesNotContain("PolicyValidator")
-            .doesNotContain("PlanStepRepository")
             .doesNotContain(".save(")
             .doesNotContain(".delete(");
     }

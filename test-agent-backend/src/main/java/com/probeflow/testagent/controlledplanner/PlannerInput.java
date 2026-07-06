@@ -69,6 +69,9 @@ public record PlannerInput(
             + "|" + currentPhase
             + "|" + workflowMode
             + "|" + lastStepOutcome.stepStatus()
+            + "|" + lastStepOutcome.sourceStepId()
+            + "|" + lastStepOutcome.sourceStepType()
+            + "|" + lastStepOutcome.sourceStepStatus()
             + "|" + lastStepOutcome.summary()
             + "|" + contextSummary.citationRefs()
             + "|" + tools.stream().map(PlannerSafeToolView::name).sorted().toList();

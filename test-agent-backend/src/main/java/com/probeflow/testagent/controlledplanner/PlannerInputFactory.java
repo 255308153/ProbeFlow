@@ -21,7 +21,7 @@ public class PlannerInputFactory {
             request.taskState(),
             policy.taskPhase(),
             policy.workflowMode(),
-            LastStepOutcomeSnapshot.from(request.lastStepOutcome()),
+            LastStepOutcomeSnapshot.from(request.lastStepOutcome(), request.lastStep()),
             request.contextSummary(),
             toolCatalog.listForPlanner(policy),
             request.constraints()

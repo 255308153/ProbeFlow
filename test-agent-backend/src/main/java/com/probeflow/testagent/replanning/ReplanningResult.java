@@ -31,11 +31,15 @@ public record ReplanningResult(
     }
 
     public static ReplanningResult noop(ReplanningTrigger trigger, String reason) {
+        return noop(trigger, reason, Map.of());
+    }
+
+    public static ReplanningResult noop(ReplanningTrigger trigger, String reason, Map<String, Object> decisionDetails) {
         return new ReplanningResult(
             ReplanningStatus.NOOP,
             trigger,
             List.of(),
-            summary("plannerCalled", false, "reason", reason),
+            decisionSummary(reason, decisionDetails),
             summary("policyValidated", false, "reason", "Policy validation is not part of the minimal replanning entrypoint."),
             summary("mutationApplied", false, "reason", "No plan mutation was requested."),
             List.of(),
@@ -73,6 +77,16 @@ public record ReplanningResult(
         var summary = new LinkedHashMap<String, Object>();
         summary.put(firstKey, firstValue);
         summary.put(secondKey, secondValue);
+        return Map.copyOf(summary);
+    }
+
+    private static Map<String, Object> decisionSummary(String reason, Map<String, Object> decisionDetails) {
+        var summary = new LinkedHashMap<String, Object>();
+        summary.put("plannerCalled", false);
+        summary.put("reason", reason);
+        if (decisionDetails != null) {
+            summary.putAll(decisionDetails);
+        }
         return Map.copyOf(summary);
     }
 
