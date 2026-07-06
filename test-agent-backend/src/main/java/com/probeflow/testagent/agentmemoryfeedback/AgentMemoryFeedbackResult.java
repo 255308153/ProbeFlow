@@ -19,8 +19,12 @@ public record AgentMemoryFeedbackResult(
     }
 
     public static AgentMemoryFeedbackResult pending(MemoryCandidateRecord record) {
+        return fromRecord(record);
+    }
+
+    public static AgentMemoryFeedbackResult fromRecord(MemoryCandidateRecord record) {
         return new AgentMemoryFeedbackResult(
-            MemoryCandidateProcessingStatus.PENDING,
+            record.getStatus(),
             record.getCandidateId(),
             record.getMemoryId(),
             record.getRejectionReason(),
