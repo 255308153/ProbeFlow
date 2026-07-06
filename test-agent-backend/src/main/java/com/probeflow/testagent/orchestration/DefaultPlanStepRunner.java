@@ -144,6 +144,13 @@ public class DefaultPlanStepRunner implements PlanStepRunner {
                 promotion.promotedCaseIds()
             );
         }
+        if (task.getPromotionMode() == PromotionMode.MANUAL) {
+            putMetadata(task, "createdDraftIds", result.createdDraftIds());
+            return StepOutcome.paused(
+                com.probeflow.testagent.task.TaskStatus.WAITING_FOR_REVIEW,
+                "Waiting for manual review of " + result.createdDraftIds().size() + " generated draft(s)"
+            );
+        }
         return StepOutcome.succeeded(
             "Test case generation completed; drafts=" + result.createdDraftIds().size() + " warnings=" + result.warnings().size(),
             result.createdDraftIds()

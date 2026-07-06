@@ -9,6 +9,7 @@ import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.task.TaskStatus;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -20,15 +21,18 @@ public class TaskOrchestrationApplicationService {
     private final TaskRepository tasks;
     private final PlanStepRepository planSteps;
     private final PlanStepRunner planStepRunner;
+    private final ManualReviewGate manualReviewGate;
 
     public TaskOrchestrationApplicationService(
         TaskRepository tasks,
         PlanStepRepository planSteps,
-        PlanStepRunner planStepRunner
+        PlanStepRunner planStepRunner,
+        ManualReviewGate manualReviewGate
     ) {
         this.tasks = tasks;
         this.planSteps = planSteps;
         this.planStepRunner = planStepRunner;
+        this.manualReviewGate = manualReviewGate;
     }
 
     @Transactional
@@ -51,6 +55,16 @@ public class TaskOrchestrationApplicationService {
             task.setStatus(TaskStatus.FAILED);
             tasks.save(task);
             return result(task, orderedSteps, reportId, blockers);
+        }
+        if (task.getStatus() == TaskStatus.WAITING_FOR_REVIEW) {
+            var reviewGate = manualReviewGate.evaluate(task);
+            if (!reviewGate.ready()) {
+                blockers.addAll(reviewGate.blockerDetails());
+                return result(task, orderedSteps, reportId, blockers);
+            }
+            applyReviewGate(task, reviewGate);
+            task.setStatus(TaskStatus.CASE_GENERATED);
+            tasks.save(task);
         }
 
         for (int i = 0; i < orderedSteps.size(); i++) {
@@ -139,6 +153,16 @@ public class TaskOrchestrationApplicationService {
                 planSteps.save(step);
             }
         }
+    }
+
+    private void applyReviewGate(Task task, ManualReviewGateResult reviewGate) {
+        var metadata = task.getMetadata() == null
+            ? new LinkedHashMap<String, Object>()
+            : new LinkedHashMap<>(task.getMetadata());
+        metadata.put("selectedCaseIds", reviewGate.promotedCaseIds());
+        metadata.put("promotedCaseIds", reviewGate.promotedCaseIds());
+        metadata.put("discardedDraftIds", reviewGate.discardedDraftIds());
+        task.setMetadata(metadata);
     }
 
     private TaskOrchestrationResult result(
