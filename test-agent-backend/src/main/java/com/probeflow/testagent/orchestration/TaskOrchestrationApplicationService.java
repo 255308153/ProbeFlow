@@ -44,7 +44,7 @@ public class TaskOrchestrationApplicationService {
             .orElseThrow(() -> new IllegalArgumentException("Task not found: " + taskId));
         var blockers = new ArrayList<String>();
         var orderedSteps = planSteps.findByTaskIdOrderByStepOrderAsc(task.getTaskId());
-        String reportId = null;
+        String reportId = metadataString(task, "reportId");
 
         if (task.getStatus() == TaskStatus.CANCELLED) {
             blockers.add("Task is cancelled");
@@ -89,6 +89,9 @@ public class TaskOrchestrationApplicationService {
             var outcome = runStep(task, step);
             if (step.getStepType() == PlanStepType.GENERATE_REPORT && !outcome.resultRefs().isEmpty()) {
                 reportId = outcome.resultRefs().getFirst();
+                task = tasks.findById(task.getTaskId()).orElseThrow();
+                putMetadata(task, "reportId", reportId);
+                tasks.save(task);
             }
             blockers.addAll(outcome.blockerDetails());
             if (outcome.stepStatus() == PlanStepStatus.FAILED) {
@@ -162,6 +165,19 @@ public class TaskOrchestrationApplicationService {
         metadata.put("selectedCaseIds", reviewGate.promotedCaseIds());
         metadata.put("promotedCaseIds", reviewGate.promotedCaseIds());
         metadata.put("discardedDraftIds", reviewGate.discardedDraftIds());
+        task.setMetadata(metadata);
+    }
+
+    private String metadataString(Task task, String key) {
+        var value = task.getMetadata() == null ? null : task.getMetadata().get(key);
+        return value == null || !StringUtils.hasText(value.toString()) ? null : value.toString();
+    }
+
+    private void putMetadata(Task task, String key, Object value) {
+        var metadata = task.getMetadata() == null
+            ? new LinkedHashMap<String, Object>()
+            : new LinkedHashMap<>(task.getMetadata());
+        metadata.put(key, value);
         task.setMetadata(metadata);
     }
 
