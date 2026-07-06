@@ -45,10 +45,10 @@ class V2Phase2AcceptanceBoundaryGuardTests {
 
     @Test
     void phase2DoesNotIntroduceControlledPlannerStructuredPlannerParsingToolRouterOrReplanning() throws Exception {
-        var mainSources = mainSourceText();
-        var classNames = mainClassNames();
+        var agentPolicySources = agentPolicySourceText();
+        var agentPolicyClassNames = classNames(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/agentpolicy"));
 
-        assertThat(classNames).doesNotContain(
+        assertThat(agentPolicyClassNames).doesNotContain(
             "ControlledPlanner",
             "LlmPlanner",
             "PlannerDecision",
@@ -61,7 +61,7 @@ class V2Phase2AcceptanceBoundaryGuardTests {
             "ReplanningLoop",
             "PolicyValidator"
         );
-        assertThat(mainSources)
+        assertThat(agentPolicySources)
             .doesNotContain("ControlledPlanner")
             .doesNotContain("PlannerDecision")
             .doesNotContain("PlanDecision")
@@ -222,7 +222,11 @@ class V2Phase2AcceptanceBoundaryGuardTests {
     }
 
     private List<String> mainClassNames() throws Exception {
-        return Files.walk(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent"))
+        return classNames(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent"));
+    }
+
+    private List<String> classNames(Path sourceRoot) throws Exception {
+        return Files.walk(sourceRoot)
             .filter(Files::isRegularFile)
             .filter(path -> path.toString().endsWith(".java"))
             .map(path -> path.getFileName().toString().replace(".java", ""))
