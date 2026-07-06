@@ -53,6 +53,7 @@ class Phase1BoundaryGuardTests {
             "memory",
             "observation",
             "orchestration",
+            "policyvalidator",
             "report",
             "sourcematerial",
             "task",

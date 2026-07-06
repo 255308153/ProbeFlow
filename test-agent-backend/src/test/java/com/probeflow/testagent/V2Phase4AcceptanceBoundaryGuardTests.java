@@ -2,7 +2,11 @@ package com.probeflow.testagent;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.probeflow.testagent.agentpolicy.AgentPolicy;
+import com.probeflow.testagent.agentpolicy.AgentPolicyService;
 import com.probeflow.testagent.agentpolicy.ToolContractRegistry;
+import com.probeflow.testagent.agentpolicy.ToolPolicyReasonCode;
+import com.probeflow.testagent.agentpolicy.ToolPolicyStatus;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -10,78 +14,44 @@ import java.util.Locale;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.Test;
 
-class V2Phase3AcceptanceBoundaryGuardTests {
+class V2Phase4AcceptanceBoundaryGuardTests {
 
     private static final Path PROJECT_ROOT = Path.of("").toAbsolutePath();
 
     @Test
-    void phase3AcceptanceIsCoveredThroughControlledPlannerSeams() throws Exception {
-        var plannerSources = controlledPlannerSourceText();
-        var plannerTests = sourceText(PROJECT_ROOT.resolve("src/test/java/com/probeflow/testagent/controlledplanner"));
-        var templates = Files.readString(PROJECT_ROOT.resolve(
-            "src/main/java/com/probeflow/testagent/llm/PromptTemplateRegistry.java"
-        ));
+    void phase4AcceptanceIsCoveredThroughPolicyValidatorServiceSeams() throws Exception {
+        var policyValidatorSources = policyValidatorSourceText();
+        var policyValidatorTests = sourceText(PROJECT_ROOT.resolve("src/test/java/com/probeflow/testagent/policyvalidator"));
 
-        assertThat(plannerSources)
-            .contains("enum PlannerAction")
-            .contains("record PlanDecision")
-            .contains("record PlannerInput")
-            .contains("class FakeControlledPlanner")
-            .contains("class ControlledPlannerService")
-            .contains("class LlmBackedControlledPlanner")
-            .contains("class PlanDecisionParser")
-            .contains("WAIT_FOR_HUMAN")
-            .contains("INSERT_STEP")
-            .contains("REPLAN");
-        assertThat(templates)
-            .contains("v2.controlled-planner.v1")
-            .contains("CONTROLLED_PLANNER");
-        assertThat(plannerTests)
-            .contains("PlanDecisionDomainModelTests")
-            .contains("PlannerInputFactoryTests")
-            .contains("FakeControlledPlannerTests")
-            .contains("ControlledPlannerServiceTests")
-            .contains("LlmBackedControlledPlannerTests")
-            .contains("PlanDecisionParserTests")
-            .contains("PlannerSafeBoundaryNonExecutionTests");
+        assertThat(policyValidatorSources)
+            .contains("enum PolicyValidationStatus")
+            .contains("enum PolicyValidationReasonCode")
+            .contains("record PolicyValidationRequest")
+            .contains("record PolicyValidationResult")
+            .contains("class PolicyValidatorService")
+            .contains("ALLOWED")
+            .contains("REQUIRES_HUMAN_CONFIRMATION")
+            .contains("BLOCKED")
+            .contains("V1_BOUNDARY_BLOCKED")
+            .contains("MISSING_FAILURE_SIGNAL");
+        assertThat(policyValidatorTests)
+            .contains("PolicyValidationResultContractTests")
+            .contains("PolicyValidatorDecisionSafetyTests")
+            .contains("PolicyValidatorToolPolicyValidationTests")
+            .contains("PolicyValidatorHumanConfirmationGateTests")
+            .contains("PolicyValidatorV1BoundaryTests")
+            .contains("PolicyValidatorTaskOrderPreconditionTests")
+            .contains("PolicyValidatorServiceEndToEndCompositionTests");
     }
 
     @Test
-    void phase3DoesNotIntroducePolicyValidatorOrPlannerDecisionPersistence() throws Exception {
-        var classNames = classNames(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/controlledplanner"));
-        var plannerSources = controlledPlannerSourceText();
-        var migrations = sourceText(PROJECT_ROOT.resolve("src/main/resources/db/migration"));
-
-        assertThat(classNames).doesNotContain(
-            "PolicyValidator",
-            "PlanDecisionPolicyValidator",
-            "PlannerPolicyValidator",
-            "PlanDecisionRepository",
-            "PlannerDecisionRepository",
-            "PlanDecisionEntity",
-            "PlannerDecisionEntity",
-            "PlanDecisionJpaRepository",
-            "PlannerDecisionJpaRepository"
-        );
-        assertThat(plannerSources)
-            .doesNotContain("@Entity")
-            .doesNotContain("JpaRepository")
-            .doesNotContain("CrudRepository")
-            .doesNotContain("Repository");
-        assertThat(migrations.toLowerCase(Locale.ROOT))
-            .doesNotContain("planner_decision")
-            .doesNotContain("plan_decision")
-            .doesNotContain("policy_validator");
-    }
-
-    @Test
-    void phase3DoesNotIntroduceToolRouterExecutionOrChangeDefaultTaskOrchestrationFlow() throws Exception {
-        var plannerSources = controlledPlannerSourceText();
+    void policyValidatorDoesNotIntroduceToolRouterExecutionAgentLoopOrTaskOrchestrationIntegration() throws Exception {
+        var policyValidatorSources = policyValidatorSourceText();
         var orchestrationSource = Files.readString(PROJECT_ROOT.resolve(
             "src/main/java/com/probeflow/testagent/orchestration/TaskOrchestrationApplicationService.java"
         ));
 
-        assertThat(plannerSources)
+        assertThat(policyValidatorSources)
             .doesNotContain("ToolRouter")
             .doesNotContain("ToolExecutor")
             .doesNotContain("ToolInvocation")
@@ -90,33 +60,45 @@ class V2Phase3AcceptanceBoundaryGuardTests {
             .doesNotContain("TaskOrchestrationApplicationService")
             .doesNotContain("TaskRepository")
             .doesNotContain("PlanStepRepository")
+            .doesNotContain("TestCaseRepository")
+            .doesNotContain("ExecutionRecordRepository")
+            .doesNotContain("ObservationRepository")
+            .doesNotContain("EntityManager")
+            .doesNotContain("DataSource")
             .doesNotContain(".save(")
             .doesNotContain(".delete(");
         assertThat(orchestrationSource)
-            .doesNotContain("ControlledPlanner")
-            .doesNotContain("PlanDecision")
-            .doesNotContain("PlannerInput")
-            .doesNotContain("LlmBackedControlledPlanner")
-            .doesNotContain("FakeControlledPlanner");
+            .doesNotContain("PolicyValidatorService")
+            .doesNotContain("PolicyValidationRequest")
+            .doesNotContain("PolicyValidationResult")
+            .doesNotContain("PolicyValidationStatus");
     }
 
     @Test
-    void phase3DoesNotIntroduceReplanningLoopHitlWorkflowMemoryFeedbackEvaluationRestFrontendQueueWorkerOrExternalIntegrations()
+    void phase4DoesNotImplementReplanningLoopHumanWorkflowEvaluationRestFrontendQueueWorkerOrExternalIntegrations()
         throws Exception {
-        var classNames = mainClassNames();
-        var mainSources = sourceText(PROJECT_ROOT.resolve("src/main/java"));
+        var mainSources = mainSourceText();
         var pom = Files.readString(PROJECT_ROOT.resolve("pom.xml"));
+        var classNames = mainClassNames();
         var controllerAnnotations = mainSources.lines()
             .map(String::trim)
             .filter(line -> line.startsWith("@RestController") || line.startsWith("@Controller"))
             .toList();
 
         assertThat(classNames).doesNotContain(
+            "ToolRouter",
+            "ToolExecutor",
+            "ToolInvocation",
             "ReplanningLoop",
             "PlanReplanningLoop",
+            "AgentLoop",
+            "AgentLoopRunner",
             "HumanInTheLoopWorkflow",
             "HumanApprovalWorkflow",
-            "AgentMemoryFeedbackLoop",
+            "UserApprovalService",
+            "TeamApprovalService",
+            "PermissionService",
+            "ApprovalFlowService",
             "AgentEvaluationService",
             "AgentEvaluator",
             "AgentEvaluationHarness",
@@ -127,9 +109,11 @@ class V2Phase3AcceptanceBoundaryGuardTests {
             "GithubTicketPublisher",
             "JiraTicketPublisher",
             "SlackNotificationPublisher",
+            "EmailNotificationPublisher",
             "WebhookPublisher",
-            "McpToolGateway",
-            "PluginMarketplace"
+            "CiPipelineRunner",
+            "BrowserAutomationRunner",
+            "UiAutomationRunner"
         );
         assertThat(controllerAnnotations).isEmpty();
         assertThat(Files.exists(PROJECT_ROOT.resolve("src/main/resources/static"))).isFalse();
@@ -140,7 +124,11 @@ class V2Phase3AcceptanceBoundaryGuardTests {
             .doesNotContain("GitHubIssue")
             .doesNotContain("JiraClient")
             .doesNotContain("SlackClient")
+            .doesNotContain("MailSender")
             .doesNotContain("WebhookClient")
+            .doesNotContain("WebDriver")
+            .doesNotContain("Playwright")
+            .doesNotContain("Selenium")
             .doesNotContain("ProcessBuilder")
             .doesNotContain("pytest");
         assertThat(presentTerms(pom, List.of(
@@ -157,13 +145,17 @@ class V2Phase3AcceptanceBoundaryGuardTests {
             "mailgun",
             "mcp",
             "python",
-            "pytest"
+            "pytest",
+            "playwright",
+            "selenium"
         ))).isEmpty();
     }
 
     @Test
-    void registeredToolCatalogStillDoesNotContainExternalMcpPluginTicketCiOrUiTools() {
-        var names = new ToolContractRegistry().listAll().stream()
+    void registeredToolsStillStayWithinBackendApiTestingBoundaryAndForbiddenCategoriesAreBlocked() {
+        var registry = new ToolContractRegistry();
+        var policyService = new AgentPolicyService(registry);
+        var names = registry.listAll().stream()
             .map(contract -> contract.name().value())
             .toList();
 
@@ -172,6 +164,7 @@ class V2Phase3AcceptanceBoundaryGuardTests {
             "knowledge.retrieve-context",
             "memory.build-context",
             "testcase.generate-drafts",
+            "testcase.review-draft",
             "http.execute-approved-case",
             "failure.analyze-execution",
             "report.generate-task"
@@ -190,13 +183,33 @@ class V2Phase3AcceptanceBoundaryGuardTests {
                 || name.startsWith("db.")
                 || name.startsWith("service.")
         );
+
+        for (var toolName : List.of(
+            "ui.run-automation",
+            "browser.run-playwright",
+            "service.direct-call",
+            "db.direct-assertion",
+            "notify.external-message",
+            "github.create-issue",
+            "jira.create-ticket",
+            "slack.post-message",
+            "webhook.send-event",
+            "ci.run-pipeline",
+            "mcp.invoke-tool",
+            "plugin.install-marketplace"
+        )) {
+            var decision = policyService.evaluate(toolName, AgentPolicy.v2Phase2Default());
+
+            assertThat(decision.status()).as(toolName).isEqualTo(ToolPolicyStatus.BLOCKED);
+            assertThat(decision.reasonCode()).as(toolName).isEqualTo(ToolPolicyReasonCode.V1_BOUNDARY_BLOCKED);
+        }
     }
 
     @Test
     void realLlmStillIsNotRequiredForCi() throws Exception {
         var testConfig = Files.readString(PROJECT_ROOT.resolve("src/test/resources/application-test.yml"));
         var pom = Files.readString(PROJECT_ROOT.resolve("pom.xml"));
-        var mainSources = sourceText(PROJECT_ROOT.resolve("src/main/java"));
+        var mainSources = mainSourceText();
 
         assertThat(testConfig)
             .contains("allow-real-providers: false")
@@ -233,8 +246,12 @@ class V2Phase3AcceptanceBoundaryGuardTests {
         }
     }
 
-    private String controlledPlannerSourceText() throws Exception {
-        return sourceText(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/controlledplanner"));
+    private String policyValidatorSourceText() throws Exception {
+        return sourceText(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/policyvalidator"));
+    }
+
+    private String mainSourceText() throws Exception {
+        return sourceText(PROJECT_ROOT.resolve("src/main/java"));
     }
 
     private String sourceText(Path sourceRoot) throws Exception {
