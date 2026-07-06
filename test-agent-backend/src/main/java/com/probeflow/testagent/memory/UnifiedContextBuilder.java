@@ -34,6 +34,7 @@ public class UnifiedContextBuilder {
     private final TaskMemoryService taskMemoryService;
     private final KnowledgeRetrievalApplicationService knowledgeRetrieval;
     private final LongTermMemoryRetrievalService longTermMemoryRetrieval;
+    private final MemoryUsageRecordingService memoryUsageRecording;
 
     public UnifiedContextBuilder(
         TaskRepository tasks,
@@ -41,7 +42,8 @@ public class UnifiedContextBuilder {
         SessionMemoryService sessionMemoryService,
         TaskMemoryService taskMemoryService,
         KnowledgeRetrievalApplicationService knowledgeRetrieval,
-        LongTermMemoryRetrievalService longTermMemoryRetrieval
+        LongTermMemoryRetrievalService longTermMemoryRetrieval,
+        MemoryUsageRecordingService memoryUsageRecording
     ) {
         this.tasks = tasks;
         this.apiSpecs = apiSpecs;
@@ -49,6 +51,7 @@ public class UnifiedContextBuilder {
         this.taskMemoryService = taskMemoryService;
         this.knowledgeRetrieval = knowledgeRetrieval;
         this.longTermMemoryRetrieval = longTermMemoryRetrieval;
+        this.memoryUsageRecording = memoryUsageRecording;
     }
 
     @Transactional
@@ -72,6 +75,7 @@ public class UnifiedContextBuilder {
             pruned.knowledge(),
             pruned.longTermMemory()
         );
+        memoryUsageRecording.recordLongTermMemoryUsage(normalized, pruned.longTermMemory(), citations);
         var conflicts = detectConflicts(knowledge, taskMemory, longTermMemory, normalized);
         var budget = buildBudget(
             normalized.tokenBudget(),
@@ -647,8 +651,20 @@ public class UnifiedContextBuilder {
             normalizeNullable(query.apiPath()),
             normalizeNullable(query.errorCode()),
             normalizeTags(query.tags()),
-            query.tokenBudget() == null ? DEFAULT_TOKEN_BUDGET : query.tokenBudget()
+            query.tokenBudget() == null ? DEFAULT_TOKEN_BUDGET : query.tokenBudget(),
+            query.consumer() == null ? inferConsumer(query.stageProfile()) : query.consumer(),
+            normalizeNullable(query.usageSourceRef())
         );
+    }
+
+    private MemoryUsageConsumer inferConsumer(String stageProfile) {
+        return switch (normalizeStage(stageProfile)) {
+            case "case_generation" -> MemoryUsageConsumer.TEST_CASE_GENERATION;
+            case "failure_analysis" -> MemoryUsageConsumer.FAILURE_ANALYSIS;
+            case "execution_preparation" -> MemoryUsageConsumer.PLANNER;
+            case "report_generation" -> MemoryUsageConsumer.REPORT_GENERATION;
+            default -> MemoryUsageConsumer.CONTEXT_BUILDER;
+        };
     }
 
     private List<String> normalizeTags(List<String> tags) {

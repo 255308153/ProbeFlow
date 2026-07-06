@@ -54,6 +54,9 @@ class UnifiedContextBuilderTests {
     @Autowired
     private MemoryRefineryService memoryRefineryService;
 
+    @Autowired
+    private MemoryUsageRecordRepository usageRecords;
+
     @Test
     void buildsSectionedContextBundleFromAllAvailableSources() {
         var apiSpec = apiSpecs.save(newApiSpec("/api/orders/{orderId}/pay", HttpMethod.POST));
@@ -395,6 +398,258 @@ class UnifiedContextBuilderTests {
         assertThat(bundle.budget().pruned()).isTrue();
         assertThat(bundle.budget().originalEstimatedTokens()).isGreaterThan(bundle.budget().totalEstimatedTokens());
         assertThat(bundle.budget().totalEstimatedTokens()).isLessThanOrEqualTo(bundle.budget().requestedTokenBudget());
+    }
+
+    @Test
+    void recordsLongTermMemoryUsageForContextCitationsAndConsumer() {
+        var apiSpec = apiSpecs.save(newApiSpec("/api/orders/{orderId}/pay", HttpMethod.POST));
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var refined = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Tenant bootstrap prevents PAY_401",
+            "Bootstrap tenant context before auth checks to avoid PAY_401 during payment execution.",
+            MemorySourceType.OBSERVATION,
+            "ltm-usage-1",
+            task.getTaskId(),
+            List.of("payment", "auth", "tenant"),
+            0.92f,
+            "Observed PAY_401 disappears after tenant bootstrap.",
+            Map.of(
+                "systemName", "order-platform",
+                "module", "payment",
+                "apiPath", "/api/orders/{orderId}/pay",
+                "errorCode", "PAY_401"
+            )
+        ));
+
+        var query = new UnifiedContextQuery(
+            task.getTaskId(),
+            null,
+            apiSpec.getApiSpecId(),
+            null,
+            "failure_analysis",
+            "payment auth failure and tenant bootstrap",
+            null,
+            null,
+            null,
+            "PAY_401",
+            List.of("payment", "auth", "tenant"),
+            400,
+            MemoryUsageConsumer.PLANNER,
+            "planner:context-input-1"
+        );
+        var bundle = unifiedContextBuilder.build(query);
+        var citation = bundle.citations().stream()
+            .filter(item -> "long_term_memory".equals(item.citationType()))
+            .findFirst()
+            .orElseThrow();
+        var firstRecords = usageRecords.findAllByTaskIdOrderByCreatedAtAscUsageIdAsc(task.getTaskId());
+
+        assertThat(citation.sourceId()).isEqualTo(refined.memory().memoryId());
+        assertThat(firstRecords).hasSize(1);
+        var usage = firstRecords.getFirst();
+        assertThat(usage.getMemoryId()).isEqualTo(refined.memory().memoryId());
+        assertThat(usage.getTaskId()).isEqualTo(task.getTaskId());
+        assertThat(usage.getStageProfile()).isEqualTo("failure_analysis");
+        assertThat(usage.getConsumer()).isEqualTo(MemoryUsageConsumer.PLANNER);
+        assertThat(usage.getSourceRef()).isEqualTo("planner:context-input-1");
+        assertThat(usage.getCitationType()).isEqualTo("long_term_memory");
+        assertThat(usage.getCitationSourceId()).isEqualTo(citation.sourceId());
+        assertThat(usage.getCitationSourceRef()).isEqualTo("ltm-usage-1");
+        assertThat(usage.getScore()).isEqualTo(citation.score());
+        assertThat(usage.getConfidence()).isEqualTo(refined.memory().confidence());
+        assertThat(usage.getLowConfidence()).isEqualTo(bundle.longTermMemoryContext().hits().getFirst().lowConfidence());
+        assertThat(usage.getMatchReasons()).contains("structure-match", "tag-match", "stage-fit");
+        assertThat(usage.getMetadata())
+            .containsEntry("memoryScopeType", MemoryScopeType.FAILURE_PATTERN.name())
+            .containsEntry("memorySourceType", MemorySourceType.OBSERVATION.name())
+            .containsEntry("apiSpecId", apiSpec.getApiSpecId())
+            .containsEntry("errorCode", "PAY_401");
+
+        unifiedContextBuilder.build(query);
+        assertThat(usageRecords.findAllByTaskIdOrderByCreatedAtAscUsageIdAsc(task.getTaskId()))
+            .hasSize(2)
+            .extracting(MemoryUsageRecord::getUsageId)
+            .doesNotHaveDuplicates();
+    }
+
+    @Test
+    void archivedAndInactiveMemoriesDoNotProduceUsageRecords() {
+        var apiSpec = apiSpecs.save(newApiSpec("/api/orders/{orderId}/pay", HttpMethod.POST));
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var archived = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Archived PAY_401 hint",
+            "Archived tenant bootstrap hint should not be recalled.",
+            MemorySourceType.OBSERVATION,
+            "ltm-usage-archived",
+            task.getTaskId(),
+            List.of("payment", "auth", "tenant"),
+            0.92f,
+            "Archived evidence.",
+            Map.of(
+                "systemName", "order-platform",
+                "module", "payment",
+                "apiPath", "/api/orders/{orderId}/pay",
+                "errorCode", "PAY_401"
+            )
+        ));
+        memoryRefineryService.archiveMemory(archived.memory().memoryId());
+        var inactive = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Inactive PAY_401 hint",
+            "Inactive tenant bootstrap hint should not be recalled.",
+            MemorySourceType.OBSERVATION,
+            "ltm-usage-inactive",
+            task.getTaskId(),
+            List.of("payment", "auth", "tenant"),
+            0.91f,
+            "Inactive evidence.",
+            Map.of(
+                "systemName", "order-platform",
+                "module", "payment",
+                "apiPath", "/api/orders/{orderId}/pay",
+                "errorCode", "PAY_401"
+            )
+        ));
+        memoryRefineryService.deactivateMemory(inactive.memory().memoryId());
+
+        var bundle = unifiedContextBuilder.build(new UnifiedContextQuery(
+            task.getTaskId(),
+            null,
+            apiSpec.getApiSpecId(),
+            null,
+            "failure_analysis",
+            "payment auth failure and tenant bootstrap",
+            null,
+            null,
+            null,
+            "PAY_401",
+            List.of("payment", "auth", "tenant"),
+            400,
+            MemoryUsageConsumer.FAILURE_ANALYSIS,
+            "failure-analysis:context-input-1"
+        ));
+
+        assertThat(bundle.longTermMemoryContext().hits()).isEmpty();
+        assertThat(bundle.citations()).noneMatch(citation -> "long_term_memory".equals(citation.citationType()));
+        assertThat(usageRecords.findAllByTaskIdOrderByCreatedAtAscUsageIdAsc(task.getTaskId())).isEmpty();
+    }
+
+    @Test
+    void infersUsageConsumerFromStageProfileWhenConsumerIsNotProvided() {
+        var apiSpec = apiSpecs.save(newApiSpec("/api/orders/{orderId}/pay", HttpMethod.POST));
+        var failureTask = tasks.save(newTask(apiSpec.getApiSpecId()));
+        memoryRefineryService.refine(new MemoryCandidateRequest(
+            "PAY_401 failure analysis memory",
+            "PAY_401 failure analysis should check tenant bootstrap before auth.",
+            MemorySourceType.OBSERVATION,
+            "ltm-usage-infer-failure",
+            failureTask.getTaskId(),
+            List.of("payment", "auth", "tenant"),
+            0.92f,
+            "Observed PAY_401 failure analysis pattern.",
+            Map.of(
+                "systemName", "order-platform",
+                "module", "payment",
+                "apiPath", "/api/orders/{orderId}/pay",
+                "errorCode", "PAY_401"
+            )
+        ));
+
+        unifiedContextBuilder.build(new UnifiedContextQuery(
+            failureTask.getTaskId(),
+            null,
+            apiSpec.getApiSpecId(),
+            null,
+            "failure_analysis",
+            "payment auth failure and tenant bootstrap",
+            null,
+            null,
+            null,
+            "PAY_401",
+            List.of("payment", "auth", "tenant"),
+            400
+        ));
+
+        var caseTask = tasks.save(newTask(apiSpec.getApiSpecId()));
+        memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Payment case generation checklist",
+            "Test case generation should assert idempotency key and tenant bootstrap preconditions.",
+            MemorySourceType.MANUAL,
+            "ltm-usage-infer-case-generation",
+            caseTask.getTaskId(),
+            List.of("payment", "case_generation", "precondition"),
+            0.9f,
+            "Human-approved checklist for payment test case generation.",
+            Map.of(
+                "systemName", "order-platform",
+                "module", "payment",
+                "apiPath", "/api/orders/{orderId}/pay"
+            )
+        ));
+
+        unifiedContextBuilder.build(new UnifiedContextQuery(
+            caseTask.getTaskId(),
+            null,
+            apiSpec.getApiSpecId(),
+            null,
+            "case_generation",
+            "payment test case generation checklist",
+            null,
+            null,
+            null,
+            null,
+            List.of("payment", "case_generation", "precondition"),
+            400
+        ));
+
+        var failureUsage = usageRecords.findAllByTaskIdOrderByCreatedAtAscUsageIdAsc(failureTask.getTaskId()).getFirst();
+        var caseUsage = usageRecords.findAllByTaskIdOrderByCreatedAtAscUsageIdAsc(caseTask.getTaskId()).getFirst();
+        assertThat(failureUsage.getConsumer()).isEqualTo(MemoryUsageConsumer.FAILURE_ANALYSIS);
+        assertThat(failureUsage.getSourceRef()).startsWith("context-build:" + failureTask.getTaskId() + ":failure_analysis:");
+        assertThat(caseUsage.getConsumer()).isEqualTo(MemoryUsageConsumer.TEST_CASE_GENERATION);
+        assertThat(caseUsage.getSourceRef()).startsWith("context-build:" + caseTask.getTaskId() + ":case_generation:");
+    }
+
+    @Test
+    void usageRecordPreservesLowConfidenceMarkerFromRecalledMemory() {
+        var task = tasks.save(newTask("direct-low-confidence-api"));
+        var apiSpec = newApiSpec("/api/low-confidence", HttpMethod.GET);
+        apiSpec.setSystemName(null);
+        apiSpec.setModuleName(null);
+        apiSpec.setPath(null);
+        var refined = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Obscure naming reminder",
+            "General naming note with little overlap to the next query.",
+            MemorySourceType.MANUAL,
+            "ltm-usage-low-confidence",
+            task.getTaskId(),
+            List.of(),
+            0.56f,
+            "Low confidence manual note.",
+            Map.of()
+        ));
+
+        var bundle = unifiedContextBuilder.build(new UnifiedContextQuery(
+            task.getTaskId(),
+            null,
+            null,
+            apiSpec,
+            "general",
+            "zirconium alkali unrelated query",
+            null,
+            null,
+            null,
+            null,
+            List.of(),
+            400,
+            MemoryUsageConsumer.CONTEXT_BUILDER,
+            "context-builder:low-confidence"
+        ));
+
+        assertThat(bundle.longTermMemoryContext().hits()).hasSize(1);
+        assertThat(bundle.longTermMemoryContext().hits().getFirst().memoryId()).isEqualTo(refined.memory().memoryId());
+        assertThat(bundle.longTermMemoryContext().hits().getFirst().lowConfidence()).isTrue();
+        var usage = usageRecords.findAllByTaskIdOrderByCreatedAtAscUsageIdAsc(task.getTaskId()).getFirst();
+        assertThat(usage.getLowConfidence()).isTrue();
     }
 
     private Task newTask(String apiSpecId) {
