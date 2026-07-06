@@ -1,5 +1,7 @@
 package com.probeflow.testagent.agentmemoryfeedback;
 
+import com.probeflow.testagent.agentpolicy.ToolRiskLevel;
+import com.probeflow.testagent.controlledplanner.PlanDecision;
 import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.task.TaskStatus;
@@ -10,6 +12,8 @@ import com.probeflow.testagent.memory.MemoryRefineryResult;
 import com.probeflow.testagent.memory.MemoryRefineryService;
 import com.probeflow.testagent.memory.MemorySourceType;
 import com.probeflow.testagent.orchestration.StepOutcome;
+import com.probeflow.testagent.policyvalidator.PolicyValidationReasonCode;
+import com.probeflow.testagent.policyvalidator.PolicyValidationResult;
 import com.probeflow.testagent.task.PlanStepStatus;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -199,10 +203,14 @@ public class AgentMemoryFeedbackApplicationService {
         var normalizedTaskId = normalizeNullable(taskId);
         var normalizedStepId = normalizeNullable(stepId);
         if (outcome == null || normalizedTaskId == null || normalizedStepId == null) {
+            var audit = new LinkedHashMap<String, Object>();
+            audit.put("taskId", normalizedTaskId);
+            audit.put("stepId", normalizedStepId);
+            audit.put("writesLongTermMemory", false);
             return AgentMemoryFeedbackResult.rejected(
                 "invalid-step-outcome-candidate",
                 List.of("taskId, stepId and StepOutcome are required"),
-                Map.of("taskId", normalizedTaskId, "stepId", normalizedStepId, "writesLongTermMemory", false)
+                compact(audit)
             );
         }
         if (outcome.stepStatus() == PlanStepStatus.SUCCESS) {
@@ -262,6 +270,77 @@ public class AgentMemoryFeedbackApplicationService {
         );
     }
 
+    @Transactional
+    public AgentMemoryFeedbackResult refinePolicyLearningNote(
+        String taskId,
+        PolicyValidationResult validation,
+        PlanDecision decision,
+        Map<String, Object> contextMetadata
+    ) {
+        var normalizedTaskId = normalizeNullable(taskId);
+        if (normalizedTaskId == null || validation == null) {
+            var audit = new LinkedHashMap<String, Object>();
+            audit.put("taskId", normalizedTaskId);
+            audit.put("writesLongTermMemory", false);
+            return AgentMemoryFeedbackResult.rejected(
+                "invalid-policy-learning-note",
+                List.of("taskId and PolicyValidationResult are required"),
+                compact(audit)
+            );
+        }
+        if (validation.allowed()) {
+            return AgentMemoryFeedbackResult.rejected(
+                "policy-validation-not-learnable",
+                List.of("Allowed policy validations do not create learning notes"),
+                Map.of("taskId", normalizedTaskId, "reasonCode", validation.reasonCode().name(), "writesLongTermMemory", false)
+            );
+        }
+
+        var context = contextMetadata == null ? Map.<String, Object>of() : contextMetadata;
+        var action = policyAction(validation, decision);
+        var toolName = policyToolName(validation, decision);
+        var riskLevel = policyRiskLevel(decision);
+        var saferAlternative = recommendedSaferAlternative(validation.reasonCode(), action, toolName);
+        var confidence = policyLearningConfidence(validation, decision);
+        var sourceRef = "policy-validation:" + policyDecisionRef(validation, decision);
+        var summary = "Policy rejected " + action + " for " + toolName + " because " + validation.reasonCode();
+        var content = "Policy rejected planner action " + action
+            + " using tool " + toolName
+            + ". Reason: " + validation.message()
+            + ". Blockers: " + validation.blockers()
+            + ". Recommended safer alternative: " + saferAlternative + ".";
+        var metadata = policyLearningMetadata(validation, decision, context, riskLevel, toolName, action, saferAlternative);
+        var tags = policyLearningTags(validation, decision, context, riskLevel, toolName, action);
+        var evidence = "PolicyValidationResult=" + validation.auditSummary()
+            + " PlanDecision=" + (decision == null ? Map.of() : decision.auditSummary())
+            + " context=" + context;
+
+        return submitAndRefine(
+            new AgentMemoryCandidateIntakeRequest(
+                AgentMemoryCandidateSourceType.POLICY_VALIDATION_RESULT,
+                sourceRef,
+                normalizedTaskId,
+                summary,
+                content,
+                evidence,
+                tags,
+                confidence,
+                metadata
+            ),
+            new MemoryCandidateRequest(
+                summary,
+                content,
+                MemorySourceType.OBSERVATION,
+                sourceRef,
+                normalizedTaskId,
+                tags,
+                confidence,
+                evidence,
+                metadata
+            )
+        );
+    }
+
     private AgentMemoryFeedbackResult submitAndRefine(
         AgentMemoryCandidateIntakeRequest intake,
         MemoryCandidateRequest refineryRequest
@@ -274,7 +353,7 @@ public class AgentMemoryFeedbackApplicationService {
 
         var record = candidates.findById(intakeResult.candidateId()).orElseThrow();
         try {
-            var refineryResult = memoryRefinery.refine(refineryRequest);
+            var refineryResult = memoryRefinery.refine(sanitizeMemoryCandidate(refineryRequest));
             applyRefineryResult(record, refineryResult);
         } catch (RuntimeException exception) {
             record.setStatus(MemoryCandidateProcessingStatus.FAILED);
@@ -544,6 +623,163 @@ public class AgentMemoryFeedbackApplicationService {
             }
         }
         return false;
+    }
+
+    private Map<String, Object> policyLearningMetadata(
+        PolicyValidationResult validation,
+        PlanDecision decision,
+        Map<String, Object> context,
+        String riskLevel,
+        String toolName,
+        String action,
+        String saferAlternative
+    ) {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("phase", "V2_PHASE_7");
+        metadata.put("handoffType", "POLICY_LEARNING_NOTE_REFINERY");
+        metadata.put("decisionId", policyDecisionRef(validation, decision));
+        metadata.put("validationStatus", validation.status().name());
+        metadata.put("policyReason", validation.reasonCode().name());
+        metadata.put("errorCode", validation.reasonCode().name());
+        metadata.put("blockedAction", action);
+        metadata.put("plannerAction", action);
+        metadata.put("toolName", toolName);
+        metadata.put("proposedToolName", toolName);
+        metadata.put("riskLevel", riskLevel);
+        metadata.put("plannerConfidence", decision == null ? null : decision.confidence());
+        metadata.put("plannerReasoning", decision == null ? null : decision.reasoning());
+        metadata.put("sourceLlmCallId", validation.sourceLlmCallId());
+        metadata.put("sourceTrigger", metadataString(context.get("sourceTrigger")));
+        metadata.put("recommendedSaferAlternative", saferAlternative);
+        metadata.put("blockers", validation.blockers());
+        metadata.put("stageProfile", metadataString(context.get("stageProfile")));
+        metadata.put("apiPath", metadataString(context.get("apiPath")));
+        metadata.put("module", metadataString(context.get("module")));
+        metadata.put("systemName", metadataString(context.get("systemName")));
+        metadata.put("context", context);
+        metadata.put("writesLongTermMemory", true);
+        if (decision != null && decision.proposedPlanStep() != null) {
+            metadata.put("proposedStepType", decision.proposedPlanStep().stepType());
+            metadata.put("proposedStepTitle", decision.proposedPlanStep().title());
+            metadata.put("proposedStepDescription", decision.proposedPlanStep().description());
+            metadata.put("proposedStepToolName", decision.proposedPlanStep().proposedToolName());
+        }
+        return compact(metadata);
+    }
+
+    private List<String> policyLearningTags(
+        PolicyValidationResult validation,
+        PlanDecision decision,
+        Map<String, Object> context,
+        String riskLevel,
+        String toolName,
+        String action
+    ) {
+        var tags = new LinkedHashSet<String>();
+        tags.add("phase7");
+        tags.add("policy-learning");
+        tags.add("policy-guardrail");
+        tags.add(validation.reasonCode().name().toLowerCase(Locale.ROOT));
+        tags.add(validation.status().name().toLowerCase(Locale.ROOT));
+        tags.add(action.toLowerCase(Locale.ROOT));
+        tags.add(riskLevel.toLowerCase(Locale.ROOT));
+        if (StringUtils.hasText(toolName) && !"unknown-tool".equals(toolName)) {
+            tags.add(toolName.toLowerCase(Locale.ROOT));
+        }
+        if (decision != null && decision.proposedPlanStep() != null) {
+            tags.add(decision.proposedPlanStep().stepType().toLowerCase(Locale.ROOT));
+        }
+        var contextTags = context.get("tags");
+        if (contextTags instanceof Iterable<?> values) {
+            for (var value : values) {
+                if (value != null && StringUtils.hasText(value.toString())) {
+                    tags.add(value.toString().trim().toLowerCase(Locale.ROOT));
+                }
+            }
+        }
+        return List.copyOf(tags);
+    }
+
+    private String policyDecisionRef(PolicyValidationResult validation, PlanDecision decision) {
+        var decisionId = metadataString(validation.decisionId());
+        if (StringUtils.hasText(decisionId)) {
+            return decisionId + ":" + validation.reasonCode().name();
+        }
+        if (decision != null && StringUtils.hasText(decision.decisionId())) {
+            return decision.decisionId() + ":" + validation.reasonCode().name();
+        }
+        return validation.reasonCode().name() + ":" + policyAction(validation, decision) + ":" + policyToolName(validation, decision);
+    }
+
+    private String policyAction(PolicyValidationResult validation, PlanDecision decision) {
+        if (decision != null && decision.action() != null) {
+            return decision.action().name();
+        }
+        return validation.plannerAction() == null ? "UNKNOWN_ACTION" : validation.plannerAction().name();
+    }
+
+    private String policyToolName(PolicyValidationResult validation, PlanDecision decision) {
+        if (decision != null && StringUtils.hasText(decision.proposedToolName())) {
+            return decision.proposedToolName();
+        }
+        if (decision != null && decision.proposedPlanStep() != null && StringUtils.hasText(decision.proposedPlanStep().proposedToolName())) {
+            return decision.proposedPlanStep().proposedToolName();
+        }
+        return StringUtils.hasText(validation.proposedToolName()) ? validation.proposedToolName() : "unknown-tool";
+    }
+
+    private String policyRiskLevel(PlanDecision decision) {
+        return decision == null || decision.riskLevel() == null ? "UNKNOWN" : decision.riskLevel().name();
+    }
+
+    private float policyLearningConfidence(PolicyValidationResult validation, PlanDecision decision) {
+        if (highValuePolicyLearningNote(validation, decision)) {
+            return 0.88f;
+        }
+        if (validation.requiresHumanConfirmation()) {
+            return 0.76f;
+        }
+        return 0.42f;
+    }
+
+    private boolean highValuePolicyLearningNote(PolicyValidationResult validation, PlanDecision decision) {
+        var riskLevel = decision == null ? ToolRiskLevel.LOW : decision.riskLevel();
+        if (riskLevel == ToolRiskLevel.HIGH || riskLevel == ToolRiskLevel.CRITICAL) {
+            return true;
+        }
+        return switch (validation.reasonCode()) {
+            case TOOL_NOT_WHITELISTED,
+                TOOL_BLOCKED_BY_CONTRACT,
+                TOOL_NOT_ALLOWED_IN_TASK_PHASE,
+                HIGH_RISK_REQUIRES_CONFIRMATION,
+                HUMAN_CONFIRMATION_REQUIRED,
+                V1_BOUNDARY_BLOCKED,
+                UNKNOWN_TOOL -> true;
+            default -> false;
+        };
+    }
+
+    private String recommendedSaferAlternative(
+        PolicyValidationReasonCode reasonCode,
+        String action,
+        String toolName
+    ) {
+        return switch (reasonCode) {
+            case TOOL_NOT_WHITELISTED, UNKNOWN_TOOL ->
+                "Use a tool that is visible and whitelisted by AgentPolicy before proposing " + action + ".";
+            case TOOL_BLOCKED_BY_CONTRACT, TOOL_NOT_ALLOWED_IN_TASK_PHASE ->
+                "Choose a lower-risk tool allowed in the current task phase instead of " + toolName + ".";
+            case HIGH_RISK_REQUIRES_CONFIRMATION, HUMAN_CONFIRMATION_REQUIRED ->
+                "Pause for the configured human approval workflow before changing the plan.";
+            case V1_BOUNDARY_BLOCKED ->
+                "Stay inside the backend Agent Core boundary and avoid external workflow integrations.";
+            case MISSING_REQUIRED_INPUT, MISSING_HUMAN_INPUT, HUMAN_INPUT_REQUIRED ->
+                "Ask for the missing input through the controlled human-in-the-loop path.";
+            case MISSING_CONTEXT_BUNDLE, MISSING_API_SPEC, MISSING_TEST_CASE, MISSING_EXECUTION_RESULT, MISSING_FAILURE_SIGNAL ->
+                "Collect the missing prerequisite context before proposing the planner action.";
+            default ->
+                "Prefer the least-privileged planner action and re-check PolicyValidator before applying changes.";
+        };
     }
 
     private List<String> validate(AgentMemoryCandidateIntakeRequest request) {
