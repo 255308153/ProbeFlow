@@ -125,6 +125,27 @@ public record ReplanningResult(
         );
     }
 
+    public static ReplanningResult applied(
+        ReplanningTrigger trigger,
+        List<String> blockers,
+        Map<String, Object> decisionSummary,
+        Map<String, Object> policySummary,
+        Map<String, Object> planMutationSummary,
+        List<String> insertedStepIds,
+        List<String> skippedStepIds
+    ) {
+        return new ReplanningResult(
+            ReplanningStatus.APPLIED,
+            trigger,
+            blockers,
+            decisionSummary,
+            policySummary,
+            planMutationSummary,
+            insertedStepIds,
+            skippedStepIds
+        );
+    }
+
     private static Map<String, Object> summary(String firstKey, Object firstValue, String secondKey, Object secondValue) {
         var summary = new LinkedHashMap<String, Object>();
         summary.put(firstKey, firstValue);

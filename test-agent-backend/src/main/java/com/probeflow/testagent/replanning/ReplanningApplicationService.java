@@ -3,11 +3,13 @@ package com.probeflow.testagent.replanning;
 import com.probeflow.testagent.controlledplanner.ControlledPlannerService;
 import com.probeflow.testagent.controlledplanner.HumanInputField;
 import com.probeflow.testagent.controlledplanner.PlanDecision;
+import com.probeflow.testagent.controlledplanner.PlannerAction;
 import com.probeflow.testagent.controlledplanner.PlannerConstraint;
 import com.probeflow.testagent.controlledplanner.PlannerInput;
 import com.probeflow.testagent.controlledplanner.PlannerInputFactory;
 import com.probeflow.testagent.controlledplanner.PlannerInputRequest;
 import com.probeflow.testagent.controlledplanner.PlannerTaskState;
+import com.probeflow.testagent.controlledplanner.ProposedPlanStep;
 import com.probeflow.testagent.controlledplanner.RequiredHumanInput;
 import com.probeflow.testagent.policyvalidator.PolicyValidationRequest;
 import com.probeflow.testagent.policyvalidator.PolicyValidationResult;
@@ -15,12 +17,14 @@ import com.probeflow.testagent.policyvalidator.PolicyValidatorService;
 import com.probeflow.testagent.task.PlanStep;
 import com.probeflow.testagent.task.PlanStepRepository;
 import com.probeflow.testagent.task.PlanStepStatus;
+import com.probeflow.testagent.task.PlanStepType;
 import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.task.TaskStatus;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -64,7 +68,13 @@ public class ReplanningApplicationService {
         }
         var plannerInput = buildPlannerInput(request);
         var decision = controlledPlanner.plan(plannerInput);
-        var validation = policyValidator.validate(new PolicyValidationRequest(decision, plannerInput, request.policy()));
+        var validation = policyValidator.validate(new PolicyValidationRequest(
+            decision,
+            plannerInput,
+            request.policy(),
+            proposedToolInput(decision, request, plannerInput),
+            Set.of()
+        ));
         if (validation.blocked()) {
             return ReplanningResult.rejectedByPolicy(
                 request.trigger(),
@@ -75,6 +85,9 @@ public class ReplanningApplicationService {
         }
         if (validation.requiresHumanConfirmation()) {
             return pauseForHuman(request, decision, validation, plannerInput);
+        }
+        if (decision.action() == PlannerAction.INSERT_STEP) {
+            return applyInsertStep(request, decision, validation, plannerInput);
         }
         return ReplanningResult.noop(
             request.trigger(),
@@ -152,6 +165,160 @@ public class ReplanningApplicationService {
         summary.put("availableToolCount", plannerInput.availableTools().size());
         summary.entrySet().removeIf(entry -> entry.getValue() == null);
         return Map.copyOf(summary);
+    }
+
+    private Map<String, Object> proposedToolInput(
+        PlanDecision decision,
+        ReplanningRequest request,
+        PlannerInput plannerInput
+    ) {
+        var proposed = decision.proposedPlanStep();
+        if (proposed == null || proposed.proposedToolName() == null) {
+            return Map.of();
+        }
+        var input = new LinkedHashMap<String, Object>();
+        switch (proposed.proposedToolName()) {
+            case "knowledge.retrieve-context" -> {
+                input.put("taskId", request.taskId());
+                input.put("query", recoveryQuery(plannerInput));
+            }
+            case "failure.analyze-execution" -> {
+                input.put("taskId", request.taskId());
+                input.put("executionRecordId", executionRecordId(plannerInput));
+            }
+            case "testcase.generate-drafts" -> {
+                input.put("taskId", request.taskId());
+                input.put("apiSpecId", apiSpecId(plannerInput));
+                input.put("generationMode", "BATCH");
+            }
+            default -> {
+            }
+        }
+        input.entrySet().removeIf(entry -> entry.getValue() == null);
+        return Map.copyOf(input);
+    }
+
+    private String recoveryQuery(PlannerInput plannerInput) {
+        if (!plannerInput.lastStepOutcome().blockers().isEmpty()) {
+            return String.join("; ", plannerInput.lastStepOutcome().blockers());
+        }
+        if (!plannerInput.lastStepOutcome().summary().isBlank()) {
+            return plannerInput.lastStepOutcome().summary();
+        }
+        return "replanning recovery context";
+    }
+
+    private String executionRecordId(PlannerInput plannerInput) {
+        return plannerInput.lastStepOutcome().resultRefs().stream()
+            .filter(ref -> ref.toLowerCase().contains("executionrecord") || ref.toLowerCase().startsWith("exec"))
+            .findFirst()
+            .map(this::valueAfterSeparator)
+            .orElse(null);
+    }
+
+    private String apiSpecId(PlannerInput plannerInput) {
+        return plannerInput.lastStepOutcome().resultRefs().stream()
+            .filter(ref -> ref.toLowerCase().contains("apispec") || ref.toLowerCase().startsWith("api"))
+            .findFirst()
+            .map(this::valueAfterSeparator)
+            .orElse(null);
+    }
+
+    private String valueAfterSeparator(String value) {
+        if (value == null) {
+            return null;
+        }
+        var index = Math.max(value.lastIndexOf(':'), value.lastIndexOf('/'));
+        if (index < 0 || index + 1 >= value.length()) {
+            return value.trim();
+        }
+        return value.substring(index + 1).trim();
+    }
+
+    private ReplanningResult applyInsertStep(
+        ReplanningRequest request,
+        PlanDecision decision,
+        PolicyValidationResult validation,
+        PlannerInput plannerInput
+    ) {
+        var proposed = decision.proposedPlanStep();
+        var stepType = parsePlanStepType(proposed);
+        if (stepType == null) {
+            return ReplanningResult.failed(request.trigger(), List.of("Planner proposed an illegal PlanStepType."));
+        }
+        var orderedSteps = planSteps.findByTaskIdOrderByStepOrderAsc(request.taskId());
+        var sourceStep = sourceStep(request, orderedSteps);
+        var inserted = new PlanStep();
+        inserted.setTaskId(request.taskId());
+        inserted.setStepType(stepType);
+        inserted.setStepStatus(PlanStepStatus.PENDING);
+        inserted.setStepOrder(nextRecoveryStepOrder(orderedSteps));
+        inserted.setGoal(recoveryGoal(proposed));
+        inserted.setInputRef(recoveryInputRef(request.trigger(), decision, sourceStep, proposed));
+        inserted.setRetryCount(0);
+
+        var saved = planSteps.save(inserted);
+        var mutationSummary = new LinkedHashMap<String, Object>();
+        mutationSummary.put("mutationApplied", true);
+        mutationSummary.put("mutationType", PlannerAction.INSERT_STEP.name());
+        mutationSummary.put("insertedStepId", saved.getStepId());
+        mutationSummary.put("insertedStepType", saved.getStepType().name());
+        mutationSummary.put("insertedStepOrder", saved.getStepOrder());
+        mutationSummary.put("insertedStepStatus", saved.getStepStatus().name());
+        mutationSummary.put("trigger", request.trigger().name());
+        mutationSummary.put("decisionId", decision.decisionId());
+        mutationSummary.put("sourceStepId", sourceStep == null ? null : sourceStep.getStepId());
+        mutationSummary.put("inputRef", saved.getInputRef());
+        mutationSummary.entrySet().removeIf(entry -> entry.getValue() == null);
+
+        return ReplanningResult.applied(
+            request.trigger(),
+            List.of(),
+            decisionAuditSummary(decision, plannerInput),
+            validation.auditSummary(),
+            mutationSummary,
+            List.of(saved.getStepId()),
+            List.of()
+        );
+    }
+
+    private PlanStepType parsePlanStepType(ProposedPlanStep proposed) {
+        if (proposed == null) {
+            return null;
+        }
+        try {
+            return PlanStepType.valueOf(proposed.stepType());
+        } catch (IllegalArgumentException exception) {
+            return null;
+        }
+    }
+
+    private int nextRecoveryStepOrder(List<PlanStep> orderedSteps) {
+        return orderedSteps.stream()
+            .map(PlanStep::getStepOrder)
+            .filter(order -> order != null)
+            .max(Integer::compareTo)
+            .orElse(0) + 10;
+    }
+
+    private String recoveryGoal(ProposedPlanStep proposed) {
+        if (proposed.description() == null) {
+            return proposed.title();
+        }
+        return proposed.title() + " - " + proposed.description();
+    }
+
+    private String recoveryInputRef(
+        ReplanningTrigger trigger,
+        PlanDecision decision,
+        PlanStep sourceStep,
+        ProposedPlanStep proposed
+    ) {
+        return "replanning:"
+            + "trigger=" + trigger.name()
+            + ";decision=" + decision.decisionId()
+            + ";sourceStep=" + (sourceStep == null ? "" : sourceStep.getStepId())
+            + ";tool=" + (proposed.proposedToolName() == null ? "" : proposed.proposedToolName());
     }
 
     private ReplanningResult pauseForHuman(

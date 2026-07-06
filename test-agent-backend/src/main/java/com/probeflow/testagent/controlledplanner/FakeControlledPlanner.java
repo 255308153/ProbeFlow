@@ -64,16 +64,11 @@ public class FakeControlledPlanner implements ControlledPlanner {
                 0.93d
             );
             case INSERT_STEP -> PlanDecision.insertStep(
-                "Fake planner found missing draft generation before execution.",
+                insertStepReasoning(input),
                 0.84d,
-                ToolRiskLevel.MEDIUM,
-                "testcase.generate-drafts",
-                ProposedPlanStep.of(
-                    "GENERATE_CASES",
-                    "Generate missing test case drafts",
-                    "Create draft test cases before execution can proceed.",
-                    "testcase.generate-drafts"
-                )
+                insertStepRisk(input),
+                insertStepProposal(input).proposedToolName(),
+                insertStepProposal(input)
             );
             case REPLAN -> PlanDecision.replan(
                 "Fake planner detected blockers that require a new remaining plan.",
@@ -105,5 +100,54 @@ public class FakeControlledPlanner implements ControlledPlanner {
                 List.of("Malformed planner output")
             );
         };
+    }
+
+    private ProposedPlanStep insertStepProposal(PlannerInput input) {
+        var trigger = replanningTrigger(input);
+        if ("PLAN_STEP_FAILED".equals(trigger)) {
+            return ProposedPlanStep.of(
+                "ANALYZE_FAILURE",
+                "Analyze failed step",
+                "Inspect the execution failure signal before changing downstream work.",
+                "failure.analyze-execution"
+            );
+        }
+        if ("CONTEXT_MISSING".equals(trigger)) {
+            return ProposedPlanStep.of(
+                "RETRIEVE_KNOWLEDGE",
+                "Retrieve missing context",
+                "Collect task-specific knowledge citations before continuing.",
+                "knowledge.retrieve-context"
+            );
+        }
+        return ProposedPlanStep.of(
+            "GENERATE_CASES",
+            "Generate missing test case drafts",
+            "Create draft test cases before execution can proceed.",
+            "testcase.generate-drafts"
+        );
+    }
+
+    private String insertStepReasoning(PlannerInput input) {
+        var trigger = replanningTrigger(input);
+        if ("PLAN_STEP_FAILED".equals(trigger)) {
+            return "Fake planner found a failed plan step that needs failure analysis before recovery can continue.";
+        }
+        if ("CONTEXT_MISSING".equals(trigger)) {
+            return "Fake planner found missing task context and proposed a knowledge retrieval recovery step.";
+        }
+        return "Fake planner found missing draft generation before execution.";
+    }
+
+    private ToolRiskLevel insertStepRisk(PlannerInput input) {
+        return "CONTEXT_MISSING".equals(replanningTrigger(input)) ? ToolRiskLevel.LOW : ToolRiskLevel.MEDIUM;
+    }
+
+    private String replanningTrigger(PlannerInput input) {
+        return input.constraints().stream()
+            .filter(constraint -> "REPLANNING_TRIGGER".equals(constraint.code()))
+            .findFirst()
+            .map(PlannerConstraint::description)
+            .orElse("");
     }
 }

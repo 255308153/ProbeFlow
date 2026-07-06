@@ -56,7 +56,7 @@ class ReplanningPolicyGatedDecisionTests {
 
         var result = replanning.replan(new ReplanningRequest(
             task.getTaskId(),
-            ReplanningTrigger.CONTEXT_MISSING,
+            ReplanningTrigger.EXECUTION_READINESS_MISSING,
             step.getStepId(),
             StepOutcome.blocked("Context is absent", List.of("No auth examples found")),
             Map.of(),
