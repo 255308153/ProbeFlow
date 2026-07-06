@@ -156,4 +156,36 @@ class LlmApplicationServiceTests {
         assertThat(log.getTotalTokens()).isZero();
         assertThat(log.getMetadata()).containsEntry("templateRenderSuccess", false);
     }
+
+    @Test
+    void policyBlockedCallDoesNotAccessProviderAndPersistsAuditLog() {
+        var result = llm.call(LlmCallRequest.forTemplate(
+            "task-llm-policy",
+            "step-llm-policy",
+            "v2.context-gap-question.v1",
+            Map.of("taskId", "task-llm-policy", "gap", "missing OAuth scope evidence"),
+            new LlmExecutionOptions("openai", "gpt-4.1-mini", 0.1d, 256, 2_000, 1)
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        assertThat(result.succeeded()).isFalse();
+        assertThat(result.callResult())
+            .returns(LlmCallStatus.BLOCKED, LlmCallResult::status)
+            .returns(LlmErrorType.POLICY_BLOCKED, LlmCallResult::errorType);
+        assertThat(result.callResult().errorMessage()).contains("policy");
+        verify(provider, never()).generate(any());
+
+        var log = logs.findById(result.llmCallId()).orElseThrow();
+        assertThat(log.getStatus()).isEqualTo(LlmCallStatus.BLOCKED);
+        assertThat(log.getErrorType()).isEqualTo(LlmErrorType.POLICY_BLOCKED);
+        assertThat(log.getProvider()).isEqualTo("openai");
+        assertThat(log.getModel()).isEqualTo("gpt-4.1-mini");
+        assertThat(log.getTotalTokens()).isZero();
+        assertThat(log.getMetadata())
+            .containsEntry("temperature", 0.1d)
+            .containsEntry("maxTokens", 256)
+            .containsEntry("timeoutMs", 2_000)
+            .containsEntry("retryAttempts", 1);
+    }
 }

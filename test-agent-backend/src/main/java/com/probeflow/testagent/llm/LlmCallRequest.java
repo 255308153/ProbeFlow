@@ -10,7 +10,8 @@ public record LlmCallRequest(
     Map<String, Object> variables,
     String provider,
     String model,
-    Map<String, Object> metadata
+    Map<String, Object> metadata,
+    LlmExecutionOptions executionOptions
 ) {
 
     public LlmCallRequest {
@@ -22,6 +23,24 @@ public record LlmCallRequest(
         provider = clean(provider);
         model = clean(model);
         metadata = metadata == null ? Map.of() : Map.copyOf(metadata);
+        executionOptions = executionOptions == null
+            ? LlmExecutionOptions.of(provider, model)
+            : executionOptions.withFallbacks(provider, model);
+        provider = executionOptions.provider();
+        model = executionOptions.model();
+    }
+
+    public LlmCallRequest(
+        String taskId,
+        String planStepId,
+        String purpose,
+        String templateId,
+        Map<String, Object> variables,
+        String provider,
+        String model,
+        Map<String, Object> metadata
+    ) {
+        this(taskId, planStepId, purpose, templateId, variables, provider, model, metadata, null);
     }
 
     public static LlmCallRequest forTemplate(
@@ -33,6 +52,16 @@ public record LlmCallRequest(
         String model
     ) {
         return new LlmCallRequest(taskId, planStepId, null, templateId, variables, provider, model, Map.of());
+    }
+
+    public static LlmCallRequest forTemplate(
+        String taskId,
+        String planStepId,
+        String templateId,
+        Map<String, Object> variables,
+        LlmExecutionOptions executionOptions
+    ) {
+        return new LlmCallRequest(taskId, planStepId, null, templateId, variables, null, null, Map.of(), executionOptions);
     }
 
     private static String clean(String value) {

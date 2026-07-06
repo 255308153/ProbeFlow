@@ -5,6 +5,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Comparator;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -20,27 +21,38 @@ public class LlmApplicationService {
     private final PromptTemplateRegistry templates;
     private final List<LlmProvider> providers;
     private final LlmCallLogRepository logs;
+    private final LlmPolicy policy;
 
     public LlmApplicationService(
         PromptTemplateRegistry templates,
         List<LlmProvider> providers,
-        LlmCallLogRepository logs
+        LlmCallLogRepository logs,
+        LlmPolicy policy
     ) {
         this.templates = templates;
         this.providers = providers == null ? List.of() : List.copyOf(providers);
         this.logs = logs;
+        this.policy = policy;
     }
 
     @Transactional
     public LlmApplicationResult call(LlmCallRequest request) {
         var normalized = normalize(request);
-        var providerName = defaulted(normalized.provider(), DEFAULT_PROVIDER);
-        var model = defaulted(normalized.model(), DEFAULT_MODEL);
+        var options = normalized.executionOptions().withFallbacks(DEFAULT_PROVIDER, DEFAULT_MODEL);
+        var providerName = options.provider();
+        var model = options.model();
         var render = renderPrompt(normalized);
         var requestHash = requestHash(providerName, model, normalized, render);
 
         if (!render.success()) {
             var result = LlmCallResult.failure(render.errorType(), render.errorMessage());
+            var saved = logs.save(logFor(normalized, render, providerName, model, requestHash, result, 0L));
+            return new LlmApplicationResult(saved.getLlmCallId(), result, requestHash, templateId(render, normalized), templateVersion(render));
+        }
+
+        var policyDecision = policy.evaluate(options);
+        if (!policyDecision.allowed()) {
+            var result = LlmCallResult.blocked(policyDecision.errorType(), policyDecision.message());
             var saved = logs.save(logFor(normalized, render, providerName, model, requestHash, result, 0L));
             return new LlmApplicationResult(saved.getLlmCallId(), result, requestHash, templateId(render, normalized), templateVersion(render));
         }
@@ -137,11 +149,25 @@ public class LlmApplicationService {
         log.setResponseSummary(response == null ? null : response.text());
         log.setProviderTraceId(response == null ? null : response.providerTraceId());
         log.setFakeProvider(result.fakeProvider());
-        log.setMetadata(Map.of(
-            "templateRenderSuccess", render.success(),
-            "providerSelected", providerName
-        ));
+        log.setMetadata(logMetadata(request, render, providerName));
         return log;
+    }
+
+    private Map<String, Object> logMetadata(LlmCallRequest request, PromptRenderResult render, String providerName) {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("templateRenderSuccess", render.success());
+        metadata.put("providerSelected", providerName);
+        putIfPresent(metadata, "temperature", request.executionOptions().temperature());
+        putIfPresent(metadata, "maxTokens", request.executionOptions().maxTokens());
+        putIfPresent(metadata, "timeoutMs", request.executionOptions().timeoutMs());
+        putIfPresent(metadata, "retryAttempts", request.executionOptions().retryAttempts());
+        return Map.copyOf(metadata);
+    }
+
+    private void putIfPresent(Map<String, Object> metadata, String key, Object value) {
+        if (value != null) {
+            metadata.put(key, value);
+        }
     }
 
     private Map<String, Object> requestMetadata(LlmCallRequest request, PromptRenderResult render) {

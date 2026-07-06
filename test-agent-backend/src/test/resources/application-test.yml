@@ -16,3 +16,8 @@ spring:
     redis:
       host: localhost
       port: 6379
+
+probeflow:
+  llm:
+    allow-real-providers: false
+    allowed-providers: fake
