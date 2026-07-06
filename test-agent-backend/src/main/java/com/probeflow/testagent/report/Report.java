@@ -50,6 +50,10 @@ public class Report {
     @Column(name = "suggestions", nullable = false, columnDefinition = "jsonb")
     private List<Map<String, Object>> suggestions = new ArrayList<>();
 
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "metadata", nullable = false, columnDefinition = "jsonb")
+    private Map<String, Object> metadata = Map.of();
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -139,6 +143,14 @@ public class Report {
 
     public void setSuggestions(List<Map<String, Object>> suggestions) {
         this.suggestions = suggestions;
+    }
+
+    public Map<String, Object> getMetadata() {
+        return metadata;
+    }
+
+    public void setMetadata(Map<String, Object> metadata) {
+        this.metadata = metadata;
     }
 
     public Instant getCreatedAt() {
