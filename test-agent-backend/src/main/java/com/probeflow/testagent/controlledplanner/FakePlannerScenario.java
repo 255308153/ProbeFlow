@@ -4,6 +4,7 @@ public enum FakePlannerScenario {
     CONTINUE,
     INSERT_STEP,
     REPLAN,
+    HIGH_RISK_REPLAN,
     WAIT_FOR_HUMAN,
     STOP,
     FAILURE,

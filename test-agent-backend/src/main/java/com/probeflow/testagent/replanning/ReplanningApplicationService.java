@@ -11,6 +11,8 @@ import com.probeflow.testagent.controlledplanner.PlannerInputRequest;
 import com.probeflow.testagent.controlledplanner.PlannerTaskState;
 import com.probeflow.testagent.controlledplanner.ProposedPlanStep;
 import com.probeflow.testagent.controlledplanner.RequiredHumanInput;
+import com.probeflow.testagent.orchestration.ManualReviewGate;
+import com.probeflow.testagent.orchestration.ManualReviewGateResult;
 import com.probeflow.testagent.policyvalidator.PolicyValidationRequest;
 import com.probeflow.testagent.policyvalidator.PolicyValidationResult;
 import com.probeflow.testagent.policyvalidator.PolicyValidatorService;
@@ -18,6 +20,7 @@ import com.probeflow.testagent.task.PlanStep;
 import com.probeflow.testagent.task.PlanStepRepository;
 import com.probeflow.testagent.task.PlanStepStatus;
 import com.probeflow.testagent.task.PlanStepType;
+import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.task.TaskStatus;
 import java.util.ArrayList;
@@ -36,19 +39,22 @@ public class ReplanningApplicationService {
     private final PlannerInputFactory plannerInputFactory;
     private final ControlledPlannerService controlledPlanner;
     private final PolicyValidatorService policyValidator;
+    private final ManualReviewGate manualReviewGate;
 
     public ReplanningApplicationService(
         TaskRepository tasks,
         PlanStepRepository planSteps,
         PlannerInputFactory plannerInputFactory,
         ControlledPlannerService controlledPlanner,
-        PolicyValidatorService policyValidator
+        PolicyValidatorService policyValidator,
+        ManualReviewGate manualReviewGate
     ) {
         this.tasks = tasks;
         this.planSteps = planSteps;
         this.plannerInputFactory = plannerInputFactory;
         this.controlledPlanner = controlledPlanner;
         this.policyValidator = policyValidator;
+        this.manualReviewGate = manualReviewGate;
     }
 
     @Transactional
@@ -65,6 +71,9 @@ public class ReplanningApplicationService {
         }
         if (task.get().getStatus() == TaskStatus.CANCELLED) {
             return ReplanningResult.notTriggerable(request.trigger(), List.of("Cancelled task cannot be replanned"));
+        }
+        if (request.trigger() == ReplanningTrigger.REVIEW_COMPLETED) {
+            return applyReviewCompleted(request, task.get());
         }
         var plannerInput = buildPlannerInput(request);
         var decision = controlledPlanner.plan(plannerInput);
@@ -238,6 +247,135 @@ public class ReplanningApplicationService {
             return value.trim();
         }
         return value.substring(index + 1).trim();
+    }
+
+    private ReplanningResult applyReviewCompleted(ReplanningRequest request, Task task) {
+        if (!request.reviewCompleted()) {
+            return ReplanningResult.waitingForHuman(
+                request.trigger(),
+                reviewCompletedDecisionSummary("Review completion flag was not provided; keeping the task paused."),
+                reviewCompletedPolicySummary(),
+                reviewCompletedMutationSummary(false, task.getStatus(), task.getStatus(), false, null),
+                List.of("Review completion signal is required before resuming task.")
+            );
+        }
+        if (task.getStatus() != TaskStatus.WAITING_FOR_REVIEW) {
+            return ReplanningResult.noop(
+                request.trigger(),
+                "Review completed trigger kept the template plan unchanged because the task is not waiting for review.",
+                reviewCompletedDecisionSummary("Task is not waiting for review."),
+                reviewCompletedPolicySummary()
+            );
+        }
+
+        var reviewGate = manualReviewGate.evaluate(task);
+        if (!reviewGate.ready()) {
+            return ReplanningResult.waitingForHuman(
+                request.trigger(),
+                reviewCompletedDecisionSummary("Manual review gate is still waiting for review completion."),
+                reviewCompletedPolicySummary(),
+                reviewCompletedMutationSummary(false, task.getStatus(), task.getStatus(), true, reviewGate),
+                reviewGate.blockerDetails()
+            );
+        }
+
+        var metadata = task.getMetadata() == null
+            ? new LinkedHashMap<String, Object>()
+            : new LinkedHashMap<>(task.getMetadata());
+        var resumeStatus = resumeStatus(metadata, reviewGate);
+        metadata.remove("requiredHumanInput");
+        if (!request.humanInput().isEmpty()) {
+            metadata.put("reviewCompletedHumanInput", request.humanInput());
+        }
+        applyReviewGateMetadata(metadata, reviewGate);
+        metadata.put("lastReplanning", Map.of(
+            "trigger", request.trigger().name(),
+            "reviewCompleted", true,
+            "status", ReplanningStatus.APPLIED.name(),
+            "taskStatus", resumeStatus.name(),
+            "manualReviewGateReady", true
+        ));
+        task.setMetadata(metadata);
+        task.setStatus(resumeStatus);
+        tasks.save(task);
+
+        return ReplanningResult.applied(
+            request.trigger(),
+            List.of(),
+            reviewCompletedDecisionSummary("Review completed; keeping the deterministic template plan and resuming downstream steps."),
+            reviewCompletedPolicySummary(),
+            reviewCompletedMutationSummary(true, TaskStatus.WAITING_FOR_REVIEW, resumeStatus, true, reviewGate),
+            List.of(),
+            List.of()
+        );
+    }
+
+    private Map<String, Object> reviewCompletedDecisionSummary(String reason) {
+        return Map.of(
+            "plannerCalled", false,
+            "action", PlannerAction.CONTINUE.name(),
+            "reason", reason
+        );
+    }
+
+    private Map<String, Object> reviewCompletedPolicySummary() {
+        return Map.of(
+            "policyValidated", false,
+            "reason", "Review completion is a deterministic resume signal and does not carry a PlannerDecision."
+        );
+    }
+
+    private Map<String, Object> reviewCompletedMutationSummary(
+        boolean mutationApplied,
+        TaskStatus previousStatus,
+        TaskStatus taskStatus,
+        boolean manualReviewGateEvaluated,
+        ManualReviewGateResult reviewGate
+    ) {
+        var summary = new LinkedHashMap<String, Object>();
+        summary.put("mutationApplied", mutationApplied);
+        summary.put("mutationType", "REVIEW_COMPLETED_RESUME");
+        summary.put("previousTaskStatus", previousStatus.name());
+        summary.put("taskStatus", taskStatus.name());
+        summary.put("manualReviewGateEvaluated", manualReviewGateEvaluated);
+        if (reviewGate != null) {
+            summary.put("manualReviewGateReady", reviewGate.ready());
+            summary.put("promotedCaseIds", reviewGate.promotedCaseIds());
+            summary.put("pendingDraftIds", reviewGate.pendingDraftIds());
+            summary.put("discardedDraftIds", reviewGate.discardedDraftIds());
+        }
+        summary.put("reason", mutationApplied
+            ? "Review completed; task status resumed without inserting, deleting or reordering PlanSteps."
+            : "Task remains paused and the template plan is unchanged.");
+        return Map.copyOf(summary);
+    }
+
+    private void applyReviewGateMetadata(Map<String, Object> metadata, ManualReviewGateResult reviewGate) {
+        metadata.put("selectedCaseIds", reviewGate.promotedCaseIds());
+        metadata.put("promotedCaseIds", reviewGate.promotedCaseIds());
+        metadata.put("discardedDraftIds", reviewGate.discardedDraftIds());
+    }
+
+    private TaskStatus resumeStatus(Map<String, Object> metadata, ManualReviewGateResult reviewGate) {
+        if (!reviewGate.promotedCaseIds().isEmpty() || !reviewGate.discardedDraftIds().isEmpty()) {
+            return TaskStatus.CASE_GENERATED;
+        }
+        return storedResumeStatus(metadata);
+    }
+
+    private TaskStatus storedResumeStatus(Map<String, Object> metadata) {
+        var lastReplanning = metadata.get("lastReplanning");
+        if (lastReplanning instanceof Map<?, ?> values) {
+            var value = values.get("resumeTaskStatus");
+            if (value != null) {
+                try {
+                    return TaskStatus.valueOf(value.toString());
+                } catch (IllegalArgumentException ignored) {
+                    return TaskStatus.CASE_GENERATED;
+                }
+            }
+        }
+        return TaskStatus.CASE_GENERATED;
     }
 
     private ReplanningResult applyInsertStep(
@@ -424,13 +562,15 @@ public class ReplanningApplicationService {
         var metadata = task.getMetadata() == null
             ? new LinkedHashMap<String, Object>()
             : new LinkedHashMap<>(task.getMetadata());
-        var requiredHumanInput = humanInputSummary(decision.requiredHumanInput());
+        var resumeStatus = task.getStatus();
+        var requiredHumanInput = humanInputSummary(decision.requiredHumanInput(), validation);
         metadata.put("requiredHumanInput", requiredHumanInput);
         metadata.put("lastReplanning", Map.of(
             "trigger", request.trigger().name(),
             "decisionId", decision.decisionId(),
             "policyStatus", validation.status().name(),
             "policyReasonCode", validation.reasonCode().name(),
+            "resumeTaskStatus", resumeStatus.name(),
             "status", ReplanningStatus.WAITING_FOR_HUMAN.name()
         ));
         task.setMetadata(metadata);
@@ -463,9 +603,9 @@ public class ReplanningApplicationService {
         );
     }
 
-    private Map<String, Object> humanInputSummary(RequiredHumanInput input) {
+    private Map<String, Object> humanInputSummary(RequiredHumanInput input, PolicyValidationResult validation) {
         if (input == null) {
-            return Map.of();
+            return policyConfirmationInputSummary(validation);
         }
         var summary = new LinkedHashMap<String, Object>();
         summary.put("reason", input.reason());
@@ -473,6 +613,21 @@ public class ReplanningApplicationService {
         summary.put("blocking", input.blocking());
         summary.put("inputSchema", input.inputSchema().stream().map(this::humanInputFieldSummary).toList());
         return Map.copyOf(summary);
+    }
+
+    private Map<String, Object> policyConfirmationInputSummary(PolicyValidationResult validation) {
+        return Map.of(
+            "reason", validation.message(),
+            "question", "Review and confirm whether this replanning decision may continue.",
+            "blocking", true,
+            "policyReasonCode", validation.reasonCode().name(),
+            "inputSchema", List.of(Map.of(
+                "name", "approved",
+                "type", "boolean",
+                "description", "Whether the policy-gated replanning decision is approved.",
+                "required", true
+            ))
+        );
     }
 
     private Map<String, Object> humanInputFieldSummary(HumanInputField field) {

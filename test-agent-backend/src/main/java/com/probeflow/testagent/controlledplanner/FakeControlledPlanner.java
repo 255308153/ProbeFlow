@@ -78,6 +78,14 @@ public class FakeControlledPlanner implements ControlledPlanner {
                     ? List.of("State changed after last step")
                     : input.lastStepOutcome().blockers()
             );
+            case HIGH_RISK_REPLAN -> PlanDecision.replan(
+                "Fake planner detected a high-risk recovery path that requires explicit confirmation.",
+                0.82d,
+                ToolRiskLevel.HIGH,
+                input.lastStepOutcome().blockers().isEmpty()
+                    ? List.of("High-risk replanning requires confirmation")
+                    : input.lastStepOutcome().blockers()
+            );
             case WAIT_FOR_HUMAN -> PlanDecision.waitForHuman(
                 "Fake planner cannot choose a target environment safely.",
                 0.34d,
