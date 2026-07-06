@@ -280,6 +280,7 @@ public class ReportGenerationApplicationService {
     }
 
     private Map<String, Object> executionFinding(ExecutionRecord record, FindingContext context) {
+        var suiteImpact = suiteExecutionImpact(record);
         var classification = classification(record);
         var observationList = context.observationsByExecutionId().getOrDefault(record.getExecutionId(), List.of());
         var apiSpecIds = affectedApiSpecIds(record, context);
@@ -289,7 +290,7 @@ public class ReportGenerationApplicationService {
         finding.put("classification", classification);
         finding.put("groupKey", groupKey(classification, apiSpecIds, record));
         finding.put("caseId", record.getCaseId());
-        finding.put("primaryApiSpecId", apiSpecIds.isEmpty() ? null : apiSpecIds.getFirst());
+        finding.put("primaryApiSpecId", primaryApiSpecId(apiSpecIds, suiteImpact));
         finding.put("apiSpecIds", apiSpecIds);
         finding.put("executionId", record.getExecutionId());
         finding.put("statusCode", record.getStatusCode());
@@ -301,6 +302,15 @@ public class ReportGenerationApplicationService {
         finding.put("factualEvidence", factualEvidence(record, classification));
         finding.put("inferredEvidence", inferredEvidence(observationList));
         finding.put("sourceReferences", sourceReferences(record, observationList, apiSpecIds));
+        if (suiteImpact.suiteExecution()) {
+            finding.put("suiteExecution", true);
+            finding.put("suiteStepCount", suiteImpact.totalSteps());
+            finding.put("firstFailingStep", suiteImpact.firstFailingStep());
+            finding.put("dependentSkippedSteps", suiteImpact.dependentSkippedSteps());
+            finding.put("dependentSkippedStepIds", suiteImpact.dependentSkippedStepIds());
+            finding.put("dependentSkippedStepCount", suiteImpact.dependentSkippedStepIds().size());
+            finding.put("suiteImpactSummary", suiteImpact.impactSummary());
+        }
         return finding;
     }
 
@@ -474,6 +484,7 @@ public class ReportGenerationApplicationService {
             || "RESPONSE_VALUE_MISMATCH".equals(classification)
             || "BODY_PRESENCE_FAILURE".equals(classification)
             || "DURATION_REGRESSION".equals(classification)
+            || "SUITE_PREREQUISITE_FAILURE".equals(classification)
             || "ASSERTION_FAILURE".equals(classification)) {
             return "INVESTIGATE_TEST_OR_CONTRACT";
         }
@@ -525,6 +536,9 @@ public class ReportGenerationApplicationService {
     }
 
     private String suggestionAction(String actionKind, String classification) {
+        if ("SUITE_PREREQUISITE_FAILURE".equals(classification)) {
+            return "Inspect the first failing suite step before rerunning dependent skipped steps.";
+        }
         return switch (actionKind) {
             case "RETRY_AFTER_STABILIZATION" -> "Retry affected executions after confirming the target environment is stable.";
             case "REPAIR_LINKED_DATA" -> "Repair missing TestCase or ApiSpec links before relying on this report.";
@@ -642,7 +656,21 @@ public class ReportGenerationApplicationService {
         return apiSpecIds.stream().sorted().toList();
     }
 
+    private Object primaryApiSpecId(List<String> apiSpecIds, SuiteExecutionImpact suiteImpact) {
+        var failedStepApiSpecId = suiteImpact.failedStepApiSpecId();
+        if (failedStepApiSpecId != null) {
+            return failedStepApiSpecId;
+        }
+        return apiSpecIds.isEmpty() ? null : apiSpecIds.getFirst();
+    }
+
     private String classification(ExecutionRecord record) {
+        var suiteImpact = suiteExecutionImpact(record);
+        if (suiteImpact.suiteExecution()
+            && suiteImpact.failedStepId() != null
+            && !suiteImpact.dependentSkippedStepIds().isEmpty()) {
+            return "SUITE_PREREQUISITE_FAILURE";
+        }
         var response = record.getResponseSnapshot() == null ? Map.<String, Object>of() : record.getResponseSnapshot();
         var errorType = stringValue(response.get("errorType"));
         if (record.getOverallStatus() == OverallStatus.PASSED_WITH_WARNINGS) {
@@ -715,6 +743,9 @@ public class ReportGenerationApplicationService {
         if ("SERVER_ERROR".equals(classification) || "AUTH_ISSUE".equals(classification)) {
             return "HIGH";
         }
+        if ("SUITE_PREREQUISITE_FAILURE".equals(classification)) {
+            return "HIGH";
+        }
         if ("VALIDATION_ISSUE".equals(classification)
             || "BLOCKED_REQUEST".equals(classification)
             || "ENVIRONMENT_ISSUE".equals(classification)
@@ -783,6 +814,17 @@ public class ReportGenerationApplicationService {
         if (clean(record.getErrorMessage()) != null) {
             evidence.add("errorMessage=" + record.getErrorMessage());
         }
+        var suiteImpact = suiteExecutionImpact(record);
+        if (suiteImpact.suiteExecution()) {
+            evidence.add("suiteStepCount=" + suiteImpact.totalSteps());
+            if (suiteImpact.failedStepId() != null) {
+                evidence.add("firstFailedStep=" + suiteImpact.failedStepId()
+                    + " order=" + suiteImpact.failedStepOrder());
+            }
+            if (!suiteImpact.dependentSkippedStepIds().isEmpty()) {
+                evidence.add("dependentSkippedSteps=" + suiteImpact.dependentSkippedStepIds());
+            }
+        }
         if (record.getAssertionResults() != null) {
             record.getAssertionResults().stream()
                 .filter(assertion -> "FAILED".equals(stringValue(assertion.get("status"))))
@@ -823,6 +865,12 @@ public class ReportGenerationApplicationService {
         sourceReferences.put("observationIds", observationList.stream().map(Observation::getObservationId).toList());
         sourceReferences.put("caseIds", List.of(record.getCaseId()));
         sourceReferences.put("apiSpecIds", apiSpecIds);
+        var suiteImpact = suiteExecutionImpact(record);
+        if (suiteImpact.suiteExecution()) {
+            sourceReferences.put("suiteStepIds", suiteImpact.stepIds());
+            sourceReferences.put("firstFailingStepId", suiteImpact.failedStepId());
+            sourceReferences.put("dependentSkippedStepIds", suiteImpact.dependentSkippedStepIds());
+        }
         return sourceReferences;
     }
 
@@ -848,6 +896,7 @@ public class ReportGenerationApplicationService {
         metadata.put("executionSummary", executionSummary.toMetadata());
         metadata.put("coverage", coverageMetadata(task, records));
         metadata.put("executionModes", executionModeCounts(taskExecutions));
+        metadata.put("suiteCoverage", suiteCoverage(records));
         metadata.put("analysisCoverage", analysisCoverage.toMetadata());
         metadata.put("task", taskMetadata(task));
         return metadata;
@@ -940,6 +989,41 @@ public class ReportGenerationApplicationService {
         return metadata;
     }
 
+    private Map<String, Object> suiteCoverage(List<ExecutionRecord> records) {
+        var firstFailingSteps = new ArrayList<Map<String, Object>>();
+        var dependentSkippedSteps = new ArrayList<Map<String, Object>>();
+        var suiteExecutionCount = 0;
+        for (var record : records) {
+            var suiteImpact = suiteExecutionImpact(record);
+            if (!suiteImpact.suiteExecution()) {
+                continue;
+            }
+            suiteExecutionCount++;
+            if (!suiteImpact.firstFailingStep().isEmpty()) {
+                var firstFailingStep = new LinkedHashMap<String, Object>();
+                firstFailingStep.put("executionId", record.getExecutionId());
+                firstFailingStep.put("caseId", record.getCaseId());
+                firstFailingStep.putAll(suiteImpact.firstFailingStep());
+                firstFailingSteps.add(firstFailingStep);
+            }
+            for (var step : suiteImpact.dependentSkippedSteps()) {
+                var dependentStep = new LinkedHashMap<String, Object>();
+                dependentStep.put("executionId", record.getExecutionId());
+                dependentStep.put("caseId", record.getCaseId());
+                dependentStep.putAll(step);
+                dependentSkippedSteps.add(dependentStep);
+            }
+        }
+
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("suiteExecutionCount", suiteExecutionCount);
+        metadata.put("suiteWithFirstFailingStepCount", firstFailingSteps.size());
+        metadata.put("dependentSkippedStepCount", dependentSkippedSteps.size());
+        metadata.put("firstFailingSteps", firstFailingSteps);
+        metadata.put("dependentSkippedSteps", dependentSkippedSteps);
+        return metadata;
+    }
+
     private List<String> apiSpecIds(ExecutionRecord record) {
         var apiSpecIds = new LinkedHashSet<String>();
         addApiSpecId(apiSpecIds, record.getRequestSnapshot().get("apiSpecId"));
@@ -966,6 +1050,119 @@ public class ReportGenerationApplicationService {
         if (apiSpecId != null) {
             apiSpecIds.add(apiSpecId);
         }
+    }
+
+    private SuiteExecutionImpact suiteExecutionImpact(ExecutionRecord record) {
+        var response = record.getResponseSnapshot() == null ? Map.<String, Object>of() : record.getResponseSnapshot();
+        if (!Boolean.TRUE.equals(response.get("suite")) || !(response.get("steps") instanceof List<?> rawSteps)) {
+            return SuiteExecutionImpact.none();
+        }
+
+        var steps = rawSteps.stream()
+            .filter(Map.class::isInstance)
+            .map(item -> objectMap((Map<?, ?>) item))
+            .toList();
+        var stepIds = steps.stream()
+            .map(step -> clean(stringValue(step.get("stepId"))))
+            .filter(value -> value != null)
+            .toList();
+
+        Map<String, Object> firstFailed = null;
+        for (var step : steps) {
+            if (failedSuiteStep(step)) {
+                firstFailed = step;
+                break;
+            }
+        }
+
+        var dependentSkipped = new ArrayList<Map<String, Object>>();
+        if (firstFailed != null) {
+            var failedOrder = intValue(firstFailed.get("order"));
+            for (var step : steps) {
+                var stepOrder = intValue(step.get("order"));
+                if (skippedSuiteStep(step)
+                    && (failedOrder == null || stepOrder == null || stepOrder > failedOrder)
+                    && contains(stringValue(step.get("message")), "prerequisite step failed")) {
+                    dependentSkipped.add(suiteStepReference(step));
+                }
+            }
+        }
+
+        var firstFailingStep = firstFailed == null ? Map.<String, Object>of() : suiteStepReference(firstFailed);
+        var failedStepId = clean(stringValue(firstFailingStep.get("stepId")));
+        var failedStepOrder = intValue(firstFailingStep.get("order"));
+        var failedStepApiSpecId = clean(stringValue(firstFailingStep.get("apiSpecId")));
+        var impactSummary = suiteImpactSummary(steps.size(), firstFailingStep, dependentSkipped);
+        return new SuiteExecutionImpact(
+            true,
+            steps.size(),
+            stepIds,
+            firstFailingStep,
+            dependentSkipped,
+            failedStepId,
+            failedStepOrder,
+            failedStepApiSpecId,
+            impactSummary
+        );
+    }
+
+    private String suiteImpactSummary(
+        int stepCount,
+        Map<String, Object> firstFailingStep,
+        List<Map<String, Object>> dependentSkippedSteps
+    ) {
+        if (firstFailingStep.isEmpty()) {
+            return "Suite execution has " + stepCount + " steps and no failed prerequisite step in the response snapshot.";
+        }
+        return "Suite first failing step " + firstFailingStep.get("stepId")
+            + " order " + firstFailingStep.get("order")
+            + " apiSpecId " + firstFailingStep.get("apiSpecId")
+            + "; dependent skipped steps: " + dependentSkippedSteps.stream()
+                .map(step -> stringValue(step.get("stepId")))
+                .toList();
+    }
+
+    private Map<String, Object> suiteStepReference(Map<String, Object> step) {
+        var reference = new LinkedHashMap<String, Object>();
+        copyIfPresent(reference, step, "stepId");
+        copyIfPresent(reference, step, "order");
+        copyIfPresent(reference, step, "apiSpecId");
+        copyIfPresent(reference, step, "targetApiSpecId");
+        copyIfPresent(reference, step, "overallStatus");
+        copyIfPresent(reference, step, "status");
+        copyIfPresent(reference, step, "statusCode");
+        copyIfPresent(reference, step, "message");
+        return reference;
+    }
+
+    private void copyIfPresent(Map<String, Object> target, Map<String, Object> source, String key) {
+        if (source.containsKey(key)) {
+            target.put(key, source.get(key));
+        }
+    }
+
+    private boolean failedSuiteStep(Map<String, Object> step) {
+        var status = stringValue(step.get("overallStatus"));
+        if (status == null) {
+            status = stringValue(step.get("status"));
+        }
+        return OverallStatus.FAILED.name().equals(status)
+            || OverallStatus.ERROR.name().equals(status)
+            || OverallStatus.BLOCKED.name().equals(status);
+    }
+
+    private boolean skippedSuiteStep(Map<String, Object> step) {
+        var status = stringValue(step.get("overallStatus"));
+        if (status == null) {
+            status = stringValue(step.get("status"));
+        }
+        return OverallStatus.SKIPPED.name().equals(status);
+    }
+
+    private Map<String, Object> objectMap(Map<?, ?> source) {
+        var target = new LinkedHashMap<String, Object>();
+        source.forEach((key, value) -> target.put(String.valueOf(key), value));
+        return target;
     }
 
     private Map<String, Object> executionModeCounts(List<TaskCaseExecution> taskExecutions) {
@@ -1035,6 +1232,16 @@ public class ReportGenerationApplicationService {
             return 0L;
         }
         return Long.parseLong(value.toString());
+    }
+
+    private Integer intValue(Object value) {
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value == null) {
+            return null;
+        }
+        return Integer.parseInt(value.toString());
     }
 
     private String clean(String value) {
@@ -1121,6 +1328,29 @@ public class ReportGenerationApplicationService {
             metadata.put("missingAnalysisExecutionIds", missingAnalysisExecutionIds);
             metadata.put("ineligibleExecutionIds", ineligibleExecutionIds);
             return metadata;
+        }
+    }
+
+    private record SuiteExecutionImpact(
+        boolean suiteExecution,
+        int totalSteps,
+        List<String> stepIds,
+        Map<String, Object> firstFailingStep,
+        List<Map<String, Object>> dependentSkippedSteps,
+        String failedStepId,
+        Integer failedStepOrder,
+        String failedStepApiSpecId,
+        String impactSummary
+    ) {
+
+        private static SuiteExecutionImpact none() {
+            return new SuiteExecutionImpact(false, 0, List.of(), Map.of(), List.of(), null, null, null, null);
+        }
+
+        private List<String> dependentSkippedStepIds() {
+            return dependentSkippedSteps.stream()
+                .map(step -> String.valueOf(step.get("stepId")))
+                .toList();
         }
     }
 }

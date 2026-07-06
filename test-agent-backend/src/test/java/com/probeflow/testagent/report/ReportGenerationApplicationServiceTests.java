@@ -787,6 +787,138 @@ class ReportGenerationApplicationServiceTests {
     }
 
     @Test
+    void suiteAndMixedExecutionReportHighlightsFirstFailingStepAndDependentSkips() {
+        apiSpecs.save(newApiSpec("api-create-suite", HttpMethod.POST, "/api/orders"));
+        apiSpecs.save(newApiSpec("api-read-suite", HttpMethod.GET, "/api/orders/{id}"));
+        apiSpecs.save(newApiSpec("api-pay-suite", HttpMethod.POST, "/api/orders/{id}/pay"));
+        apiSpecs.save(newApiSpec("api-single-mixed", HttpMethod.GET, "/api/health"));
+        apiSpecs.save(newApiSpec("api-batch-mixed", HttpMethod.GET, "/api/batch"));
+        var task = tasks.save(newTask(
+            "task-suite-mixed",
+            List.of("api-create-suite", "api-read-suite", "api-pay-suite", "api-single-mixed", "api-batch-mixed"),
+            Map.of("environment", "qa")
+        ));
+        var suiteCase = testCases.save(newTestCase("case-suite-mixed", "api-create-suite"));
+        var singleCase = testCases.save(newTestCase("case-single-mixed", "api-single-mixed"));
+        var batchCase = testCases.save(newTestCase("case-batch-mixed", "api-batch-mixed"));
+        var suite = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            suiteCase.getCaseId(),
+            "qa",
+            "api-create-suite",
+            OverallStatus.FAILED,
+            35L,
+            500,
+            Map.of("suite", true, "steps", List.of(
+                suiteStep("create-order", 1, "api-create-suite", "FAILED", "status mismatch", 500),
+                suiteStep("read-order", 2, "api-read-suite", "SKIPPED", "Skipped because prerequisite step failed: create-order", null),
+                suiteStep("pay-order", 3, "api-pay-suite", "SKIPPED", "Skipped because prerequisite step failed: create-order", null)
+            )),
+            null,
+            List.of(Map.of(
+                "type", "STATUS_CODE",
+                "expected", 201,
+                "actual", 500,
+                "status", "FAILED",
+                "stepId", "create-order"
+            ))
+        ));
+        var single = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            singleCase.getCaseId(),
+            "qa",
+            "api-single-mixed",
+            OverallStatus.PASSED,
+            5L
+        ));
+        var batch = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            batchCase.getCaseId(),
+            "qa",
+            "api-batch-mixed",
+            OverallStatus.FAILED,
+            15L,
+            422,
+            Map.of("statusCode", 422),
+            null,
+            List.of()
+        ));
+        taskCaseExecutions.save(newTaskCaseExecution(task.getTaskId(), suiteCase.getCaseId(), suite.getExecutionId(), ExecutionMode.SUITE_STEP));
+        taskCaseExecutions.save(newTaskCaseExecution(task.getTaskId(), singleCase.getCaseId(), single.getExecutionId(), ExecutionMode.SINGLE));
+        taskCaseExecutions.save(newTaskCaseExecution(task.getTaskId(), batchCase.getCaseId(), batch.getExecutionId(), ExecutionMode.BATCH));
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = reportGeneration.generateTaskReport(ReportGenerationRequest.forTask(task.getTaskId()));
+
+        var report = reports.findById(result.reportId()).orElseThrow();
+        @SuppressWarnings("unchecked")
+        var executionSummary = (Map<String, Object>) report.getMetadata().get("executionSummary");
+        assertThat(executionSummary)
+            .containsEntry("total", 3)
+            .containsEntry("executionCount", 3)
+            .containsEntry("passed", 1)
+            .containsEntry("failed", 2)
+            .containsEntry("skipped", 0)
+            .containsEntry("passRate", "0.3333");
+        assertThat((Map<String, Object>) report.getMetadata().get("executionModes"))
+            .containsEntry("SINGLE", 1)
+            .containsEntry("BATCH", 1)
+            .containsEntry("SUITE_STEP", 1);
+
+        @SuppressWarnings("unchecked")
+        var suiteCoverage = (Map<String, Object>) report.getMetadata().get("suiteCoverage");
+        assertThat(suiteCoverage)
+            .containsEntry("suiteExecutionCount", 1)
+            .containsEntry("suiteWithFirstFailingStepCount", 1)
+            .containsEntry("dependentSkippedStepCount", 2);
+        assertThat((List<Map<String, Object>>) suiteCoverage.get("firstFailingSteps"))
+            .singleElement()
+            .satisfies(step -> assertThat(step)
+                .containsEntry("executionId", suite.getExecutionId())
+                .containsEntry("caseId", suiteCase.getCaseId())
+                .containsEntry("stepId", "create-order")
+                .containsEntry("apiSpecId", "api-create-suite")
+                .containsEntry("overallStatus", "FAILED"));
+        assertThat((List<Map<String, Object>>) suiteCoverage.get("dependentSkippedSteps"))
+            .extracting(step -> step.get("stepId"))
+            .containsExactly("read-order", "pay-order");
+
+        assertThat(report.getFindings()).anySatisfy(finding -> {
+            assertThat(finding)
+                .containsEntry("type", "EXECUTION_OUTCOME")
+                .containsEntry("classification", "SUITE_PREREQUISITE_FAILURE")
+                .containsEntry("severity", "HIGH")
+                .containsEntry("caseId", suiteCase.getCaseId())
+                .containsEntry("executionId", suite.getExecutionId())
+                .containsEntry("primaryApiSpecId", "api-create-suite")
+                .containsEntry("suiteExecution", true)
+                .containsEntry("dependentSkippedStepIds", List.of("read-order", "pay-order"))
+                .containsEntry("dependentSkippedStepCount", 2);
+            assertThat((Map<String, Object>) finding.get("firstFailingStep"))
+                .containsEntry("stepId", "create-order")
+                .containsEntry("order", 1)
+                .containsEntry("apiSpecId", "api-create-suite")
+                .containsEntry("statusCode", 500);
+            assertThat((List<String>) finding.get("factualEvidence"))
+                .contains("firstFailedStep=create-order order=1")
+                .contains("dependentSkippedSteps=[read-order, pay-order]");
+            @SuppressWarnings("unchecked")
+            var references = (Map<String, Object>) finding.get("sourceReferences");
+            assertThat(references)
+                .containsEntry("executionIds", List.of(suite.getExecutionId()))
+                .containsEntry("caseIds", List.of(suiteCase.getCaseId()))
+                .containsEntry("suiteStepIds", List.of("create-order", "read-order", "pay-order"))
+                .containsEntry("firstFailingStepId", "create-order")
+                .containsEntry("dependentSkippedStepIds", List.of("read-order", "pay-order"));
+        });
+        assertThat(report.getSuggestions()).anySatisfy(suggestion -> assertThat(suggestion)
+            .containsEntry("classification", "SUITE_PREREQUISITE_FAILURE")
+            .containsEntry("priority", "P1")
+            .containsEntry("action", "Inspect the first failing suite step before rerunning dependent skipped steps."));
+    }
+
+    @Test
     void missingTaskIsRejectedClearly() {
         assertThatThrownBy(() -> reportGeneration.generateTaskReport(ReportGenerationRequest.forTask("missing-task")))
             .isInstanceOf(IllegalArgumentException.class)
@@ -929,6 +1061,28 @@ class ReportGenerationApplicationServiceTests {
         execution.setExecutionRecordId(executionId);
         execution.setSnapshotJson(Map.of("caseId", caseId, "path", "/api/orders"));
         return execution;
+    }
+
+    private Map<String, Object> suiteStep(
+        String stepId,
+        int order,
+        String apiSpecId,
+        String overallStatus,
+        String message,
+        Integer statusCode
+    ) {
+        var step = new java.util.LinkedHashMap<String, Object>();
+        step.put("stepId", stepId);
+        step.put("order", order);
+        step.put("apiSpecId", apiSpecId);
+        step.put("overallStatus", overallStatus);
+        if (message != null) {
+            step.put("message", message);
+        }
+        if (statusCode != null) {
+            step.put("statusCode", statusCode);
+        }
+        return step;
     }
 
     private Observation newObservation(
