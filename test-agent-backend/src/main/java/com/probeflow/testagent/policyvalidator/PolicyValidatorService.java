@@ -1,11 +1,27 @@
 package com.probeflow.testagent.policyvalidator;
 
+import com.probeflow.testagent.agentpolicy.AgentPolicyService;
+import com.probeflow.testagent.agentpolicy.ToolContractRegistry;
+import com.probeflow.testagent.agentpolicy.ToolName;
+import com.probeflow.testagent.agentpolicy.ToolPolicyDecision;
+import com.probeflow.testagent.agentpolicy.ToolPolicyEvaluationRequest;
+import com.probeflow.testagent.agentpolicy.ToolPolicyReasonCode;
+import com.probeflow.testagent.agentpolicy.ToolPolicyStatus;
+import com.probeflow.testagent.controlledplanner.PlanDecision;
 import com.probeflow.testagent.controlledplanner.PlannerAction;
 import java.util.List;
 import org.springframework.stereotype.Service;
 
 @Service
 public class PolicyValidatorService {
+
+    private final ToolContractRegistry registry;
+    private final AgentPolicyService policyService;
+
+    public PolicyValidatorService(ToolContractRegistry registry, AgentPolicyService policyService) {
+        this.registry = registry;
+        this.policyService = policyService;
+    }
 
     public PolicyValidationResult validate(PolicyValidationRequest request) {
         if (request == null) {
@@ -30,7 +46,7 @@ public class PolicyValidatorService {
         }
         return switch (decision.action()) {
             case CONTINUE -> validateContinue(decision);
-            case INSERT_STEP -> validateInsertStep(decision);
+            case INSERT_STEP -> validateInsertStep(request);
             case REPLAN -> PolicyValidationResult.allowed(
                 decision,
                 PolicyValidationReasonCode.SAFE_REPLAN,
@@ -41,7 +57,7 @@ public class PolicyValidatorService {
         };
     }
 
-    private PolicyValidationResult validateContinue(com.probeflow.testagent.controlledplanner.PlanDecision decision) {
+    private PolicyValidationResult validateContinue(PlanDecision decision) {
         if (decision.proposedToolName() != null) {
             return PolicyValidationResult.blocked(
                 decision,
@@ -57,7 +73,8 @@ public class PolicyValidatorService {
         );
     }
 
-    private PolicyValidationResult validateInsertStep(com.probeflow.testagent.controlledplanner.PlanDecision decision) {
+    private PolicyValidationResult validateInsertStep(PolicyValidationRequest request) {
+        var decision = request.decision();
         if (decision.proposedPlanStep() == null) {
             return PolicyValidationResult.blocked(
                 decision,
@@ -66,6 +83,21 @@ public class PolicyValidatorService {
                 List.of("MISSING_PROPOSED_STEP")
             );
         }
+        var proposedToolName = proposedToolName(decision);
+        if (proposedToolName != null) {
+            var nameMismatch = decision.proposedToolName() != null
+                && decision.proposedPlanStep().proposedToolName() != null
+                && !decision.proposedToolName().equals(decision.proposedPlanStep().proposedToolName());
+            if (nameMismatch) {
+                return PolicyValidationResult.blocked(
+                    decision,
+                    PolicyValidationReasonCode.INVALID_REQUEST,
+                    "Planner proposed conflicting tool names for INSERT_STEP.",
+                    List.of("PROPOSED_TOOL_NAME_MISMATCH")
+                );
+            }
+            return validateProposedTool(decision, proposedToolName, request);
+        }
         return PolicyValidationResult.allowed(
             decision,
             PolicyValidationReasonCode.SAFE_INSERT_STEP,
@@ -73,7 +105,7 @@ public class PolicyValidatorService {
         );
     }
 
-    private PolicyValidationResult validateWaitForHuman(com.probeflow.testagent.controlledplanner.PlanDecision decision) {
+    private PolicyValidationResult validateWaitForHuman(PlanDecision decision) {
         if (decision.requiredHumanInput() == null) {
             return PolicyValidationResult.blocked(
                 decision,
@@ -90,7 +122,7 @@ public class PolicyValidatorService {
         );
     }
 
-    private PolicyValidationResult validateStop(com.probeflow.testagent.controlledplanner.PlanDecision decision) {
+    private PolicyValidationResult validateStop(PlanDecision decision) {
         if (decision.proposedToolName() != null || decision.proposedPlanStep() != null) {
             return PolicyValidationResult.blocked(
                 decision,
@@ -104,5 +136,95 @@ public class PolicyValidatorService {
             PolicyValidationReasonCode.SAFE_STOP,
             "Planner requested a safe task stop without executing a tool."
         );
+    }
+
+    private PolicyValidationResult validateProposedTool(
+        PlanDecision decision,
+        String rawToolName,
+        PolicyValidationRequest request
+    ) {
+        ToolName toolName;
+        try {
+            toolName = ToolName.of(rawToolName);
+        } catch (IllegalArgumentException exception) {
+            return PolicyValidationResult.blocked(
+                decision,
+                PolicyValidationReasonCode.UNKNOWN_TOOL,
+                "Planner proposed an unknown or invalid tool name: " + rawToolName,
+                List.of("UNKNOWN_TOOL")
+            );
+        }
+        if (registry.find(toolName).isEmpty()) {
+            return PolicyValidationResult.blocked(
+                decision,
+                PolicyValidationReasonCode.UNKNOWN_TOOL,
+                "Planner proposed an unregistered tool: " + toolName,
+                List.of("UNKNOWN_TOOL")
+            );
+        }
+        if (request == null || !visibleToPlanner(toolName, request)) {
+            return PolicyValidationResult.blocked(
+                decision,
+                PolicyValidationReasonCode.TOOL_NOT_VISIBLE,
+                "Planner proposed a tool that is not visible in the current planner input: " + toolName,
+                List.of("TOOL_NOT_VISIBLE")
+            );
+        }
+        return fromToolPolicyDecision(decision, policyService.evaluate(ToolPolicyEvaluationRequest.of(
+            toolName,
+            request.policy(),
+            request.proposedToolInput(),
+            request.satisfiedPreconditions()
+        )));
+    }
+
+    private PolicyValidationResult fromToolPolicyDecision(PlanDecision decision, ToolPolicyDecision toolDecision) {
+        var reasonCode = mapReasonCode(toolDecision.reasonCode());
+        if (toolDecision.status() == ToolPolicyStatus.ALLOWED) {
+            return PolicyValidationResult.allowed(decision, reasonCode, toolDecision.message());
+        }
+        if (toolDecision.status() == ToolPolicyStatus.REQUIRES_HUMAN_CONFIRMATION) {
+            return PolicyValidationResult.requiresHumanConfirmation(
+                decision,
+                reasonCode,
+                toolDecision.message(),
+                List.of(toolDecision.reasonCode().name())
+            );
+        }
+        return PolicyValidationResult.blocked(
+            decision,
+            reasonCode,
+            toolDecision.message(),
+            List.of(toolDecision.reasonCode().name())
+        );
+    }
+
+    private PolicyValidationReasonCode mapReasonCode(ToolPolicyReasonCode reasonCode) {
+        return switch (reasonCode) {
+            case ALLOWED_BY_POLICY -> PolicyValidationReasonCode.TOOL_ALLOWED_BY_POLICY;
+            case HUMAN_CONFIRMATION_REQUIRED -> PolicyValidationReasonCode.HUMAN_CONFIRMATION_REQUIRED;
+            case REVIEW_REQUIRED_WORKFLOW -> PolicyValidationReasonCode.REVIEW_REQUIRED_WORKFLOW;
+            case UNKNOWN_TOOL -> PolicyValidationReasonCode.UNKNOWN_TOOL;
+            case TOOL_NOT_WHITELISTED -> PolicyValidationReasonCode.TOOL_NOT_WHITELISTED;
+            case TOOL_BLOCKED_BY_CONTRACT -> PolicyValidationReasonCode.TOOL_BLOCKED_BY_CONTRACT;
+            case TOOL_NOT_ALLOWED_IN_TASK_PHASE -> PolicyValidationReasonCode.TOOL_NOT_ALLOWED_IN_TASK_PHASE;
+            case MISSING_REQUIRED_INPUT -> PolicyValidationReasonCode.MISSING_REQUIRED_INPUT;
+            case INVALID_INPUT_TYPE -> PolicyValidationReasonCode.INVALID_INPUT_TYPE;
+            case INVALID_INPUT_VALUE -> PolicyValidationReasonCode.INVALID_INPUT_VALUE;
+            case MISSING_PRECONDITION -> PolicyValidationReasonCode.MISSING_PRECONDITION;
+            case V1_BOUNDARY_BLOCKED -> PolicyValidationReasonCode.V1_BOUNDARY_BLOCKED;
+        };
+    }
+
+    private boolean visibleToPlanner(ToolName toolName, PolicyValidationRequest request) {
+        return request.plannerInput().availableTools().stream()
+            .anyMatch(tool -> tool.name().equals(toolName.value()));
+    }
+
+    private String proposedToolName(PlanDecision decision) {
+        if (decision.proposedToolName() != null) {
+            return decision.proposedToolName();
+        }
+        return decision.proposedPlanStep() == null ? null : decision.proposedPlanStep().proposedToolName();
     }
 }

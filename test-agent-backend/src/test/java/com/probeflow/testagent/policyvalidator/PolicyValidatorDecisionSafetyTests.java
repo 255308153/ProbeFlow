@@ -29,7 +29,7 @@ class PolicyValidatorDecisionSafetyTests {
     private final PlannerInputFactory inputFactory = new PlannerInputFactory(
         new PlannerSafeToolCatalogService(registry, policyService)
     );
-    private final PolicyValidatorService validator = new PolicyValidatorService();
+    private final PolicyValidatorService validator = new PolicyValidatorService(registry, policyService);
 
     @Test
     void blockedPlannerDecisionBecomesBlockedValidationAndPreservesPlannerBlockers() {
