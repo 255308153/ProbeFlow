@@ -51,7 +51,7 @@ class AgentPolicyServiceTests {
 
     @Test
     void unregisteredToolNameIsBlockedWithStableReasonCode() {
-        var decision = policyService.evaluate("ticket.create-github", AgentPolicy.v2Phase2Default());
+        var decision = policyService.evaluate("unknown.missing-tool", AgentPolicy.v2Phase2Default());
 
         assertThat(decision.status()).isEqualTo(ToolPolicyStatus.BLOCKED);
         assertThat(decision.reasonCode()).isEqualTo(ToolPolicyReasonCode.UNKNOWN_TOOL);

@@ -15,6 +15,22 @@ public class AgentPolicyService {
         AgentTaskPhase.FAILURE_ANALYSIS, Set.of(ToolCapabilityGroup.FAILURE_ANALYSIS),
         AgentTaskPhase.REPORTING, Set.of(ToolCapabilityGroup.REPORTING)
     );
+    private static final Set<String> FORBIDDEN_V1_BOUNDARY_PREFIXES = Set.of(
+        "ui.",
+        "browser.",
+        "service.",
+        "db.",
+        "notify.",
+        "notification.",
+        "ticket.",
+        "github.",
+        "jira.",
+        "slack.",
+        "webhook.",
+        "ci.",
+        "mcp.",
+        "plugin."
+    );
 
     private final ToolContractRegistry registry;
 
@@ -34,6 +50,10 @@ public class AgentPolicyService {
 
     public ToolPolicyDecision evaluate(ToolName toolName, AgentPolicy policy) {
         var effectivePolicy = policy == null ? AgentPolicy.v2Phase2Default() : policy;
+        var boundaryDecision = v1BoundaryDecision(toolName, effectivePolicy);
+        if (boundaryDecision != null) {
+            return boundaryDecision;
+        }
         var contract = registry.find(toolName);
         if (contract.isEmpty()) {
             return ToolPolicyDecision.blocked(toolName, ToolPolicyReasonCode.UNKNOWN_TOOL, "Unknown tool: " + toolName);
@@ -95,6 +115,10 @@ public class AgentPolicyService {
 
     private ToolPolicyDecision evaluateContractPolicy(ToolName toolName, AgentPolicy policy) {
         var effectivePolicy = policy == null ? AgentPolicy.v2Phase2Default() : policy;
+        var boundaryDecision = v1BoundaryDecision(toolName, effectivePolicy);
+        if (boundaryDecision != null) {
+            return boundaryDecision;
+        }
         var contract = registry.find(toolName);
         if (contract.isEmpty()) {
             return ToolPolicyDecision.blocked(toolName, ToolPolicyReasonCode.UNKNOWN_TOOL, "Unknown tool: " + toolName);
@@ -198,5 +222,21 @@ public class AgentPolicyService {
             return true;
         }
         return policy.workflowMode() == AgentWorkflowMode.REVIEW_REQUIRED && !tool.readOnly();
+    }
+
+    private ToolPolicyDecision v1BoundaryDecision(ToolName toolName, AgentPolicy policy) {
+        if (toolName == null || policy == null || !policy.enforceV1BoundaryRules()) {
+            return null;
+        }
+        var value = toolName.value();
+        var blocked = FORBIDDEN_V1_BOUNDARY_PREFIXES.stream().anyMatch(value::startsWith);
+        if (!blocked) {
+            return null;
+        }
+        return ToolPolicyDecision.blocked(
+            toolName,
+            ToolPolicyReasonCode.V1_BOUNDARY_BLOCKED,
+            "Tool is blocked by V1 API-testing boundary policy: " + toolName
+        );
     }
 }
