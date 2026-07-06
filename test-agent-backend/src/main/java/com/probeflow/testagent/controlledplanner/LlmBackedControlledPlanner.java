@@ -17,9 +17,11 @@ public class LlmBackedControlledPlanner implements ControlledPlanner {
     public static final String PURPOSE = "CONTROLLED_PLANNER";
 
     private final LlmApplicationService llm;
+    private final PlanDecisionParser parser;
 
-    public LlmBackedControlledPlanner(LlmApplicationService llm) {
+    public LlmBackedControlledPlanner(LlmApplicationService llm, PlanDecisionParser parser) {
         this.llm = llm;
+        this.parser = parser;
     }
 
     @Override
@@ -41,10 +43,8 @@ public class LlmBackedControlledPlanner implements ControlledPlanner {
             ).withSourceLlmCall(result.llmCallId(), result.callResult().fakeProvider());
         }
         var response = result.callResult().response();
-        return PlanDecision.continuePlan(
-            "LLM-backed planner response received for structured parsing: " + compact(response.text()),
-            0.5d
-        ).withSourceLlmCall(result.llmCallId(), response.fakeProvider());
+        return parser.parse(response.text())
+            .withSourceLlmCall(result.llmCallId(), response.fakeProvider());
     }
 
     Map<String, Object> promptVariables(PlannerInput input) {

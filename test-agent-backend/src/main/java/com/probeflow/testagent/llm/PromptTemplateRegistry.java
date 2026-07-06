@@ -114,7 +114,11 @@ public class PromptTemplateRegistry {
                     "availableTools",
                     "constraints"
                 ),
-                "Return compact structured JSON for PlanDecision only. Do not claim that any tool was executed."
+                """
+                    Return compact structured JSON for PlanDecision only, with action, reasoning, confidence, riskLevel,
+                    optional proposedToolName/proposedPlanStep/blockers, and requiredHumanInput for WAIT_FOR_HUMAN.
+                    Do not claim that any tool was executed.
+                    """
             )
         );
     }

@@ -75,7 +75,7 @@ class LlmBackedControlledPlannerTests {
             return new LlmResponse(
                 "fake",
                 request.model(),
-                "{\"action\":\"CONTINUE\",\"reasoning\":\"continue from fake llm\"}",
+                "{\"action\":\"CONTINUE\",\"reasoning\":\"continue from fake llm\",\"confidence\":0.72,\"riskLevel\":\"LOW\"}",
                 LlmTokenUsage.of(20, 6),
                 "trace-planner",
                 true,
@@ -90,7 +90,8 @@ class LlmBackedControlledPlannerTests {
         assertThat(decision.action()).isEqualTo(PlannerAction.CONTINUE);
         assertThat(decision.sourceLlmCallId()).isNotBlank();
         assertThat(decision.fakeProvider()).isTrue();
-        assertThat(decision.reasoning()).contains("structured parsing");
+        assertThat(decision.reasoning()).isEqualTo("continue from fake llm");
+        assertThat(decision.confidence()).isEqualTo(0.72d);
         verify(provider).generate(any(LlmRequest.class));
 
         var log = logs.findById(decision.sourceLlmCallId()).orElseThrow();
@@ -103,6 +104,31 @@ class LlmBackedControlledPlannerTests {
             .contains("task-llm-planner")
             .contains("Planner-safe tools")
             .contains("knowledge.retrieve-context");
+    }
+
+    @Test
+    void llmBackedPlannerReturnsSafeFailedDecisionWhenModelOutputIsFreeText() {
+        when(provider.providerName()).thenReturn("fake");
+        when(provider.generate(any())).thenAnswer(invocation -> {
+            LlmRequest request = invocation.getArgument(0);
+            return new LlmResponse(
+                "fake",
+                request.model(),
+                "Just continue the current plan.",
+                LlmTokenUsage.of(18, 5),
+                "trace-free-text",
+                true,
+                Map.of("purpose", request.purpose())
+            );
+        });
+
+        var decision = planner.plan(input());
+
+        assertThat(decision.failed()).isTrue();
+        assertThat(decision.action()).isEqualTo(PlannerAction.STOP);
+        assertThat(decision.blockers()).containsExactly("NON_STRUCTURED_OUTPUT");
+        assertThat(decision.sourceLlmCallId()).isNotBlank();
+        assertThat(decision.fakeProvider()).isTrue();
     }
 
     @Test
