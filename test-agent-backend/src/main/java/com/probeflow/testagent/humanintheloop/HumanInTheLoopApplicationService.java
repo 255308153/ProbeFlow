@@ -1,6 +1,8 @@
 package com.probeflow.testagent.humanintheloop;
 
 import com.probeflow.testagent.agentpolicy.ToolRiskLevel;
+import com.probeflow.testagent.memory.MemoryCandidateRequest;
+import com.probeflow.testagent.memory.MemorySourceType;
 import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.task.TaskStatus;
@@ -9,6 +11,7 @@ import com.probeflow.testagent.testcasegeneration.TestCasePromotionService;
 import com.probeflow.testagent.testcasedraft.DraftStatus;
 import com.probeflow.testagent.testcasedraft.TestCaseDraft;
 import com.probeflow.testagent.testcasedraft.TestCaseDraftRepository;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -129,6 +132,52 @@ public class HumanInTheLoopApplicationService {
     @Transactional(readOnly = true)
     public List<HumanDecisionRecord> decisionsForTask(String taskId) {
         return decisions.findByTaskIdOrderByCreatedAtAsc(taskId);
+    }
+
+    @Transactional
+    public HumanFeedbackMemoryCandidateResult generateMemoryCandidateForDecision(String decisionId) {
+        if (decisionId == null || decisionId.isBlank()) {
+            return HumanFeedbackMemoryCandidateResult.rejected(
+                List.of("Human decision id is required"),
+                Map.of("decisionId", "")
+            );
+        }
+        var decision = decisions.findById(decisionId.trim());
+        if (decision.isEmpty()) {
+            return HumanFeedbackMemoryCandidateResult.rejected(
+                List.of("Human decision not found: " + decisionId.trim()),
+                Map.of("decisionId", decisionId.trim())
+            );
+        }
+        var request = humanRequests.findById(decision.get().getRequestId());
+        if (request.isEmpty()) {
+            return HumanFeedbackMemoryCandidateResult.rejected(
+                List.of("Human request not found: " + decision.get().getRequestId()),
+                Map.of("decisionId", decision.get().getDecisionId(), "requestId", decision.get().getRequestId())
+            );
+        }
+        var task = tasks.findById(decision.get().getTaskId());
+        if (task.isEmpty()) {
+            return HumanFeedbackMemoryCandidateResult.rejected(
+                List.of("Task not found: " + decision.get().getTaskId()),
+                Map.of("decisionId", decision.get().getDecisionId(), "taskId", decision.get().getTaskId())
+            );
+        }
+        if (!memoryCandidateSupported(request.get(), decision.get())) {
+            return HumanFeedbackMemoryCandidateResult.rejected(
+                List.of("Human decision is not eligible for Phase 6 memory candidate handoff"),
+                Map.of(
+                    "decisionId", decision.get().getDecisionId(),
+                    "requestId", request.get().getRequestId(),
+                    "requestType", request.get().getRequestType().name(),
+                    "decisionType", decision.get().getDecisionType().name()
+                )
+            );
+        }
+
+        var candidate = memoryCandidate(task.get(), request.get(), decision.get());
+        var audit = recordMemoryCandidateAudit(task.get(), request.get(), decision.get(), candidate);
+        return HumanFeedbackMemoryCandidateResult.generated(candidate, audit);
     }
 
     @Transactional
@@ -853,6 +902,177 @@ public class HumanInTheLoopApplicationService {
         tasks.save(task);
 
         return Map.of("plannerClarification", compactRecord);
+    }
+
+    private boolean memoryCandidateSupported(HumanReviewRequest request, HumanDecisionRecord decision) {
+        return switch (request.getRequestType()) {
+            case DRAFT_REVIEW -> decision.getDecisionType() == HumanDecisionType.PROMOTE_DRAFT
+                || decision.getDecisionType() == HumanDecisionType.DISCARD_DRAFT
+                || decision.getDecisionType() == HumanDecisionType.REQUEST_CHANGES;
+            case BLOCKER_RESOLUTION, MISSING_INPUT -> decision.getDecisionType() == HumanDecisionType.PROVIDE_INPUT
+                || decision.getDecisionType() == HumanDecisionType.RESOLVE_BLOCKER;
+            case HIGH_RISK_APPROVAL -> decision.getDecisionType() == HumanDecisionType.REJECT;
+            case PLANNER_CLARIFICATION -> decision.getDecisionType() == HumanDecisionType.PROVIDE_INPUT;
+            case REVIEW_COMPLETION -> false;
+        };
+    }
+
+    private MemoryCandidateRequest memoryCandidate(
+        Task task,
+        HumanReviewRequest request,
+        HumanDecisionRecord decision
+    ) {
+        var sanitizedRequestMetadata = sanitizeMap(request.getMetadata());
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("phase", "V2_PHASE_6");
+        metadata.put("handoffType", "HUMAN_FEEDBACK_MEMORY_CANDIDATE");
+        metadata.put("writesLongTermMemory", false);
+        metadata.put("taskId", task.getTaskId());
+        metadata.put("taskStatus", task.getStatus().name());
+        metadata.put("requestId", request.getRequestId());
+        metadata.put("requestType", request.getRequestType().name());
+        metadata.put("requestStatus", request.getStatus().name());
+        metadata.put("decisionId", decision.getDecisionId());
+        metadata.put("decisionType", decision.getDecisionType().name());
+        metadata.put("actor", decision.getActor());
+        metadata.put("reason", decision.getReason());
+        metadata.put("sourceTrigger", request.getSourceTrigger());
+        metadata.put("sourceStepId", request.getSourceStepId());
+        metadata.put("plannerDecisionId", request.getPlannerDecisionId());
+        metadata.put("policyReason", request.getPolicyReason());
+        metadata.put("sanitizedSummary", decision.getSanitizedPayloadSummary());
+        metadata.put("requestMetadataSummary", sanitizedRequestMetadata);
+
+        return new MemoryCandidateRequest(
+            memoryCandidateSummary(request, decision),
+            memoryCandidateContent(request, decision, sanitizedRequestMetadata),
+            MemorySourceType.USER_FEEDBACK,
+            "human-decision:" + decision.getDecisionId(),
+            task.getTaskId(),
+            memoryCandidateTags(request, decision),
+            0.72f,
+            memoryCandidateEvidence(request, decision, sanitizedRequestMetadata),
+            compact(metadata)
+        );
+    }
+
+    private String memoryCandidateSummary(HumanReviewRequest request, HumanDecisionRecord decision) {
+        return "Human "
+            + decision.getDecisionType().name()
+            + " feedback for "
+            + request.getRequestType().name()
+            + " on task "
+            + decision.getTaskId();
+    }
+
+    private String memoryCandidateContent(
+        HumanReviewRequest request,
+        HumanDecisionRecord decision,
+        Map<String, Object> sanitizedRequestMetadata
+    ) {
+        return "requestType=" + request.getRequestType().name()
+            + "; decisionType=" + decision.getDecisionType().name()
+            + "; actor=" + decision.getActor()
+            + "; reason=" + metadataString(decision.getReason())
+            + "; waitingReason=" + request.getWaitingReason()
+            + "; payloadSummary={" + metadataDescription(decision.getSanitizedPayloadSummary()) + "}"
+            + "; requestMetadataSummary={" + metadataDescription(sanitizedRequestMetadata) + "}";
+    }
+
+    private String memoryCandidateEvidence(
+        HumanReviewRequest request,
+        HumanDecisionRecord decision,
+        Map<String, Object> sanitizedRequestMetadata
+    ) {
+        return "HumanReviewRequest(" + request.getRequestId() + ") "
+            + "HumanDecisionRecord(" + decision.getDecisionId() + ") "
+            + "task=" + decision.getTaskId()
+            + " actor=" + decision.getActor()
+            + " reason=" + metadataString(decision.getReason())
+            + " sanitizedPayload={" + metadataDescription(decision.getSanitizedPayloadSummary()) + "}"
+            + " requestMetadata={" + metadataDescription(sanitizedRequestMetadata) + "}";
+    }
+
+    private List<String> memoryCandidateTags(HumanReviewRequest request, HumanDecisionRecord decision) {
+        var tags = new LinkedHashSet<String>();
+        tags.add("human-feedback");
+        tags.add(tagName(request.getRequestType().name()));
+        tags.add(tagName(decision.getDecisionType().name()));
+        if (request.getRequestType() == HumanRequestType.HIGH_RISK_APPROVAL) {
+            tags.add("high-risk");
+        }
+        if (request.getRequestType() == HumanRequestType.PLANNER_CLARIFICATION) {
+            tags.add("planner-clarification");
+        }
+        if (request.getRequestType() == HumanRequestType.BLOCKER_RESOLUTION
+            || request.getRequestType() == HumanRequestType.MISSING_INPUT) {
+            tags.add("blocker-resolution");
+        }
+        return List.copyOf(tags);
+    }
+
+    private Map<String, Object> recordMemoryCandidateAudit(
+        Task task,
+        HumanReviewRequest request,
+        HumanDecisionRecord decision,
+        MemoryCandidateRequest candidate
+    ) {
+        var metadata = mutableMetadata(task);
+        var alreadyRecorded = memoryCandidateRecords(metadata).stream()
+            .anyMatch(record -> decision.getDecisionId().equals(metadataString(record.get("decisionId"))));
+        var audit = new LinkedHashMap<String, Object>();
+        audit.put("taskId", task.getTaskId());
+        audit.put("requestId", request.getRequestId());
+        audit.put("decisionId", decision.getDecisionId());
+        audit.put("sourceRef", candidate.sourceRef());
+        audit.put("sourceType", candidate.sourceType().name());
+        audit.put("writesLongTermMemory", false);
+        audit.put("idempotent", alreadyRecorded);
+        if (!alreadyRecorded) {
+            audit.put("generatedAt", Instant.now().toString());
+            appendMetadataRecord(metadata, "humanFeedbackMemoryCandidates", compact(audit));
+            task.setMetadata(Map.copyOf(metadata));
+            tasks.save(task);
+        }
+        return compact(audit);
+    }
+
+    private List<Map<String, Object>> memoryCandidateRecords(Map<String, Object> metadata) {
+        var records = new ArrayList<Map<String, Object>>();
+        var existing = metadata.get("humanFeedbackMemoryCandidates");
+        if (existing instanceof List<?> values) {
+            for (var value : values) {
+                if (value instanceof Map<?, ?> map) {
+                    var copied = new LinkedHashMap<String, Object>();
+                    map.forEach((key, item) -> copied.put(String.valueOf(key), item));
+                    records.add(Map.copyOf(copied));
+                }
+            }
+        }
+        return List.copyOf(records);
+    }
+
+    private String tagName(String value) {
+        return value == null ? "" : value.toLowerCase().replace('_', '-');
+    }
+
+    private String metadataDescription(Map<String, Object> values) {
+        var parts = values.entrySet().stream()
+            .map(entry -> entry.getKey() + "=" + metadataValueDescription(entry.getValue()))
+            .toList();
+        return String.join("; ", parts);
+    }
+
+    private String metadataValueDescription(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            var copied = new LinkedHashMap<String, Object>();
+            map.forEach((key, item) -> copied.put(String.valueOf(key), item));
+            return "{" + metadataDescription(copied) + "}";
+        }
+        if (value instanceof List<?> list) {
+            return "[" + String.join(", ", list.stream().map(this::metadataValueDescription).toList()) + "]";
+        }
+        return value == null ? "" : value.toString();
     }
 
     private void recordHighRiskDecision(
