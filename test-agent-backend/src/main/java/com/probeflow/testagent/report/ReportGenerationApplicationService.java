@@ -5,6 +5,8 @@ import com.probeflow.testagent.apispec.ApiSpecRepository;
 import com.probeflow.testagent.executionrecord.ExecutionRecord;
 import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.OverallStatus;
+import com.probeflow.testagent.failureanalysis.FailureAnalysisApplicationService;
+import com.probeflow.testagent.failureanalysis.FailureAnalysisRequest;
 import com.probeflow.testagent.observation.AnalysisLevel;
 import com.probeflow.testagent.observation.Observation;
 import com.probeflow.testagent.observation.ObservationRepository;
@@ -33,6 +35,7 @@ public class ReportGenerationApplicationService {
     private final TaskCaseExecutionRepository taskCaseExecutions;
     private final ExecutionRecordRepository executionRecords;
     private final ObservationRepository observations;
+    private final FailureAnalysisApplicationService failureAnalysis;
     private final ReportRepository reports;
 
     public ReportGenerationApplicationService(
@@ -42,6 +45,7 @@ public class ReportGenerationApplicationService {
         TaskCaseExecutionRepository taskCaseExecutions,
         ExecutionRecordRepository executionRecords,
         ObservationRepository observations,
+        FailureAnalysisApplicationService failureAnalysis,
         ReportRepository reports
     ) {
         this.tasks = tasks;
@@ -50,6 +54,7 @@ public class ReportGenerationApplicationService {
         this.taskCaseExecutions = taskCaseExecutions;
         this.executionRecords = executionRecords;
         this.observations = observations;
+        this.failureAnalysis = failureAnalysis;
         this.reports = reports;
     }
 
@@ -62,6 +67,7 @@ public class ReportGenerationApplicationService {
         var records = executionRecords.findAllByTaskIdOrderByCreatedAtAscExecutionIdAsc(task.getTaskId());
         var caseIds = caseIds(task, taskExecutions, records);
         var executionSummary = executionSummary(task, caseIds, taskExecutions, records);
+        var analysisCoverage = ensureBasicAnalysis(records);
         var state = reportState(caseIds.size(), records.size());
 
         var report = new Report();
@@ -75,7 +81,7 @@ public class ReportGenerationApplicationService {
         var findings = findings(task, state, caseIds, records, executionSummary);
         report.setFindings(findings);
         report.setSuggestions(suggestions(findings));
-        report.setMetadata(metadata(task, caseIds, taskExecutions, records, state, executionSummary));
+        report.setMetadata(metadata(task, caseIds, taskExecutions, records, state, executionSummary, analysisCoverage));
 
         var saved = reports.save(report);
         return new ReportGenerationResult(
@@ -373,11 +379,61 @@ public class ReportGenerationApplicationService {
         return byKey.values().stream()
             .sorted(Comparator
                 .comparingInt((Map<String, Object> suggestion) -> priorityRank(stringValue(suggestion.get("priority"))))
+                .thenComparingInt(suggestion -> suggestionCategoryRank(stringValue(suggestion.get("category"))))
                 .thenComparing(suggestion -> sortValue(suggestion.get("category")))
                 .thenComparing(suggestion -> sortValue(suggestion.get("classification")))
                 .thenComparing(suggestion -> sortValue(suggestion.get("primaryApiSpecId")))
                 .thenComparing(suggestion -> sortValue(suggestion.get("action"))))
             .toList();
+    }
+
+    private AnalysisCoverage ensureBasicAnalysis(List<ExecutionRecord> records) {
+        var eligibleExecutionIds = new ArrayList<String>();
+        var existingAnalysisExecutionIds = new ArrayList<String>();
+        var generatedAnalysisExecutionIds = new ArrayList<String>();
+        var generatedObservationIds = new ArrayList<String>();
+        var missingAnalysisExecutionIds = new ArrayList<String>();
+        var ineligibleExecutionIds = new ArrayList<String>();
+
+        for (var record : records) {
+            if (!requiresBasicAnalysis(record)) {
+                ineligibleExecutionIds.add(record.getExecutionId());
+                continue;
+            }
+            eligibleExecutionIds.add(record.getExecutionId());
+            var existing = observations.findAllByExecutionIdAndAnalysisLevelOrderByCreatedAtAscObservationIdAsc(
+                record.getExecutionId(),
+                AnalysisLevel.BASIC
+            );
+            if (!existing.isEmpty()) {
+                existingAnalysisExecutionIds.add(record.getExecutionId());
+                continue;
+            }
+
+            var result = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
+            if (result.observationIds().isEmpty()) {
+                missingAnalysisExecutionIds.add(record.getExecutionId());
+            } else {
+                generatedAnalysisExecutionIds.add(record.getExecutionId());
+                generatedObservationIds.addAll(result.observationIds());
+            }
+        }
+
+        return new AnalysisCoverage(
+            eligibleExecutionIds,
+            existingAnalysisExecutionIds,
+            generatedAnalysisExecutionIds,
+            generatedObservationIds,
+            missingAnalysisExecutionIds,
+            ineligibleExecutionIds
+        );
+    }
+
+    private boolean requiresBasicAnalysis(ExecutionRecord record) {
+        return record.getOverallStatus() == OverallStatus.FAILED
+            || record.getOverallStatus() == OverallStatus.ERROR
+            || record.getOverallStatus() == OverallStatus.BLOCKED
+            || record.getOverallStatus() == OverallStatus.PASSED_WITH_WARNINGS;
     }
 
     private Map<String, Object> suggestionFor(Map<String, Object> finding, String classification) {
@@ -549,6 +605,28 @@ public class ReportGenerationApplicationService {
             return 2;
         }
         return 3;
+    }
+
+    private int suggestionCategoryRank(String category) {
+        if ("AUTH".equals(category)) {
+            return 0;
+        }
+        if ("DATA_QUALITY".equals(category)) {
+            return 1;
+        }
+        if ("RETRY".equals(category)) {
+            return 2;
+        }
+        if ("BLOCKER".equals(category)) {
+            return 3;
+        }
+        if ("INVESTIGATION".equals(category)) {
+            return 4;
+        }
+        if ("REVIEW".equals(category)) {
+            return 5;
+        }
+        return 6;
     }
 
     private List<String> affectedApiSpecIds(ExecutionRecord record, FindingContext context) {
@@ -754,7 +832,8 @@ public class ReportGenerationApplicationService {
         List<TaskCaseExecution> taskExecutions,
         List<ExecutionRecord> records,
         String state,
-        ExecutionSummary executionSummary
+        ExecutionSummary executionSummary,
+        AnalysisCoverage analysisCoverage
     ) {
         var metadata = new LinkedHashMap<String, Object>();
         metadata.put("schemaVersion", "phase8.v1");
@@ -769,6 +848,7 @@ public class ReportGenerationApplicationService {
         metadata.put("executionSummary", executionSummary.toMetadata());
         metadata.put("coverage", coverageMetadata(task, records));
         metadata.put("executionModes", executionModeCounts(taskExecutions));
+        metadata.put("analysisCoverage", analysisCoverage.toMetadata());
         metadata.put("task", taskMetadata(task));
         return metadata;
     }
@@ -1013,5 +1093,34 @@ public class ReportGenerationApplicationService {
         Map<String, ApiSpec> apiSpecById,
         Map<String, List<Observation>> observationsByExecutionId
     ) {
+    }
+
+    private record AnalysisCoverage(
+        List<String> eligibleExecutionIds,
+        List<String> existingAnalysisExecutionIds,
+        List<String> generatedAnalysisExecutionIds,
+        List<String> generatedObservationIds,
+        List<String> missingAnalysisExecutionIds,
+        List<String> ineligibleExecutionIds
+    ) {
+
+        private Map<String, Object> toMetadata() {
+            var metadata = new LinkedHashMap<String, Object>();
+            metadata.put("mode", "BASIC");
+            metadata.put("deepAnalysisRequested", false);
+            metadata.put("eligibleExecutionCount", eligibleExecutionIds.size());
+            metadata.put("existingBasicAnalysisCount", existingAnalysisExecutionIds.size());
+            metadata.put("generatedBasicAnalysisCount", generatedAnalysisExecutionIds.size());
+            metadata.put("missingBasicAnalysisCount", missingAnalysisExecutionIds.size());
+            metadata.put("analysisComplete", missingAnalysisExecutionIds.isEmpty());
+            metadata.put("staleAnalysis", false);
+            metadata.put("eligibleExecutionIds", eligibleExecutionIds);
+            metadata.put("existingAnalysisExecutionIds", existingAnalysisExecutionIds);
+            metadata.put("generatedAnalysisExecutionIds", generatedAnalysisExecutionIds);
+            metadata.put("generatedObservationIds", generatedObservationIds);
+            metadata.put("missingAnalysisExecutionIds", missingAnalysisExecutionIds);
+            metadata.put("ineligibleExecutionIds", ineligibleExecutionIds);
+            return metadata;
+        }
     }
 }

@@ -586,7 +586,7 @@ class ReportGenerationApplicationServiceTests {
         var report = reports.findById(result.reportId()).orElseThrow();
         assertThat(report.getSuggestions()).hasSize(3);
         assertThat(report.getSuggestions()).extracting(suggestion -> suggestion.get("priority"))
-            .containsExactly("P0", "P1", "P2");
+            .containsExactly("P0", "P1", "P1");
         assertThat(report.getSuggestions().get(0))
             .containsEntry("category", "AUTH")
             .containsEntry("priority", "P0")
@@ -617,7 +617,7 @@ class ReportGenerationApplicationServiceTests {
 
         assertThat(report.getSuggestions().get(2))
             .containsEntry("category", "INVESTIGATION")
-            .containsEntry("priority", "P2")
+            .containsEntry("priority", "P1")
             .containsEntry("classification", "VALIDATION_ISSUE")
             .containsEntry("primaryApiSpecId", "api-validation-suggestion")
             .containsEntry("retryable", false);
@@ -629,6 +629,161 @@ class ReportGenerationApplicationServiceTests {
         assertThat(report.getFindings()).anySatisfy(finding -> assertThat(finding)
             .containsEntry("classification", "VALIDATION_ISSUE")
             .containsEntry("executionId", validation.getExecutionId()));
+    }
+
+    @Test
+    void reusesExistingBasicObservationsAndSkipsIneligiblePassedExecutions() {
+        apiSpecs.save(newApiSpec("api-reuse-failed", HttpMethod.GET, "/api/reuse-failed"));
+        apiSpecs.save(newApiSpec("api-reuse-passed", HttpMethod.GET, "/api/reuse-passed"));
+        var task = tasks.save(newTask(
+            "task-analysis-reuse",
+            List.of("api-reuse-failed", "api-reuse-passed"),
+            Map.of("environment", "qa")
+        ));
+        var failedCase = testCases.save(newTestCase("case-analysis-reuse-failed", "api-reuse-failed"));
+        var passedCase = testCases.save(newTestCase("case-analysis-reuse-passed", "api-reuse-passed"));
+        var failed = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            failedCase.getCaseId(),
+            "qa",
+            "api-reuse-failed",
+            OverallStatus.FAILED,
+            25L,
+            500,
+            Map.of("statusCode", 500),
+            null,
+            List.of()
+        ));
+        var passed = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            passedCase.getCaseId(),
+            "qa",
+            "api-reuse-passed",
+            OverallStatus.PASSED,
+            8L
+        ));
+        var existingObservation = observations.save(newObservation(
+            task.getTaskId(),
+            failed.getExecutionId(),
+            ObservationType.RISK_EVALUATION,
+            ObservationRiskLevel.HIGH,
+            "Existing server error analysis",
+            "Existing analysis should be reused",
+            "Escalate existing finding"
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = reportGeneration.generateTaskReport(ReportGenerationRequest.forTask(task.getTaskId()));
+
+        assertThat(observations.findAllByExecutionIdAndAnalysisLevelOrderByCreatedAtAscObservationIdAsc(
+            failed.getExecutionId(),
+            AnalysisLevel.BASIC
+        )).singleElement()
+            .satisfies(observation -> assertThat(observation.getObservationId()).isEqualTo(existingObservation.getObservationId()));
+        assertThat(observations.findAllByExecutionIdAndAnalysisLevelOrderByCreatedAtAscObservationIdAsc(
+            passed.getExecutionId(),
+            AnalysisLevel.BASIC
+        )).isEmpty();
+
+        var report = reports.findById(result.reportId()).orElseThrow();
+        @SuppressWarnings("unchecked")
+        var analysisCoverage = (Map<String, Object>) report.getMetadata().get("analysisCoverage");
+        assertThat(analysisCoverage)
+            .containsEntry("mode", "BASIC")
+            .containsEntry("deepAnalysisRequested", false)
+            .containsEntry("eligibleExecutionCount", 1)
+            .containsEntry("existingBasicAnalysisCount", 1)
+            .containsEntry("generatedBasicAnalysisCount", 0)
+            .containsEntry("missingBasicAnalysisCount", 0)
+            .containsEntry("analysisComplete", true);
+        assertThat((List<String>) analysisCoverage.get("existingAnalysisExecutionIds"))
+            .containsExactly(failed.getExecutionId());
+        assertThat((List<String>) analysisCoverage.get("ineligibleExecutionIds"))
+            .containsExactly(passed.getExecutionId());
+        assertThat(report.getFindings()).anySatisfy(finding -> assertThat(finding)
+            .containsEntry("executionId", failed.getExecutionId())
+            .containsEntry("observationIds", List.of(existingObservation.getObservationId()))
+            .containsEntry("evidenceType", "FACTUAL_AND_INFERRED"));
+
+        entityManager.flush();
+        entityManager.clear();
+        assertThat(executionRecords.findById(failed.getExecutionId()).orElseThrow().getOverallStatus())
+            .isEqualTo(OverallStatus.FAILED);
+        assertThat(testCases.findById(failedCase.getCaseId()).orElseThrow().getTitle())
+            .isEqualTo("Generated case " + failedCase.getCaseId());
+    }
+
+    @Test
+    void triggersMissingBasicAnalysisOnceForEligibleExecutionWithoutDeepOrLlmDependency() {
+        apiSpecs.save(newApiSpec("api-analysis-missing", HttpMethod.GET, "/api/analysis-missing"));
+        var task = tasks.save(newTask(
+            "task-analysis-missing",
+            List.of("api-analysis-missing"),
+            Map.of("environment", "qa")
+        ));
+        var testCase = testCases.save(newTestCase("case-analysis-missing", "api-analysis-missing"));
+        var failed = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            testCase.getCaseId(),
+            "qa",
+            "api-analysis-missing",
+            OverallStatus.FAILED,
+            44L,
+            500,
+            Map.of("statusCode", 500),
+            null,
+            List.of()
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var firstResult = reportGeneration.generateTaskReport(ReportGenerationRequest.forTask(task.getTaskId()));
+
+        var generated = observations.findAllByExecutionIdAndAnalysisLevelOrderByCreatedAtAscObservationIdAsc(
+            failed.getExecutionId(),
+            AnalysisLevel.BASIC
+        );
+        assertThat(generated).singleElement()
+            .satisfies(observation -> {
+                assertThat(observation.getAnalysisLevel()).isEqualTo(AnalysisLevel.BASIC);
+                assertThat(observation.getSource()).isEqualTo(ObservationSource.SYSTEM);
+                assertThat(observation.getSummary()).contains("BASIC failure analysis");
+            });
+
+        var firstReport = reports.findById(firstResult.reportId()).orElseThrow();
+        @SuppressWarnings("unchecked")
+        var firstCoverage = (Map<String, Object>) firstReport.getMetadata().get("analysisCoverage");
+        assertThat(firstCoverage)
+            .containsEntry("mode", "BASIC")
+            .containsEntry("deepAnalysisRequested", false)
+            .containsEntry("eligibleExecutionCount", 1)
+            .containsEntry("existingBasicAnalysisCount", 0)
+            .containsEntry("generatedBasicAnalysisCount", 1)
+            .containsEntry("missingBasicAnalysisCount", 0)
+            .containsEntry("analysisComplete", true);
+        assertThat((List<String>) firstCoverage.get("generatedAnalysisExecutionIds"))
+            .containsExactly(failed.getExecutionId());
+        assertThat((List<String>) firstCoverage.get("generatedObservationIds"))
+            .containsExactly(generated.getFirst().getObservationId());
+        assertThat(firstReport.getFindings()).anySatisfy(finding -> assertThat(finding)
+            .containsEntry("executionId", failed.getExecutionId())
+            .containsEntry("observationIds", List.of(generated.getFirst().getObservationId()))
+            .containsEntry("evidenceType", "FACTUAL_AND_INFERRED"));
+
+        var secondResult = reportGeneration.generateTaskReport(ReportGenerationRequest.forTask(task.getTaskId()));
+
+        assertThat(observations.findAllByExecutionIdAndAnalysisLevelOrderByCreatedAtAscObservationIdAsc(
+            failed.getExecutionId(),
+            AnalysisLevel.BASIC
+        )).hasSize(1);
+        var secondReport = reports.findById(secondResult.reportId()).orElseThrow();
+        @SuppressWarnings("unchecked")
+        var secondCoverage = (Map<String, Object>) secondReport.getMetadata().get("analysisCoverage");
+        assertThat(secondCoverage)
+            .containsEntry("existingBasicAnalysisCount", 1)
+            .containsEntry("generatedBasicAnalysisCount", 0)
+            .containsEntry("deepAnalysisRequested", false);
     }
 
     @Test
