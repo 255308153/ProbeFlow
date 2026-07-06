@@ -40,23 +40,24 @@ public class TaskOrchestrationApplicationService {
             .orElseThrow(() -> new IllegalArgumentException("Task not found: " + taskId));
         var blockers = new ArrayList<String>();
         var orderedSteps = planSteps.findByTaskIdOrderByStepOrderAsc(task.getTaskId());
+        String reportId = null;
 
         if (task.getStatus() == TaskStatus.CANCELLED) {
             blockers.add("Task is cancelled");
-            return result(task, orderedSteps, blockers);
+            return result(task, orderedSteps, reportId, blockers);
         }
         if (orderedSteps.isEmpty()) {
             blockers.add("Task has no PlanSteps");
             task.setStatus(TaskStatus.FAILED);
             tasks.save(task);
-            return result(task, orderedSteps, blockers);
+            return result(task, orderedSteps, reportId, blockers);
         }
 
         for (int i = 0; i < orderedSteps.size(); i++) {
             task = tasks.findById(task.getTaskId()).orElseThrow();
             if (task.getStatus() == TaskStatus.CANCELLED) {
                 blockers.add("Task is cancelled");
-                return result(task, orderedSteps, blockers);
+                return result(task, orderedSteps, reportId, blockers);
             }
 
             var step = orderedSteps.get(i);
@@ -68,19 +69,22 @@ public class TaskOrchestrationApplicationService {
                 skipDownstream(orderedSteps, i + 1);
                 task.setStatus(TaskStatus.FAILED);
                 tasks.save(task);
-                return result(task, orderedSteps, blockers);
+                return result(task, orderedSteps, reportId, blockers);
             }
 
             var outcome = runStep(task, step);
+            if (step.getStepType() == PlanStepType.GENERATE_REPORT && !outcome.resultRefs().isEmpty()) {
+                reportId = outcome.resultRefs().getFirst();
+            }
             blockers.addAll(outcome.blockerDetails());
             if (outcome.stepStatus() == PlanStepStatus.FAILED) {
                 skipDownstream(orderedSteps, i + 1);
                 task = tasks.findById(task.getTaskId()).orElseThrow();
-                return result(task, orderedSteps, blockers);
+                return result(task, orderedSteps, reportId, blockers);
             }
             if (outcome.stopOrchestration()) {
                 task = tasks.findById(task.getTaskId()).orElseThrow();
-                return result(task, orderedSteps, blockers);
+                return result(task, orderedSteps, reportId, blockers);
             }
         }
 
@@ -89,7 +93,7 @@ public class TaskOrchestrationApplicationService {
             task.setStatus(TaskStatus.COMPLETED);
             tasks.save(task);
         }
-        return result(task, orderedSteps, blockers);
+        return result(task, orderedSteps, reportId, blockers);
     }
 
     private StepOutcome runStep(Task task, PlanStep step) {
@@ -137,10 +141,15 @@ public class TaskOrchestrationApplicationService {
         }
     }
 
-    private TaskOrchestrationResult result(Task task, List<PlanStep> orderedSteps, List<String> blockers) {
+    private TaskOrchestrationResult result(
+        Task task,
+        List<PlanStep> orderedSteps,
+        String reportId,
+        List<String> blockers
+    ) {
         var completedStepCount = (int) orderedSteps.stream()
             .filter(step -> step.getStepStatus() == PlanStepStatus.SUCCESS)
             .count();
-        return new TaskOrchestrationResult(task.getTaskId(), task.getStatus(), completedStepCount, blockers);
+        return new TaskOrchestrationResult(task.getTaskId(), task.getStatus(), completedStepCount, reportId, blockers);
     }
 }

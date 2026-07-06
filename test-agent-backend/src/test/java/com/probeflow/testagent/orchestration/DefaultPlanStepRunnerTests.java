@@ -41,6 +41,7 @@ import com.probeflow.testagent.testcasegeneration.TestCaseGenerationCounts;
 import com.probeflow.testagent.testcasegeneration.TestCaseGenerationMode;
 import com.probeflow.testagent.testcasegeneration.TestCaseGenerationRequest;
 import com.probeflow.testagent.testcasegeneration.TestCaseGenerationResult;
+import com.probeflow.testagent.testcasegeneration.TestCasePromotionService;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -64,6 +65,9 @@ class DefaultPlanStepRunnerTests {
     private TestCaseGenerationApplicationService testCaseGeneration;
 
     @Mock
+    private TestCasePromotionService testCasePromotion;
+
+    @Mock
     private HttpExecutionApplicationService httpExecution;
 
     @Mock
@@ -80,6 +84,7 @@ class DefaultPlanStepRunnerTests {
             apiAnalysis,
             knowledgeRetrieval,
             testCaseGeneration,
+            testCasePromotion,
             httpExecution,
             failureAnalysis,
             reportGeneration

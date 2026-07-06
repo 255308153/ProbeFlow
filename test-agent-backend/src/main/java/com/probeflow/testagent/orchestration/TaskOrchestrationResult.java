@@ -7,6 +7,7 @@ public record TaskOrchestrationResult(
     String taskId,
     TaskStatus finalStatus,
     int completedStepCount,
+    String reportId,
     List<String> blockerDetails
 ) {
 
