@@ -245,6 +245,43 @@ public class HumanInTheLoopApplicationService {
     }
 
     @Transactional
+    public HumanInputResolutionResult applyBlockerResolutionDecision(HumanDecisionSubmissionRequest request) {
+        var audit = new LinkedHashMap<String, Object>();
+        audit.put("requestId", request == null ? null : request.requestId());
+        audit.put("decisionType", request == null || request.decisionType() == null ? null : request.decisionType().name());
+        audit.put("actor", request == null ? null : request.actor());
+        var humanRequest = request == null || request.requestId().isBlank()
+            ? Optional.<HumanReviewRequest>empty()
+            : humanRequests.findById(request.requestId());
+
+        var validationBlockers = validateBlockerResolutionDecision(request, humanRequest);
+        if (!validationBlockers.isEmpty()) {
+            return HumanInputResolutionResult.rejected(validationBlockers, compact(audit));
+        }
+
+        var submission = submitDecision(request);
+        if (submission.status() == HumanDecisionSubmissionStatus.REJECTED) {
+            return HumanInputResolutionResult.rejected(submission.blockers(), submission.auditSummary());
+        }
+
+        recordBlockerResolution(submission.request(), submission.decision(), request.payload());
+        var consumption = consumeDecision(new HumanDecisionConsumptionRequest(request.requestId(), "blocker-resolution-workflow"));
+        if (consumption.status() == HumanDecisionConsumptionStatus.REJECTED) {
+            return HumanInputResolutionResult.rejected(consumption.blockers(), consumption.auditSummary());
+        }
+
+        var resultAudit = new LinkedHashMap<String, Object>();
+        resultAudit.putAll(submission.auditSummary());
+        resultAudit.put("consumptionStatus", consumption.status().name());
+        resultAudit.put("taskStatus", tasks.findById(submission.request().getTaskId()).orElseThrow().getStatus().name());
+        return HumanInputResolutionResult.applied(
+            consumption.request(),
+            submission.decision(),
+            compact(resultAudit)
+        );
+    }
+
+    @Transactional
     public HumanDecisionSubmissionResult submitDecision(HumanDecisionSubmissionRequest request) {
         var baseAudit = new LinkedHashMap<String, Object>();
         baseAudit.put("requestId", request == null ? null : request.requestId());
@@ -420,6 +457,49 @@ public class HumanInTheLoopApplicationService {
             || decisionType == HumanDecisionType.REQUEST_CHANGES;
     }
 
+    private List<String> validateBlockerResolutionDecision(
+        HumanDecisionSubmissionRequest request,
+        Optional<HumanReviewRequest> humanRequest
+    ) {
+        if (request == null || request.requestId().isBlank()) {
+            return List.of("Human request id is required");
+        }
+        if (humanRequest.isEmpty()) {
+            return List.of("Human request not found: " + request.requestId());
+        }
+
+        var blockers = new ArrayList<String>();
+        if (!blockerResolutionRequestType(humanRequest.get().getRequestType())) {
+            blockers.add("Human request is not a blocker resolution request: " + humanRequest.get().getRequestType().name());
+        }
+        if (humanRequest.get().getStatus() != HumanRequestStatus.PENDING) {
+            blockers.add("Human request is not pending: " + humanRequest.get().getStatus().name());
+        }
+        if (!blockerResolutionDecisionType(request.decisionType())) {
+            blockers.add("Unsupported blocker resolution decision type: "
+                + (request.decisionType() == null ? "null" : request.decisionType().name()));
+        }
+        var task = tasks.findById(humanRequest.get().getTaskId());
+        if (task.isEmpty()) {
+            blockers.add("Task not found: " + humanRequest.get().getTaskId());
+        } else if (task.get().getStatus() == TaskStatus.COMPLETED) {
+            blockers.add("Completed task cannot consume blocker resolution decision");
+        } else if (task.get().getStatus() == TaskStatus.CANCELLED) {
+            blockers.add("Cancelled task cannot consume blocker resolution decision");
+        }
+        return List.copyOf(blockers);
+    }
+
+    private boolean blockerResolutionRequestType(HumanRequestType requestType) {
+        return requestType == HumanRequestType.MISSING_INPUT
+            || requestType == HumanRequestType.BLOCKER_RESOLUTION;
+    }
+
+    private boolean blockerResolutionDecisionType(HumanDecisionType decisionType) {
+        return decisionType == HumanDecisionType.PROVIDE_INPUT
+            || decisionType == HumanDecisionType.RESOLVE_BLOCKER;
+    }
+
     private List<String> draftIds(Object value) {
         if (!(value instanceof List<?> values)) {
             return List.of();
@@ -514,6 +594,65 @@ public class HumanInTheLoopApplicationService {
         }
         records.add(Map.copyOf(record));
         metadata.put(key, List.copyOf(records));
+    }
+
+    private void recordBlockerResolution(
+        HumanReviewRequest request,
+        HumanDecisionRecord decision,
+        Map<String, Object> payload
+    ) {
+        var task = tasks.findById(request.getTaskId()).orElseThrow();
+        var metadata = mutableMetadata(task);
+        metadata.remove("requiredHumanInput");
+        mergeMetadataMap(metadata, "humanInputContext", payload);
+        mergeMetadataMap(metadata, "humanInputContextSummary", decision.getSanitizedPayloadSummary());
+
+        var record = new LinkedHashMap<String, Object>();
+        record.put("requestId", request.getRequestId());
+        record.put("decisionId", decision.getDecisionId());
+        record.put("requestType", request.getRequestType().name());
+        record.put("decisionType", decision.getDecisionType().name());
+        record.put("actor", decision.getActor());
+        record.put("reason", decision.getReason());
+        record.put("sourceTrigger", request.getSourceTrigger());
+        record.put("sourceStepId", request.getSourceStepId());
+        record.put("policyReason", request.getPolicyReason());
+        record.put("blockers", request.getMetadata().get("blockers"));
+        record.put("payloadSummary", decision.getSanitizedPayloadSummary());
+        appendMetadataRecord(metadata, "humanInputResolutionRecords", compact(record));
+        metadata.put("lastHumanInputResolution", compact(record));
+        task.setMetadata(Map.copyOf(metadata));
+        task.setStatus(resumeStatusAfterHumanInput(task, metadata));
+        tasks.save(task);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void mergeMetadataMap(Map<String, Object> metadata, String key, Map<String, Object> values) {
+        if (values == null || values.isEmpty()) {
+            return;
+        }
+        var merged = new LinkedHashMap<String, Object>();
+        var existing = metadata.get(key);
+        if (existing instanceof Map<?, ?> map) {
+            map.forEach((entryKey, entryValue) -> merged.put(String.valueOf(entryKey), entryValue));
+        }
+        values.forEach(merged::put);
+        metadata.put(key, Map.copyOf(merged));
+    }
+
+    private TaskStatus resumeStatusAfterHumanInput(Task task, Map<String, Object> metadata) {
+        var lastReplanning = metadata.get("lastReplanning");
+        if (lastReplanning instanceof Map<?, ?> values) {
+            var resumeStatus = values.get("resumeTaskStatus");
+            if (resumeStatus != null) {
+                try {
+                    return TaskStatus.valueOf(resumeStatus.toString());
+                } catch (IllegalArgumentException ignored) {
+                    return task.getStatus();
+                }
+            }
+        }
+        return task.getStatus();
     }
 
     private List<String> metadataList(Object value) {
