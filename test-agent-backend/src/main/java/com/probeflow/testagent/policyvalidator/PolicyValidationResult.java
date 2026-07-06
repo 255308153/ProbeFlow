@@ -2,6 +2,7 @@ package com.probeflow.testagent.policyvalidator;
 
 import com.probeflow.testagent.controlledplanner.PlanDecision;
 import com.probeflow.testagent.controlledplanner.PlannerAction;
+import com.probeflow.testagent.controlledplanner.RequiredHumanInput;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -15,7 +16,8 @@ public record PolicyValidationResult(
     String decisionId,
     PlannerAction plannerAction,
     String proposedToolName,
-    String sourceLlmCallId
+    String sourceLlmCallId,
+    RequiredHumanInput requiredHumanInput
 ) {
 
     public PolicyValidationResult {
@@ -49,6 +51,15 @@ public record PolicyValidationResult(
         return fromDecision(PolicyValidationStatus.BLOCKED, reasonCode, message, blockers, decision);
     }
 
+    public static PolicyValidationResult requiresHumanConfirmation(
+        PlanDecision decision,
+        PolicyValidationReasonCode reasonCode,
+        String message,
+        List<String> blockers
+    ) {
+        return fromDecision(PolicyValidationStatus.REQUIRES_HUMAN_CONFIRMATION, reasonCode, message, blockers, decision);
+    }
+
     public boolean allowed() {
         return status == PolicyValidationStatus.ALLOWED;
     }
@@ -67,6 +78,7 @@ public record PolicyValidationResult(
         summary.put("sourceLlmCallId", sourceLlmCallId);
         summary.put("plannerAction", plannerAction == null ? null : plannerAction.name());
         summary.put("proposedToolName", proposedToolName);
+        summary.put("requiresHumanInput", requiredHumanInput != null);
         summary.put("validationStatus", status.name());
         summary.put("reasonCode", reasonCode.name());
         summary.put("message", message);
@@ -89,7 +101,8 @@ public record PolicyValidationResult(
             decision == null ? null : decision.decisionId(),
             decision == null ? null : decision.action(),
             decision == null ? null : decision.proposedToolName(),
-            decision == null ? null : decision.sourceLlmCallId()
+            decision == null ? null : decision.sourceLlmCallId(),
+            decision == null ? null : decision.requiredHumanInput()
         );
     }
 }

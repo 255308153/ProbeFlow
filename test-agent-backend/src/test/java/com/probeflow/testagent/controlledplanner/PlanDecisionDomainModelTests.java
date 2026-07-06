@@ -1,8 +1,6 @@
 package com.probeflow.testagent.controlledplanner;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
-
 import com.probeflow.testagent.agentpolicy.ToolRiskLevel;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -98,8 +96,8 @@ class PlanDecisionDomainModelTests {
     }
 
     @Test
-    void proposedWaitForHumanRequiresHumanInputDetails() {
-        assertThatThrownBy(() -> new PlanDecision(
+    void proposedWaitForHumanCanRepresentMissingInputForPolicyValidation() {
+        var decision = new PlanDecision(
             null,
             PlanDecisionStatus.PROPOSED,
             PlannerAction.WAIT_FOR_HUMAN,
@@ -112,7 +110,9 @@ class PlanDecisionDomainModelTests {
             List.of(),
             null,
             false
-        )).isInstanceOf(IllegalArgumentException.class)
-            .hasMessageContaining("WAIT_FOR_HUMAN");
+        );
+
+        assertThat(decision.action()).isEqualTo(PlannerAction.WAIT_FOR_HUMAN);
+        assertThat(decision.requiredHumanInput()).isNull();
     }
 }

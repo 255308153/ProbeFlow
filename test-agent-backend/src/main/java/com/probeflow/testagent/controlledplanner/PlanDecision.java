@@ -42,9 +42,6 @@ public record PlanDecision(
         if (decisionId == null) {
             decisionId = stableDecisionId(status, action, reasoning, proposedToolName, blockers, sourceLlmCallId, fakeProvider);
         }
-        if (action == PlannerAction.WAIT_FOR_HUMAN && requiredHumanInput == null && status == PlanDecisionStatus.PROPOSED) {
-            throw new IllegalArgumentException("WAIT_FOR_HUMAN decision requires actionable human input");
-        }
     }
 
     public static PlanDecision continuePlan(String reasoning, double confidence) {
