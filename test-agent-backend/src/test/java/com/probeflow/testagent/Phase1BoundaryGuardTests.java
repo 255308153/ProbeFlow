@@ -54,6 +54,7 @@ class Phase1BoundaryGuardTests {
             "observation",
             "orchestration",
             "policyvalidator",
+            "replanning",
             "report",
             "sourcematerial",
             "task",

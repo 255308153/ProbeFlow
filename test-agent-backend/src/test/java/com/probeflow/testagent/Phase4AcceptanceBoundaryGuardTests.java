@@ -319,6 +319,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             "MemoryRefineryService",
             "PlannerSafeToolCatalogService",
             "PolicyValidatorService",
+            "ReplanningApplicationService",
             "ReportGenerationApplicationService",
             "SessionMemoryService",
             "TaskInitializationService",
