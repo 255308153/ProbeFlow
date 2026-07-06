@@ -171,6 +171,7 @@ public class ReplanningApplicationService {
         if (sourceStep != null) {
             constraints.add(PlannerConstraint.of("REPLANNING_SOURCE_STEP", sourceStep.getStepId()));
         }
+        constraints.addAll(humanInputConstraints(request.humanInput()));
 
         return plannerInputFactory.build(new PlannerInputRequest(
             PlannerTaskState.of(
@@ -460,6 +461,25 @@ public class ReplanningApplicationService {
         return result;
     }
 
+    private String metadataDescription(Map<String, Object> values) {
+        var parts = values.entrySet().stream()
+            .map(entry -> entry.getKey() + "=" + metadataValueDescription(entry.getValue()))
+            .toList();
+        return String.join("; ", parts);
+    }
+
+    private String metadataValueDescription(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            var copied = new LinkedHashMap<String, Object>();
+            map.forEach((key, item) -> copied.put(String.valueOf(key), item));
+            return "{" + metadataDescription(copied) + "}";
+        }
+        if (value instanceof List<?> list) {
+            return "[" + String.join(", ", list.stream().map(this::metadataValueDescription).toList()) + "]";
+        }
+        return value == null ? "" : value.toString();
+    }
+
     private int metadataInt(Object value) {
         if (value instanceof Number number) {
             return number.intValue();
@@ -522,8 +542,29 @@ public class ReplanningApplicationService {
         summary.put("blockers", plannerInput.lastStepOutcome().blockers());
         summary.put("resultRefs", plannerInput.lastStepOutcome().resultRefs());
         summary.put("availableToolCount", plannerInput.availableTools().size());
+        summary.put("constraints", plannerInput.constraints().stream().map(this::constraintSummary).toList());
         summary.entrySet().removeIf(entry -> entry.getValue() == null);
         return Map.copyOf(summary);
+    }
+
+    private List<PlannerConstraint> humanInputConstraints(Map<String, Object> humanInput) {
+        if (humanInput == null || humanInput.isEmpty()) {
+            return List.of();
+        }
+        var constraints = new ArrayList<PlannerConstraint>();
+        constraints.add(PlannerConstraint.of("HUMAN_INPUT", metadataDescription(humanInput)));
+        var plannerClarification = metadataMap(humanInput.get("plannerClarification"));
+        if (!plannerClarification.isEmpty()) {
+            constraints.add(PlannerConstraint.of("PLANNER_CLARIFICATION_ANSWER", metadataDescription(plannerClarification)));
+        }
+        return List.copyOf(constraints);
+    }
+
+    private Map<String, Object> constraintSummary(PlannerConstraint constraint) {
+        return Map.of(
+            "code", constraint.code(),
+            "description", constraint.description()
+        );
     }
 
     private Map<String, Object> proposedToolInput(
@@ -980,6 +1021,10 @@ public class ReplanningApplicationService {
         metadata.put("policyReason", validation.reasonCode().name());
         metadata.put("blockers", blockerSummary(request, validation));
         metadata.put("question", requiredHumanInput.get("question"));
+        var clarificationOptions = clarificationOptions(request, requestType);
+        if (!clarificationOptions.isEmpty()) {
+            metadata.put("options", clarificationOptions);
+        }
         metadata.put("plannerInputTraceId", plannerInput.planningTraceId());
         metadata.entrySet().removeIf(entry -> entry.getValue() == null);
 
@@ -1057,6 +1102,20 @@ public class ReplanningApplicationService {
             return HumanRequestType.MISSING_INPUT;
         }
         return HumanRequestType.PLANNER_CLARIFICATION;
+    }
+
+    private List<String> clarificationOptions(ReplanningRequest request, HumanRequestType requestType) {
+        if (requestType != HumanRequestType.PLANNER_CLARIFICATION) {
+            return List.of();
+        }
+        return request.constraints().stream()
+            .filter(constraint -> "PLANNER_CLARIFICATION_OPTION".equals(constraint.code())
+                || "PLANNER_CLARIFICATION_OPTIONS".equals(constraint.code()))
+            .flatMap(constraint -> List.of(constraint.description().split(",")).stream())
+            .map(String::trim)
+            .filter(option -> !option.isBlank())
+            .distinct()
+            .toList();
     }
 
     private Map<String, Object> sourceStepSummary(String sourceStepId) {

@@ -335,6 +335,46 @@ public class HumanInTheLoopApplicationService {
     }
 
     @Transactional
+    public HumanPlannerClarificationResult applyPlannerClarificationDecision(HumanDecisionSubmissionRequest request) {
+        var audit = new LinkedHashMap<String, Object>();
+        audit.put("requestId", request == null ? null : request.requestId());
+        audit.put("decisionType", request == null || request.decisionType() == null ? null : request.decisionType().name());
+        audit.put("actor", request == null ? null : request.actor());
+        var humanRequest = request == null || request.requestId().isBlank()
+            ? Optional.<HumanReviewRequest>empty()
+            : humanRequests.findById(request.requestId());
+
+        var validationBlockers = validatePlannerClarificationDecision(request, humanRequest);
+        if (!validationBlockers.isEmpty()) {
+            return HumanPlannerClarificationResult.rejected(validationBlockers, compact(audit));
+        }
+
+        var submission = submitDecision(request);
+        if (submission.status() == HumanDecisionSubmissionStatus.REJECTED) {
+            return HumanPlannerClarificationResult.rejected(submission.blockers(), submission.auditSummary());
+        }
+
+        var humanInput = recordPlannerClarification(submission.request(), submission.decision(), request.payload());
+        var consumption = consumeDecision(new HumanDecisionConsumptionRequest(request.requestId(), "planner-clarification-workflow"));
+        if (consumption.status() == HumanDecisionConsumptionStatus.REJECTED) {
+            return HumanPlannerClarificationResult.rejected(consumption.blockers(), consumption.auditSummary());
+        }
+
+        var resultAudit = new LinkedHashMap<String, Object>();
+        resultAudit.putAll(submission.auditSummary());
+        resultAudit.put("consumptionStatus", consumption.status().name());
+        resultAudit.put("recoveryTrigger", "HUMAN_INPUT_REQUIRED");
+        resultAudit.put("taskStatus", tasks.findById(submission.request().getTaskId()).orElseThrow().getStatus().name());
+        return HumanPlannerClarificationResult.applied(
+            consumption.request(),
+            submission.decision(),
+            humanInput,
+            "HUMAN_INPUT_REQUIRED",
+            compact(resultAudit)
+        );
+    }
+
+    @Transactional
     public HumanDecisionSubmissionResult submitDecision(HumanDecisionSubmissionRequest request) {
         var baseAudit = new LinkedHashMap<String, Object>();
         baseAudit.put("requestId", request == null ? null : request.requestId());
@@ -597,6 +637,63 @@ public class HumanInTheLoopApplicationService {
             || decisionType == HumanDecisionType.REJECT;
     }
 
+    private List<String> validatePlannerClarificationDecision(
+        HumanDecisionSubmissionRequest request,
+        Optional<HumanReviewRequest> humanRequest
+    ) {
+        if (request == null || request.requestId().isBlank()) {
+            return List.of("Human request id is required");
+        }
+        if (humanRequest.isEmpty()) {
+            return List.of("Human request not found: " + request.requestId());
+        }
+
+        var blockers = new ArrayList<String>();
+        if (humanRequest.get().getRequestType() != HumanRequestType.PLANNER_CLARIFICATION) {
+            blockers.add("Human request is not a planner clarification request: " + humanRequest.get().getRequestType().name());
+        }
+        if (humanRequest.get().getStatus() != HumanRequestStatus.PENDING) {
+            blockers.add("Human request is not pending: " + humanRequest.get().getStatus().name());
+        }
+        if (request.decisionType() != HumanDecisionType.PROVIDE_INPUT) {
+            blockers.add("Unsupported planner clarification decision type: "
+                + (request.decisionType() == null ? "null" : request.decisionType().name()));
+        }
+        if (!hasMeaningfulPayload(request.payload())) {
+            blockers.add("Planner clarification answer is required");
+        }
+        var task = tasks.findById(humanRequest.get().getTaskId());
+        if (task.isEmpty()) {
+            blockers.add("Task not found: " + humanRequest.get().getTaskId());
+        } else if (task.get().getStatus() == TaskStatus.COMPLETED) {
+            blockers.add("Completed task cannot consume planner clarification decision");
+        } else if (task.get().getStatus() == TaskStatus.CANCELLED) {
+            blockers.add("Cancelled task cannot consume planner clarification decision");
+        }
+        return List.copyOf(blockers);
+    }
+
+    private boolean hasMeaningfulPayload(Map<String, Object> payload) {
+        if (payload == null || payload.isEmpty()) {
+            return false;
+        }
+        return payload.values().stream().anyMatch(value -> {
+            if (value == null) {
+                return false;
+            }
+            if (value instanceof String string) {
+                return !string.isBlank();
+            }
+            if (value instanceof List<?> list) {
+                return !list.isEmpty();
+            }
+            if (value instanceof Map<?, ?> map) {
+                return !map.isEmpty();
+            }
+            return true;
+        });
+    }
+
     private List<String> draftIds(Object value) {
         if (!(value instanceof List<?> values)) {
             return List.of();
@@ -721,6 +818,41 @@ public class HumanInTheLoopApplicationService {
         task.setMetadata(Map.copyOf(metadata));
         task.setStatus(resumeStatusAfterHumanInput(task, metadata));
         tasks.save(task);
+    }
+
+    private Map<String, Object> recordPlannerClarification(
+        HumanReviewRequest request,
+        HumanDecisionRecord decision,
+        Map<String, Object> payload
+    ) {
+        var task = tasks.findById(request.getTaskId()).orElseThrow();
+        var metadata = mutableMetadata(task);
+        metadata.remove("requiredHumanInput");
+        mergeMetadataMap(metadata, "plannerClarificationContext", payload);
+        mergeMetadataMap(metadata, "plannerClarificationContextSummary", decision.getSanitizedPayloadSummary());
+
+        var record = new LinkedHashMap<String, Object>();
+        record.put("requestId", request.getRequestId());
+        record.put("decisionId", decision.getDecisionId());
+        record.put("decisionType", decision.getDecisionType().name());
+        record.put("actor", decision.getActor());
+        record.put("reason", decision.getReason());
+        record.put("sourceTrigger", request.getSourceTrigger());
+        record.put("sourceStepId", request.getSourceStepId());
+        record.put("policyReason", request.getPolicyReason());
+        record.put("plannerDecisionId", request.getPlannerDecisionId());
+        record.put("question", request.getMetadata().get("question"));
+        record.put("options", request.getMetadata().get("options"));
+        record.put("blockers", request.getMetadata().get("blockers"));
+        record.put("payloadSummary", decision.getSanitizedPayloadSummary());
+        var compactRecord = compact(record);
+        appendMetadataRecord(metadata, "plannerClarificationRecords", compactRecord);
+        metadata.put("lastPlannerClarification", compactRecord);
+        task.setMetadata(Map.copyOf(metadata));
+        task.setStatus(resumeStatusAfterHumanInput(task, metadata));
+        tasks.save(task);
+
+        return Map.of("plannerClarification", compactRecord);
     }
 
     private void recordHighRiskDecision(
