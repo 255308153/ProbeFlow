@@ -146,6 +146,10 @@ public class PolicyValidatorService {
         String rawToolName,
         PolicyValidationRequest request
     ) {
+        var boundaryDecision = policyService.evaluate(rawToolName, request.policy());
+        if (boundaryDecision.reasonCode() == ToolPolicyReasonCode.V1_BOUNDARY_BLOCKED) {
+            return fromToolPolicyDecision(decision, boundaryDecision);
+        }
         ToolName toolName;
         try {
             toolName = ToolName.of(rawToolName);
