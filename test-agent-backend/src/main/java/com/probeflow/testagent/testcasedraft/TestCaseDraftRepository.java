@@ -8,4 +8,6 @@ public interface TestCaseDraftRepository extends JpaRepository<TestCaseDraft, St
     List<TestCaseDraft> findByTaskIdAndDedupKeyOrderByCreatedAtAsc(String taskId, String dedupKey);
 
     List<TestCaseDraft> findAllByTaskIdOrderByCreatedAtAscDraftIdAsc(String taskId);
+
+    List<TestCaseDraft> findByTaskIdAndStatusOrderByCreatedAtAscDraftIdAsc(String taskId, DraftStatus status);
 }

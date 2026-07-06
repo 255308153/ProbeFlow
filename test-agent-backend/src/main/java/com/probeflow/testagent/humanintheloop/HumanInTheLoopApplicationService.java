@@ -1,8 +1,17 @@
 package com.probeflow.testagent.humanintheloop;
 
+import com.probeflow.testagent.agentpolicy.ToolRiskLevel;
+import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.task.TaskStatus;
+import com.probeflow.testagent.testcasegeneration.TestCasePromotionRequest;
+import com.probeflow.testagent.testcasegeneration.TestCasePromotionService;
+import com.probeflow.testagent.testcasedraft.DraftStatus;
+import com.probeflow.testagent.testcasedraft.TestCaseDraft;
+import com.probeflow.testagent.testcasedraft.TestCaseDraftRepository;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -17,15 +26,21 @@ public class HumanInTheLoopApplicationService {
     private final TaskRepository tasks;
     private final HumanReviewRequestRepository humanRequests;
     private final HumanDecisionRecordRepository decisions;
+    private final TestCaseDraftRepository drafts;
+    private final TestCasePromotionService casePromotion;
 
     public HumanInTheLoopApplicationService(
         TaskRepository tasks,
         HumanReviewRequestRepository humanRequests,
-        HumanDecisionRecordRepository decisions
+        HumanDecisionRecordRepository decisions,
+        TestCaseDraftRepository drafts,
+        TestCasePromotionService casePromotion
     ) {
         this.tasks = tasks;
         this.humanRequests = humanRequests;
         this.decisions = decisions;
+        this.drafts = drafts;
+        this.casePromotion = casePromotion;
     }
 
     @Transactional
@@ -114,6 +129,119 @@ public class HumanInTheLoopApplicationService {
     @Transactional(readOnly = true)
     public List<HumanDecisionRecord> decisionsForTask(String taskId) {
         return decisions.findByTaskIdOrderByCreatedAtAsc(taskId);
+    }
+
+    @Transactional
+    public HumanReviewRequestCreationResult createDraftReviewRequest(HumanDraftReviewRequest request) {
+        if (request == null || request.taskId().isBlank()) {
+            return HumanReviewRequestCreationResult.rejected(List.of("Task id is required"));
+        }
+        var task = tasks.findById(request.taskId());
+        if (task.isEmpty()) {
+            return HumanReviewRequestCreationResult.rejected(List.of("Task not found: " + request.taskId()));
+        }
+
+        var pendingDraftIds = drafts.findByTaskIdAndStatusOrderByCreatedAtAscDraftIdAsc(
+                request.taskId(),
+                DraftStatus.PENDING_REVIEW
+            )
+            .stream()
+            .map(TestCaseDraft::getDraftId)
+            .toList();
+        if (pendingDraftIds.isEmpty()) {
+            return HumanReviewRequestCreationResult.rejected(List.of("No pending test case drafts require review"));
+        }
+
+        var waitingReason = request.waitingReason() == null
+            ? "Waiting for manual review of " + pendingDraftIds.size() + " draft(s)"
+            : request.waitingReason();
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("requestType", HumanRequestType.DRAFT_REVIEW.name());
+        metadata.put("source", "HumanInTheLoopApplicationService");
+        metadata.put("pendingDraftIds", pendingDraftIds);
+        metadata.put("waitingReason", waitingReason);
+        metadata.put("manualReviewCompatible", true);
+        var idempotencyKey = humanRequestIdempotencyKey(
+            task.get().getTaskId(),
+            HumanRequestType.DRAFT_REVIEW,
+            "MANUAL_REVIEW_GATE",
+            request.sourceStepId(),
+            pendingDraftIds
+        );
+
+        return createOrReusePendingRequest(new HumanReviewRequestCreateRequest(
+            task.get().getTaskId(),
+            request.sourceStepId(),
+            HumanRequestType.DRAFT_REVIEW,
+            waitingReason,
+            draftReviewSchema(),
+            ToolRiskLevel.LOW,
+            "MANUAL_REVIEW_GATE",
+            null,
+            "MANUAL_REVIEW_PENDING",
+            metadata,
+            null
+        ), idempotencyKey);
+    }
+
+    @Transactional
+    public HumanDraftReviewDecisionResult applyDraftReviewDecision(HumanDecisionSubmissionRequest request) {
+        var audit = new LinkedHashMap<String, Object>();
+        audit.put("requestId", request == null ? null : request.requestId());
+        audit.put("decisionType", request == null || request.decisionType() == null ? null : request.decisionType().name());
+        audit.put("actor", request == null ? null : request.actor());
+        var humanRequest = request == null || request.requestId().isBlank()
+            ? Optional.<HumanReviewRequest>empty()
+            : humanRequests.findById(request.requestId());
+
+        var validationBlockers = validateDraftReviewDecision(request, humanRequest);
+        if (!validationBlockers.isEmpty()) {
+            return HumanDraftReviewDecisionResult.rejected(validationBlockers, compact(audit));
+        }
+
+        var draftIds = draftIds(request.payload().get("draftIds"));
+        var submission = submitDecision(request);
+        if (submission.status() == HumanDecisionSubmissionStatus.REJECTED) {
+            return HumanDraftReviewDecisionResult.rejected(submission.blockers(), submission.auditSummary());
+        }
+
+        var promotedCaseIds = new ArrayList<String>();
+        var discardedDraftIds = new ArrayList<String>();
+        if (request.decisionType() == HumanDecisionType.PROMOTE_DRAFT) {
+            promotedCaseIds.addAll(casePromotion.promote(new TestCasePromotionRequest(draftIds, request.actor())).promotedCaseIds());
+        } else if (request.decisionType() == HumanDecisionType.DISCARD_DRAFT) {
+            discardedDraftIds.addAll(discardDrafts(draftIds));
+        }
+
+        recordDraftReviewDecision(
+            submission.request(),
+            submission.decision(),
+            request,
+            draftIds,
+            promotedCaseIds,
+            discardedDraftIds
+        );
+        var consumption = consumeDecision(new HumanDecisionConsumptionRequest(request.requestId(), "draft-review-workflow"));
+        if (consumption.status() == HumanDecisionConsumptionStatus.REJECTED) {
+            return HumanDraftReviewDecisionResult.rejected(consumption.blockers(), consumption.auditSummary());
+        }
+
+        var resultAudit = new LinkedHashMap<String, Object>();
+        resultAudit.putAll(submission.auditSummary());
+        resultAudit.put("consumptionStatus", consumption.status().name());
+        resultAudit.put("draftIds", draftIds);
+        resultAudit.put("promotedCaseIds", promotedCaseIds);
+        resultAudit.put("discardedDraftIds", discardedDraftIds);
+        if (request.payload().containsKey("changeRequest")) {
+            resultAudit.put("changeRequest", request.payload().get("changeRequest"));
+        }
+        return HumanDraftReviewDecisionResult.applied(
+            consumption.request(),
+            submission.decision(),
+            promotedCaseIds,
+            discardedDraftIds,
+            compact(resultAudit)
+        );
     }
 
     @Transactional
@@ -210,6 +338,203 @@ public class HumanInTheLoopApplicationService {
             result.put("idempotencyKey", idempotencyKey);
         }
         return Map.copyOf(result);
+    }
+
+    private List<Map<String, Object>> draftReviewSchema() {
+        return List.of(
+            Map.of("name", "reviewDecision", "type", "string", "required", true),
+            Map.of("name", "draftIds", "type", "array", "required", true),
+            Map.of("name", "changeRequest", "type", "string", "required", false)
+        );
+    }
+
+    private String humanRequestIdempotencyKey(
+        String taskId,
+        HumanRequestType requestType,
+        String trigger,
+        String sourceStepId,
+        List<String> pendingDraftIds
+    ) {
+        return taskId
+            + "|" + requestType.name()
+            + "|" + trigger
+            + "|" + (sourceStepId == null ? "" : sourceStepId)
+            + "|" + String.join(";", pendingDraftIds == null ? List.of() : pendingDraftIds);
+    }
+
+    private List<String> validateDraftReviewDecision(
+        HumanDecisionSubmissionRequest request,
+        Optional<HumanReviewRequest> humanRequest
+    ) {
+        if (request == null || request.requestId().isBlank()) {
+            return List.of("Human request id is required");
+        }
+        if (humanRequest.isEmpty()) {
+            return List.of("Human request not found: " + request.requestId());
+        }
+        var blockers = new ArrayList<String>();
+        if (humanRequest.get().getRequestType() != HumanRequestType.DRAFT_REVIEW) {
+            blockers.add("Human request is not a draft review request: " + humanRequest.get().getRequestType().name());
+        }
+        if (humanRequest.get().getStatus() != HumanRequestStatus.PENDING) {
+            blockers.add("Human request is not pending: " + humanRequest.get().getStatus().name());
+        }
+        if (!draftReviewDecisionType(request.decisionType())) {
+            blockers.add("Unsupported draft review decision type: " + (request.decisionType() == null ? "null" : request.decisionType().name()));
+        }
+
+        var draftIds = draftIds(request.payload().get("draftIds"));
+        if (draftIds.isEmpty()) {
+            blockers.add("Draft review decision requires at least one draft id");
+        }
+        var allowedDraftIds = metadataList(humanRequest.get().getMetadata().get("pendingDraftIds"));
+        var unexpectedDraftIds = draftIds.stream()
+            .filter(draftId -> !allowedDraftIds.isEmpty() && !allowedDraftIds.contains(draftId))
+            .toList();
+        if (!unexpectedDraftIds.isEmpty()) {
+            blockers.add("Draft review decision references drafts outside the request: " + String.join(",", unexpectedDraftIds));
+        }
+        var persistedDrafts = drafts.findAllById(draftIds);
+        var persistedById = new LinkedHashMap<String, TestCaseDraft>();
+        persistedDrafts.forEach(draft -> persistedById.put(draft.getDraftId(), draft));
+        for (var draftId : draftIds) {
+            var draft = persistedById.get(draftId);
+            if (draft == null) {
+                blockers.add("TestCaseDraft not found: " + draftId);
+            } else if (!humanRequest.get().getTaskId().equals(draft.getTaskId())) {
+                blockers.add("TestCaseDraft does not belong to task: " + draftId);
+            } else if (draft.getStatus() != DraftStatus.PENDING_REVIEW) {
+                blockers.add("TestCaseDraft is not pending review: " + draftId);
+            }
+        }
+        if (request.decisionType() == HumanDecisionType.REQUEST_CHANGES
+            && metadataString(request.payload().get("changeRequest")).isBlank()) {
+            blockers.add("Change request is required when requesting draft changes");
+        }
+        return List.copyOf(blockers);
+    }
+
+    private boolean draftReviewDecisionType(HumanDecisionType decisionType) {
+        return decisionType == HumanDecisionType.PROMOTE_DRAFT
+            || decisionType == HumanDecisionType.DISCARD_DRAFT
+            || decisionType == HumanDecisionType.REQUEST_CHANGES;
+    }
+
+    private List<String> draftIds(Object value) {
+        if (!(value instanceof List<?> values)) {
+            return List.of();
+        }
+        var result = new LinkedHashSet<String>();
+        for (var item : values) {
+            var draftId = metadataString(item);
+            if (!draftId.isBlank()) {
+                result.add(draftId);
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    private List<String> discardDrafts(List<String> draftIds) {
+        var discarded = new ArrayList<String>();
+        for (var draftId : draftIds) {
+            var draft = drafts.findById(draftId).orElseThrow();
+            draft.setStatus(DraftStatus.DISCARDED);
+            drafts.save(draft);
+            discarded.add(draftId);
+        }
+        return List.copyOf(discarded);
+    }
+
+    private void recordDraftReviewDecision(
+        HumanReviewRequest request,
+        HumanDecisionRecord decision,
+        HumanDecisionSubmissionRequest submission,
+        List<String> draftIds,
+        List<String> promotedCaseIds,
+        List<String> discardedDraftIds
+    ) {
+        var task = tasks.findById(request.getTaskId()).orElseThrow();
+        var metadata = mutableMetadata(task);
+        addMetadataValues(metadata, "promotedCaseIds", promotedCaseIds);
+        addMetadataValues(metadata, "selectedCaseIds", promotedCaseIds);
+        addMetadataValues(metadata, "discardedDraftIds", discardedDraftIds);
+        if (submission.decisionType() == HumanDecisionType.REQUEST_CHANGES) {
+            task.setStatus(TaskStatus.WAITING_FOR_REVIEW);
+            var changeRequest = new LinkedHashMap<String, Object>();
+            changeRequest.put("requestId", request.getRequestId());
+            changeRequest.put("decisionId", decision.getDecisionId());
+            changeRequest.put("actor", decision.getActor());
+            changeRequest.put("reason", decision.getReason());
+            changeRequest.put("draftIds", draftIds);
+            changeRequest.put("changeRequest", metadataString(submission.payload().get("changeRequest")));
+            changeRequest.put("keepsTaskWaiting", true);
+            appendMetadataRecord(metadata, "draftReviewChangeRequests", compact(changeRequest));
+        }
+        var lastDecision = new LinkedHashMap<String, Object>();
+        lastDecision.put("requestId", request.getRequestId());
+        lastDecision.put("decisionId", decision.getDecisionId());
+        lastDecision.put("decisionType", submission.decisionType().name());
+        lastDecision.put("actor", decision.getActor());
+        lastDecision.put("reason", decision.getReason());
+        lastDecision.put("draftIds", draftIds);
+        lastDecision.put("promotedCaseIds", promotedCaseIds);
+        lastDecision.put("discardedDraftIds", discardedDraftIds);
+        lastDecision.entrySet().removeIf(entry -> entry.getValue() == null);
+        metadata.put("lastDraftReviewDecision", Map.copyOf(lastDecision));
+        task.setMetadata(Map.copyOf(metadata));
+        tasks.save(task);
+    }
+
+    private Map<String, Object> mutableMetadata(Task task) {
+        return task.getMetadata() == null
+            ? new LinkedHashMap<>()
+            : new LinkedHashMap<>(task.getMetadata());
+    }
+
+    private void addMetadataValues(Map<String, Object> metadata, String key, List<String> values) {
+        if (values == null || values.isEmpty()) {
+            return;
+        }
+        var merged = new LinkedHashSet<>(metadataList(metadata.get(key)));
+        merged.addAll(values);
+        metadata.put(key, List.copyOf(merged));
+    }
+
+    private void appendMetadataRecord(Map<String, Object> metadata, String key, Map<String, Object> record) {
+        var records = new ArrayList<Map<String, Object>>();
+        var existing = metadata.get(key);
+        if (existing instanceof List<?> values) {
+            for (var value : values) {
+                if (value instanceof Map<?, ?> map) {
+                    var copied = new LinkedHashMap<String, Object>();
+                    map.forEach((entryKey, entryValue) -> copied.put(String.valueOf(entryKey), entryValue));
+                    records.add(Map.copyOf(copied));
+                }
+            }
+        }
+        records.add(Map.copyOf(record));
+        metadata.put(key, List.copyOf(records));
+    }
+
+    private List<String> metadataList(Object value) {
+        if (!(value instanceof List<?> values)) {
+            return List.of();
+        }
+        return values.stream()
+            .map(this::metadataString)
+            .filter(item -> !item.isBlank())
+            .distinct()
+            .toList();
+    }
+
+    private Map<String, Object> compact(Map<String, Object> source) {
+        var compacted = new LinkedHashMap<String, Object>();
+        source.forEach((key, value) -> {
+            if (key != null && value != null) {
+                compacted.put(key, value);
+            }
+        });
+        return Map.copyOf(compacted);
     }
 
     private String metadataString(Object value) {
