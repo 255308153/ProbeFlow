@@ -49,6 +49,7 @@ class Phase1BoundaryGuardTests {
             "knowledge",
             "memory",
             "observation",
+            "orchestration",
             "report",
             "sourcematerial",
             "task",

@@ -316,6 +316,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             "MemoryRefineryService",
             "ReportGenerationApplicationService",
             "SessionMemoryService",
+            "TaskInitializationService",
             "TaskMemoryService",
             "TestCaseGenerationApplicationService",
             "TestCasePromotionService",
