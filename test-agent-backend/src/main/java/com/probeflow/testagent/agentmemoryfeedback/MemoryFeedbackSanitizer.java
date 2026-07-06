@@ -40,7 +40,7 @@ class MemoryFeedbackSanitizer {
         }
         var sanitized = new LinkedHashMap<String, Object>();
         value.forEach((key, item) -> {
-            if (StringUtils.hasText(key)) {
+            if (StringUtils.hasText(key) && item != null) {
                 sanitized.put(key.trim(), sanitizeValue(key, item));
             }
         });
@@ -57,7 +57,7 @@ class MemoryFeedbackSanitizer {
         if (value instanceof Map<?, ?> nestedMap) {
             var sanitized = new LinkedHashMap<String, Object>();
             nestedMap.forEach((nestedKey, nestedValue) -> {
-                if (nestedKey != null) {
+                if (nestedKey != null && nestedValue != null) {
                     var stringKey = nestedKey.toString();
                     sanitized.put(stringKey, sanitizeValue(stringKey, nestedValue));
                 }
@@ -67,7 +67,9 @@ class MemoryFeedbackSanitizer {
         if (value instanceof Iterable<?> iterable) {
             var sanitized = new ArrayList<Object>();
             for (var item : iterable) {
-                sanitized.add(sanitizeValue("", item));
+                if (item != null) {
+                    sanitized.add(sanitizeValue("", item));
+                }
             }
             return ListCopy.copyOf(sanitized);
         }

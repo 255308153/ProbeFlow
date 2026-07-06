@@ -627,6 +627,7 @@ class FailureAnalysisApplicationServiceTests {
 
     @Test
     void lowValueOneOffAndNoisyPassedExecutionsDoNotBecomeReusableLongTermMemory() {
+        tasks.save(newTask("task-1"));
         var deterministicMismatch = executionRecords.save(newExecutionRecord(
             OverallStatus.FAILED,
             Map.of("method", "POST", "path", "/api/orders"),
@@ -706,7 +707,7 @@ class FailureAnalysisApplicationServiceTests {
         assertThat(memory.getMetadata())
             .containsEntry("classification", "STATUS_MISMATCH")
             .containsEntry("occurrenceCount", 2)
-            .containsEntry("mergeCount", 2);
+            .containsEntry("mergeCount", 1);
         assertThat((List<String>) memory.getMetadata().get("executionIds"))
             .contains(first.getExecutionId(), second.getExecutionId());
     }

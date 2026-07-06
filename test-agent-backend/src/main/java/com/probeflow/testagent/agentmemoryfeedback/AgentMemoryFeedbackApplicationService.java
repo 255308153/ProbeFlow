@@ -8,6 +8,9 @@ import com.probeflow.testagent.humanintheloop.HumanInTheLoopApplicationService;
 import com.probeflow.testagent.memory.MemoryCandidateRequest;
 import com.probeflow.testagent.memory.MemoryRefineryResult;
 import com.probeflow.testagent.memory.MemoryRefineryService;
+import com.probeflow.testagent.memory.MemorySourceType;
+import com.probeflow.testagent.orchestration.StepOutcome;
+import com.probeflow.testagent.task.PlanStepStatus;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -141,6 +144,122 @@ public class AgentMemoryFeedbackApplicationService {
             sanitizedCandidate.rawEvidence(),
             intake.metadata()
         ));
+    }
+
+    @Transactional
+    public AgentMemoryFeedbackResult refineFailureAnalysisCandidate(
+        AgentMemoryCandidateSourceType candidateSourceType,
+        MemoryCandidateRequest candidate
+    ) {
+        if (candidate == null) {
+            return AgentMemoryFeedbackResult.rejected(
+                "invalid-failure-analysis-candidate",
+                List.of("Memory candidate is required"),
+                Map.of("writesLongTermMemory", false)
+            );
+        }
+        if (candidateSourceType != AgentMemoryCandidateSourceType.EXECUTION_RECORD
+            && candidateSourceType != AgentMemoryCandidateSourceType.FAILURE_ANALYSIS) {
+            return AgentMemoryFeedbackResult.rejected(
+                "unsupported-failure-analysis-source",
+                List.of("Failure analysis candidates must come from EXECUTION_RECORD or FAILURE_ANALYSIS"),
+                Map.of("sourceType", String.valueOf(candidateSourceType), "writesLongTermMemory", false)
+            );
+        }
+
+        var sanitizedCandidate = sanitizeMemoryCandidate(candidate);
+        var tags = enrichedFailureAnalysisTags(sanitizedCandidate, candidateSourceType);
+        var metadata = metadataWithPhase7FailureAnalysis(sanitizedCandidate.metadata(), candidateSourceType);
+        var intake = new AgentMemoryCandidateIntakeRequest(
+            candidateSourceType,
+            sanitizedCandidate.sourceRef(),
+            sanitizedCandidate.taskId(),
+            sanitizedCandidate.summary(),
+            sanitizedCandidate.content(),
+            sanitizedCandidate.rawEvidence(),
+            tags,
+            sanitizedCandidate.confidence(),
+            metadata
+        );
+        return submitAndRefine(intake, new MemoryCandidateRequest(
+            sanitizedCandidate.summary(),
+            sanitizedCandidate.content(),
+            sanitizedCandidate.sourceType(),
+            sanitizedCandidate.sourceRef(),
+            sanitizedCandidate.taskId(),
+            tags,
+            sanitizedCandidate.confidence(),
+            sanitizedCandidate.rawEvidence(),
+            metadata
+        ));
+    }
+
+    @Transactional
+    public AgentMemoryFeedbackResult refineStepOutcomeCandidate(String taskId, String stepId, StepOutcome outcome) {
+        var normalizedTaskId = normalizeNullable(taskId);
+        var normalizedStepId = normalizeNullable(stepId);
+        if (outcome == null || normalizedTaskId == null || normalizedStepId == null) {
+            return AgentMemoryFeedbackResult.rejected(
+                "invalid-step-outcome-candidate",
+                List.of("taskId, stepId and StepOutcome are required"),
+                Map.of("taskId", normalizedTaskId, "stepId", normalizedStepId, "writesLongTermMemory", false)
+            );
+        }
+        if (outcome.stepStatus() == PlanStepStatus.SUCCESS) {
+            return AgentMemoryFeedbackResult.rejected(
+                "step-outcome-not-learnable",
+                List.of("Successful StepOutcome is not a reusable failure memory candidate"),
+                Map.of(
+                    "taskId", normalizedTaskId,
+                    "stepId", normalizedStepId,
+                    "stepStatus", outcome.stepStatus().name(),
+                    "writesLongTermMemory", false
+                )
+            );
+        }
+
+        var classification = stepOutcomeClassification(outcome);
+        var riskLevel = stepOutcomeRiskLevel(outcome, classification);
+        var retryable = stepOutcomeRetryable(outcome, classification);
+        var confidence = stepOutcomeConfidence(outcome, riskLevel);
+        var sourceRef = "step-outcome:" + normalizedStepId;
+        var metadata = stepOutcomeMetadata(normalizedStepId, outcome, classification, riskLevel, retryable);
+        var tags = stepOutcomeTags(classification, riskLevel, retryable);
+        var summary = classification + " in step " + normalizedStepId;
+        var content = "Step " + normalizedStepId
+            + " finished with " + outcome.stepStatus()
+            + ". Summary: " + outcome.summary()
+            + ". Blockers: " + outcome.blockerDetails()
+            + ". Retryable: " + retryable + ".";
+        var evidence = "StepOutcome resultRefs=" + outcome.resultRefs()
+            + " resultRef=" + outcome.resultRef()
+            + " blockers=" + outcome.blockerDetails()
+            + " stopOrchestration=" + outcome.stopOrchestration();
+
+        return submitAndRefine(
+            new AgentMemoryCandidateIntakeRequest(
+                AgentMemoryCandidateSourceType.STEP_OUTCOME,
+                sourceRef,
+                normalizedTaskId,
+                summary,
+                content,
+                evidence,
+                tags,
+                confidence,
+                metadata
+            ),
+            new MemoryCandidateRequest(
+                summary,
+                content,
+                MemorySourceType.EXECUTION_RESULT,
+                sourceRef,
+                normalizedTaskId,
+                tags,
+                confidence,
+                evidence,
+                metadata
+            )
+        );
     }
 
     private AgentMemoryFeedbackResult submitAndRefine(
@@ -293,6 +412,138 @@ public class AgentMemoryFeedbackApplicationService {
         metadata.put("writesLongTermMemory", true);
         metadata.put("phase6HandoffAudit", sanitizer.sanitizeMap(phase6Audit));
         return compact(metadata);
+    }
+
+    private List<String> enrichedFailureAnalysisTags(
+        MemoryCandidateRequest candidate,
+        AgentMemoryCandidateSourceType candidateSourceType
+    ) {
+        var tags = new LinkedHashSet<>(normalizeTags(candidate.tags()));
+        tags.add("failure-analysis");
+        tags.add(candidateSourceType == AgentMemoryCandidateSourceType.EXECUTION_RECORD
+            ? "execution-record"
+            : "task-failure-pattern");
+        var riskLevel = metadataString(candidate.metadata().get("riskLevel"));
+        if ("HIGH".equals(riskLevel) || "CRITICAL".equals(riskLevel)) {
+            tags.add("high-risk");
+        }
+        if (Boolean.TRUE.equals(candidate.metadata().get("retryable"))) {
+            tags.add("retryable");
+        }
+        return List.copyOf(tags);
+    }
+
+    private Map<String, Object> metadataWithPhase7FailureAnalysis(
+        Map<String, Object> candidateMetadata,
+        AgentMemoryCandidateSourceType candidateSourceType
+    ) {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.putAll(candidateMetadata == null ? Map.of() : candidateMetadata);
+        metadata.put("phase", "V2_PHASE_7");
+        metadata.put("handoffType", "FAILURE_ANALYSIS_MEMORY_FEEDBACK_REFINERY");
+        metadata.put("candidateSourceType", candidateSourceType.name());
+        metadata.put("writesLongTermMemory", true);
+        return compact(metadata);
+    }
+
+    private Map<String, Object> stepOutcomeMetadata(
+        String stepId,
+        StepOutcome outcome,
+        String classification,
+        String riskLevel,
+        boolean retryable
+    ) {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("phase", "V2_PHASE_7");
+        metadata.put("handoffType", "STEP_OUTCOME_MEMORY_FEEDBACK_REFINERY");
+        metadata.put("stepId", stepId);
+        metadata.put("classification", classification);
+        metadata.put("riskLevel", riskLevel);
+        metadata.put("retryable", retryable);
+        metadata.put("stepStatus", outcome.stepStatus().name());
+        if (outcome.taskStatus() != null) {
+            metadata.put("taskStatus", outcome.taskStatus().name());
+        }
+        metadata.put("resultRefs", outcome.resultRefs());
+        metadata.put("blockers", outcome.blockerDetails());
+        metadata.put("stopOrchestration", outcome.stopOrchestration());
+        metadata.put("errorCode", classification);
+        metadata.put("writesLongTermMemory", true);
+        return compact(metadata);
+    }
+
+    private List<String> stepOutcomeTags(String classification, String riskLevel, boolean retryable) {
+        var tags = new LinkedHashSet<String>();
+        tags.add("phase7");
+        tags.add("failure-analysis");
+        tags.add("step-outcome");
+        tags.add(classification.toLowerCase(Locale.ROOT));
+        if ("HIGH".equals(riskLevel) || "CRITICAL".equals(riskLevel)) {
+            tags.add("high-risk");
+        }
+        if (retryable) {
+            tags.add("retryable");
+        }
+        return List.copyOf(tags);
+    }
+
+    private String stepOutcomeClassification(StepOutcome outcome) {
+        var combined = stepOutcomeCombinedText(outcome);
+        if (containsAny(combined, List.of("auth", "401", "403", "permission", "credential"))) {
+            return "AUTH_ISSUE";
+        }
+        if (containsAny(combined, List.of("timeout", "timed out", "connection", "network"))) {
+            return "TIMEOUT";
+        }
+        if (containsAny(combined, List.of("policy", "high risk", "unsafe", "security"))) {
+            return "HIGH_RISK_STEP_FAILURE";
+        }
+        if (outcome.stepStatus() == PlanStepStatus.SKIPPED) {
+            return "BLOCKED_STEP";
+        }
+        return "STEP_FAILURE";
+    }
+
+    private String stepOutcomeRiskLevel(StepOutcome outcome, String classification) {
+        if (outcome.taskStatus() == TaskStatus.FAILED || outcome.stopOrchestration()
+            || "HIGH_RISK_STEP_FAILURE".equals(classification)) {
+            return "HIGH";
+        }
+        if (!outcome.blockerDetails().isEmpty()) {
+            return "MEDIUM";
+        }
+        return "LOW";
+    }
+
+    private boolean stepOutcomeRetryable(StepOutcome outcome, String classification) {
+        if ("TIMEOUT".equals(classification)) {
+            return true;
+        }
+        return containsAny(stepOutcomeCombinedText(outcome), List.of("retry", "temporary", "transient", "environment"));
+    }
+
+    private float stepOutcomeConfidence(StepOutcome outcome, String riskLevel) {
+        if ("HIGH".equals(riskLevel)) {
+            return 0.86f;
+        }
+        if ("MEDIUM".equals(riskLevel) && outcome.stepStatus() == PlanStepStatus.FAILED) {
+            return 0.64f;
+        }
+        return 0.42f;
+    }
+
+    private String stepOutcomeCombinedText(StepOutcome outcome) {
+        return (outcome.summary() + " " + outcome.blockerDetails() + " " + outcome.resultRefs() + " " + outcome.resultRef())
+            .toLowerCase(Locale.ROOT);
+    }
+
+    private boolean containsAny(String input, List<String> tokens) {
+        for (var token : tokens) {
+            if (input.contains(token)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private List<String> validate(AgentMemoryCandidateIntakeRequest request) {

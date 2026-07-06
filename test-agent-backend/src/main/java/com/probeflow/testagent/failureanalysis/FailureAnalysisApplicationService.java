@@ -1,13 +1,15 @@
 package com.probeflow.testagent.failureanalysis;
 
+import com.probeflow.testagent.agentmemoryfeedback.AgentMemoryCandidateSourceType;
+import com.probeflow.testagent.agentmemoryfeedback.AgentMemoryFeedbackApplicationService;
+import com.probeflow.testagent.agentmemoryfeedback.AgentMemoryFeedbackResult;
+import com.probeflow.testagent.agentmemoryfeedback.MemoryCandidateProcessingStatus;
 import com.probeflow.testagent.apispec.ApiSpecRepository;
 import com.probeflow.testagent.executionrecord.ExecutionRecord;
 import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.OverallStatus;
 import com.probeflow.testagent.memory.MemoryScopeType;
 import com.probeflow.testagent.memory.MemoryCandidateRequest;
-import com.probeflow.testagent.memory.MemoryRefineryResult;
-import com.probeflow.testagent.memory.MemoryRefineryService;
 import com.probeflow.testagent.memory.MemorySourceType;
 import com.probeflow.testagent.memory.TaskMemoryService;
 import com.probeflow.testagent.memory.TaskMemoryWriteRequest;
@@ -40,7 +42,7 @@ public class FailureAnalysisApplicationService {
     private final TestCaseRepository testCases;
     private final ApiSpecRepository apiSpecs;
     private final TaskMemoryService taskMemoryService;
-    private final MemoryRefineryService memoryRefineryService;
+    private final AgentMemoryFeedbackApplicationService memoryFeedback;
     private final TaskRepository tasks;
 
     public FailureAnalysisApplicationService(
@@ -49,7 +51,7 @@ public class FailureAnalysisApplicationService {
         TestCaseRepository testCases,
         ApiSpecRepository apiSpecs,
         TaskMemoryService taskMemoryService,
-        MemoryRefineryService memoryRefineryService,
+        AgentMemoryFeedbackApplicationService memoryFeedback,
         TaskRepository tasks
     ) {
         this.executionRecords = executionRecords;
@@ -57,7 +59,7 @@ public class FailureAnalysisApplicationService {
         this.testCases = testCases;
         this.apiSpecs = apiSpecs;
         this.taskMemoryService = taskMemoryService;
-        this.memoryRefineryService = memoryRefineryService;
+        this.memoryFeedback = memoryFeedback;
         this.tasks = tasks;
     }
 
@@ -510,18 +512,21 @@ public class FailureAnalysisApplicationService {
         }
 
         var confidence = memoryCandidateConfidence(classification, riskLevel);
-        var result = memoryRefineryService.refine(new MemoryCandidateRequest(
-            memoryCandidateSummary(record, classification),
-            memoryCandidateContent(record, classification, failureReason, retryable),
-            MemorySourceType.EXECUTION_RESULT,
-            record.getExecutionId(),
-            record.getTaskId(),
-            memoryCandidateTags(classification, retryable, false),
-            confidence,
-            rawEvidence(summary, evidence),
-            memoryCandidateMetadata(record, classification, riskLevel, retryable, evidence, 1)
-        ));
-        if (result.accepted()) {
+        var result = memoryFeedback.refineFailureAnalysisCandidate(
+            AgentMemoryCandidateSourceType.EXECUTION_RECORD,
+            new MemoryCandidateRequest(
+                memoryCandidateSummary(record, classification),
+                memoryCandidateContent(record, classification, failureReason, retryable),
+                MemorySourceType.EXECUTION_RESULT,
+                record.getExecutionId(),
+                record.getTaskId(),
+                memoryCandidateTags(classification, retryable, false),
+                confidence,
+                rawEvidence(summary, evidence),
+                memoryCandidateMetadata(record, classification, riskLevel, retryable, evidence, 1)
+            )
+        );
+        if (result.memoryId() != null) {
             markTaskMemoryRefinementPending(record.getTaskId());
         }
         return memoryCandidateResult(result);
@@ -545,24 +550,27 @@ public class FailureAnalysisApplicationService {
                 continue;
             }
             var retryable = group.retryable();
-            var result = memoryRefineryService.refine(new MemoryCandidateRequest(
-                "Repeated " + group.classification() + " pattern for " + group.apiReference(),
-                "Task " + taskId + " saw " + group.occurrenceCount()
-                    + " similar executions with classification " + group.classification()
-                    + ". Next action: " + first.nextSuggestion(),
-                MemorySourceType.EXECUTION_RESULT,
-                taskId + ":" + group.classification() + ":" + group.apiReference() + ":" + group.statusCode(),
-                taskId,
-                memoryCandidateTags(group.classification(), retryable, true),
-                0.90f,
-                "Repeated task-level failure executions: " + group.executionIds()
-                    + ". Cases: " + group.affectedCaseIds()
-                    + ". Evidence: " + first.evidence(),
-                groupedMemoryCandidateMetadata(group, taskId, first)
-            ));
+            var result = memoryFeedback.refineFailureAnalysisCandidate(
+                AgentMemoryCandidateSourceType.FAILURE_ANALYSIS,
+                new MemoryCandidateRequest(
+                    "Repeated " + group.classification() + " pattern for " + group.apiReference(),
+                    "Task " + taskId + " saw " + group.occurrenceCount()
+                        + " similar executions with classification " + group.classification()
+                        + ". Next action: " + first.nextSuggestion(),
+                    MemorySourceType.EXECUTION_RESULT,
+                    taskId + ":" + group.classification() + ":" + group.apiReference() + ":" + group.statusCode(),
+                    taskId,
+                    memoryCandidateTags(group.classification(), retryable, true),
+                    0.90f,
+                    "Repeated task-level failure executions: " + group.executionIds()
+                        + ". Cases: " + group.affectedCaseIds()
+                        + ". Evidence: " + first.evidence(),
+                    groupedMemoryCandidateMetadata(group, taskId, first)
+                )
+            );
             var candidateResult = memoryCandidateResult(result);
             group.executionIds().forEach(executionId -> byExecutionId.put(executionId, candidateResult));
-            if (result.accepted()) {
+            if (result.memoryId() != null) {
                 markTaskMemoryRefinementPending(taskId);
             }
         }
@@ -620,15 +628,16 @@ public class FailureAnalysisApplicationService {
         );
     }
 
-    private MemoryCandidateAnalysisResult memoryCandidateResult(MemoryRefineryResult result) {
-        var memoryId = result.memory() == null ? null : result.memory().memoryId();
+    private MemoryCandidateAnalysisResult memoryCandidateResult(AgentMemoryFeedbackResult result) {
+        var accepted = result.memoryId() != null;
+        var duplicateWithMemory = result.status() == MemoryCandidateProcessingStatus.DUPLICATE && result.memoryId() != null;
         return new MemoryCandidateAnalysisResult(
             true,
-            result.accepted(),
-            result.created(),
-            result.accepted() && !result.created() && result.duplicateSuppressed(),
+            accepted,
+            result.status() == MemoryCandidateProcessingStatus.ACCEPTED,
+            result.status() == MemoryCandidateProcessingStatus.MERGED || duplicateWithMemory,
             result.rejectionReason(),
-            memoryId
+            result.memoryId()
         );
     }
 
