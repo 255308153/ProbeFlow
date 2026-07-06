@@ -9,9 +9,9 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 @Component
-class MemoryFeedbackSanitizer {
+public class MemoryFeedbackSanitizer {
 
-    static final String MASKED_VALUE = "***MASKED***";
+    public static final String MASKED_VALUE = "***MASKED***";
 
     private static final Pattern AUTHORIZATION_PATTERN = Pattern.compile(
         "(?i)(authorization\\s*[:=]\\s*)(bearer\\s+)?[^\\s,;]+"
@@ -23,7 +23,7 @@ class MemoryFeedbackSanitizer {
         "(?i)\\b(?:secret|token|password|cookie|apikey|api-key)[-_][A-Za-z0-9._-]+"
     );
 
-    String sanitizeText(String value) {
+    public String sanitizeText(String value) {
         if (!StringUtils.hasText(value)) {
             return value == null ? null : value.trim();
         }
@@ -34,7 +34,7 @@ class MemoryFeedbackSanitizer {
         return sanitized;
     }
 
-    Map<String, Object> sanitizeMap(Map<String, Object> value) {
+    public Map<String, Object> sanitizeMap(Map<String, Object> value) {
         if (value == null || value.isEmpty()) {
             return Map.of();
         }
@@ -47,7 +47,7 @@ class MemoryFeedbackSanitizer {
         return Map.copyOf(sanitized);
     }
 
-    Object sanitizeValue(String key, Object value) {
+    public Object sanitizeValue(String key, Object value) {
         if (isSensitiveKey(key)) {
             return MASKED_VALUE;
         }
@@ -76,7 +76,7 @@ class MemoryFeedbackSanitizer {
         return value;
     }
 
-    boolean containsSensitiveText(Object value) {
+    public boolean containsSensitiveText(Object value) {
         return value != null && value.toString().contains(MASKED_VALUE);
     }
 
