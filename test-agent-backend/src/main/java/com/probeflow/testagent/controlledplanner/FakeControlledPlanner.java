@@ -2,7 +2,9 @@ package com.probeflow.testagent.controlledplanner;
 
 import com.probeflow.testagent.agentpolicy.ToolRiskLevel;
 import java.util.List;
+import org.springframework.stereotype.Component;
 
+@Component
 public class FakeControlledPlanner implements ControlledPlanner {
 
     public static final String SCENARIO_CONSTRAINT_CODE = "FAKE_PLANNER_SCENARIO";
