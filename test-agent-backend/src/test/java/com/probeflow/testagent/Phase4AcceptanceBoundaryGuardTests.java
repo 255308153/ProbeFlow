@@ -318,6 +318,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             "SessionMemoryService",
             "TaskInitializationService",
             "TaskMemoryService",
+            "TaskOrchestrationApplicationService",
             "TestCaseGenerationApplicationService",
             "TestCasePromotionService",
             "UnifiedContextBuilder"

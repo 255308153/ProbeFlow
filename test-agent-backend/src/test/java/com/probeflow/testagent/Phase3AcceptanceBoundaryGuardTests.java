@@ -243,6 +243,7 @@ class Phase3AcceptanceBoundaryGuardTests {
                 "KnowledgeIngestApplicationService",
                 "KnowledgeRetrievalApplicationService",
                 "ReportGenerationApplicationService",
+                "TaskOrchestrationApplicationService",
                 "TestCaseGenerationApplicationService"
             );
         assertThat(controllerAnnotations).isEmpty();

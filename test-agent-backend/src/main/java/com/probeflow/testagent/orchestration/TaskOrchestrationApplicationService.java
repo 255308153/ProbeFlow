@@ -1,0 +1,146 @@
+package com.probeflow.testagent.orchestration;
+
+import com.probeflow.testagent.task.PlanStep;
+import com.probeflow.testagent.task.PlanStepRepository;
+import com.probeflow.testagent.task.PlanStepStatus;
+import com.probeflow.testagent.task.PlanStepType;
+import com.probeflow.testagent.task.Task;
+import com.probeflow.testagent.task.TaskRepository;
+import com.probeflow.testagent.task.TaskStatus;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
+
+@Service
+public class TaskOrchestrationApplicationService {
+
+    private final TaskRepository tasks;
+    private final PlanStepRepository planSteps;
+    private final PlanStepRunner planStepRunner;
+
+    public TaskOrchestrationApplicationService(
+        TaskRepository tasks,
+        PlanStepRepository planSteps,
+        PlanStepRunner planStepRunner
+    ) {
+        this.tasks = tasks;
+        this.planSteps = planSteps;
+        this.planStepRunner = planStepRunner;
+    }
+
+    @Transactional
+    public TaskOrchestrationResult runInitializedTask(String taskId) {
+        if (!StringUtils.hasText(taskId)) {
+            throw new IllegalArgumentException("Task id is required");
+        }
+        var task = tasks.findById(taskId.trim())
+            .orElseThrow(() -> new IllegalArgumentException("Task not found: " + taskId));
+        var blockers = new ArrayList<String>();
+        var orderedSteps = planSteps.findByTaskIdOrderByStepOrderAsc(task.getTaskId());
+
+        if (task.getStatus() == TaskStatus.CANCELLED) {
+            blockers.add("Task is cancelled");
+            return result(task, orderedSteps, blockers);
+        }
+        if (orderedSteps.isEmpty()) {
+            blockers.add("Task has no PlanSteps");
+            task.setStatus(TaskStatus.FAILED);
+            tasks.save(task);
+            return result(task, orderedSteps, blockers);
+        }
+
+        for (int i = 0; i < orderedSteps.size(); i++) {
+            task = tasks.findById(task.getTaskId()).orElseThrow();
+            if (task.getStatus() == TaskStatus.CANCELLED) {
+                blockers.add("Task is cancelled");
+                return result(task, orderedSteps, blockers);
+            }
+
+            var step = orderedSteps.get(i);
+            if (step.getStepStatus() == PlanStepStatus.SUCCESS || step.getStepStatus() == PlanStepStatus.SKIPPED) {
+                continue;
+            }
+            if (step.getStepStatus() == PlanStepStatus.FAILED) {
+                blockers.add("PlanStep failed: " + step.getStepType());
+                skipDownstream(orderedSteps, i + 1);
+                task.setStatus(TaskStatus.FAILED);
+                tasks.save(task);
+                return result(task, orderedSteps, blockers);
+            }
+
+            var outcome = runStep(task, step);
+            blockers.addAll(outcome.blockerDetails());
+            if (outcome.stepStatus() == PlanStepStatus.FAILED) {
+                skipDownstream(orderedSteps, i + 1);
+                task = tasks.findById(task.getTaskId()).orElseThrow();
+                return result(task, orderedSteps, blockers);
+            }
+            if (outcome.stopOrchestration()) {
+                task = tasks.findById(task.getTaskId()).orElseThrow();
+                return result(task, orderedSteps, blockers);
+            }
+        }
+
+        task = tasks.findById(task.getTaskId()).orElseThrow();
+        if (task.getStatus() != TaskStatus.CANCELLED && task.getStatus() != TaskStatus.FAILED) {
+            task.setStatus(TaskStatus.COMPLETED);
+            tasks.save(task);
+        }
+        return result(task, orderedSteps, blockers);
+    }
+
+    private StepOutcome runStep(Task task, PlanStep step) {
+        task.setStatus(statusFor(step.getStepType()));
+        tasks.save(task);
+
+        step.setStepStatus(PlanStepStatus.RUNNING);
+        if (step.getStartedAt() == null) {
+            step.setStartedAt(Instant.now());
+        }
+        planSteps.save(step);
+
+        var outcome = planStepRunner.run(task, step);
+        step.setStepStatus(outcome.stepStatus());
+        step.setFinishedAt(Instant.now());
+        planSteps.save(step);
+
+        if (outcome.taskStatus() != null) {
+            task.setStatus(outcome.taskStatus());
+        } else if (outcome.stepStatus() == PlanStepStatus.FAILED) {
+            task.setStatus(TaskStatus.FAILED);
+        } else if (outcome.stepStatus() == PlanStepStatus.SUCCESS && step.getStepType() == PlanStepType.GENERATE_CASES) {
+            task.setStatus(TaskStatus.CASE_GENERATED);
+        }
+        tasks.save(task);
+        return outcome;
+    }
+
+    private TaskStatus statusFor(PlanStepType stepType) {
+        return switch (stepType) {
+            case ANALYZE_CODE_API, RETRIEVE_KNOWLEDGE, GENERATE_CASES -> TaskStatus.ANALYZING;
+            case EXECUTE_SINGLE, EXECUTE_BATCH, EXECUTE_SUITE -> TaskStatus.EXECUTING;
+            case ANALYZE_FAILURE, GENERATE_REPORT, REFINE_MEMORY -> TaskStatus.ANALYZING_RESULTS;
+        };
+    }
+
+    private void skipDownstream(List<PlanStep> orderedSteps, int startIndex) {
+        for (int i = startIndex; i < orderedSteps.size(); i++) {
+            var step = orderedSteps.get(i);
+            if (step.getStepStatus() == PlanStepStatus.PENDING || step.getStepStatus() == PlanStepStatus.RUNNING) {
+                step.setStepStatus(PlanStepStatus.SKIPPED);
+                step.setFinishedAt(Instant.now());
+                planSteps.save(step);
+            }
+        }
+    }
+
+    private TaskOrchestrationResult result(Task task, List<PlanStep> orderedSteps, List<String> blockers) {
+        var completedStepCount = (int) orderedSteps.stream()
+            .filter(step -> step.getStepStatus() == PlanStepStatus.SUCCESS)
+            .count();
+        return new TaskOrchestrationResult(task.getTaskId(), task.getStatus(), completedStepCount, blockers);
+    }
+}
