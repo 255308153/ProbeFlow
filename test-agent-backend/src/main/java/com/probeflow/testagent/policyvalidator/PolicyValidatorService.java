@@ -1,16 +1,23 @@
 package com.probeflow.testagent.policyvalidator;
 
 import com.probeflow.testagent.agentpolicy.AgentPolicyService;
+import com.probeflow.testagent.agentpolicy.ToolCapabilityGroup;
 import com.probeflow.testagent.agentpolicy.ToolContractRegistry;
 import com.probeflow.testagent.agentpolicy.ToolName;
 import com.probeflow.testagent.agentpolicy.ToolPolicyDecision;
 import com.probeflow.testagent.agentpolicy.ToolPolicyEvaluationRequest;
 import com.probeflow.testagent.agentpolicy.ToolPolicyReasonCode;
 import com.probeflow.testagent.agentpolicy.ToolPolicyStatus;
+import com.probeflow.testagent.agentpolicy.ToolPrecondition;
 import com.probeflow.testagent.agentpolicy.ToolRiskLevel;
 import com.probeflow.testagent.controlledplanner.PlanDecision;
+import com.probeflow.testagent.controlledplanner.PlannerInput;
 import com.probeflow.testagent.controlledplanner.PlannerAction;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -177,11 +184,18 @@ public class PolicyValidatorService {
                 List.of("TOOL_NOT_VISIBLE")
             );
         }
+        var satisfiedPreconditions = effectiveSatisfiedPreconditions(request);
+        if (request.satisfiedPreconditions().isEmpty()) {
+            var taskOrderDecision = validateTaskOrder(decision, toolName, satisfiedPreconditions);
+            if (taskOrderDecision != null) {
+                return taskOrderDecision;
+            }
+        }
         return fromToolPolicyDecision(decision, policyService.evaluate(ToolPolicyEvaluationRequest.of(
             toolName,
             request.policy(),
             request.proposedToolInput(),
-            request.satisfiedPreconditions()
+            satisfiedPreconditions
         )));
     }
 
@@ -233,6 +247,127 @@ public class PolicyValidatorService {
             return decision.proposedToolName();
         }
         return decision.proposedPlanStep() == null ? null : decision.proposedPlanStep().proposedToolName();
+    }
+
+    private Set<ToolPrecondition> effectiveSatisfiedPreconditions(PolicyValidationRequest request) {
+        if (!request.satisfiedPreconditions().isEmpty()) {
+            return request.satisfiedPreconditions();
+        }
+        return inferPreconditions(request.plannerInput(), request.proposedToolInput());
+    }
+
+    private Set<ToolPrecondition> inferPreconditions(PlannerInput input, Map<String, Object> toolInput) {
+        var inferred = EnumSet.noneOf(ToolPrecondition.class);
+        if (input.taskState() != null) {
+            inferred.add(ToolPrecondition.TASK_EXISTS);
+        }
+        var combined = (
+            input.taskState().taskStatus()
+                + " " + input.taskState().remainingStepTypes()
+                + " " + input.lastStepOutcome().stepStatus()
+                + " " + input.lastStepOutcome().taskStatus()
+                + " " + input.lastStepOutcome().summary()
+                + " " + input.lastStepOutcome().resultRefs()
+                + " " + input.lastStepOutcome().blockers()
+                + " " + input.contextSummary().summary()
+                + " " + input.contextSummary().citationRefs()
+                + " " + toolInput
+        ).toLowerCase(Locale.ROOT);
+        if (hasText(toolInput.get("sourceMaterialId")) || containsAny(combined, "sourcematerial", "source-material", "source_material")) {
+            inferred.add(ToolPrecondition.SOURCE_MATERIAL_AVAILABLE);
+        }
+        if (hasText(toolInput.get("apiSpecId")) || containsAny(combined, "apispec", "api-spec", "api_spec")) {
+            inferred.add(ToolPrecondition.API_SPEC_AVAILABLE);
+        }
+        if (hasContext(input)) {
+            inferred.add(ToolPrecondition.CONTEXT_BUNDLE_AVAILABLE);
+        }
+        if (hasText(toolInput.get("draftId")) || containsAny(combined, "draft")) {
+            inferred.add(ToolPrecondition.TEST_CASE_DRAFT_EXISTS);
+        }
+        if (containsAny(combined, "reviewed", "approved")) {
+            inferred.add(ToolPrecondition.TEST_CASE_DRAFT_REVIEWED);
+        }
+        if (hasText(toolInput.get("testCaseId")) || containsAny(combined, "testcase", "test-case", "test_case", "case-")) {
+            inferred.add(ToolPrecondition.TEST_CASE_EXISTS);
+        }
+        if (hasText(toolInput.get("executionRecordId")) || containsAny(combined, "executionrecord", "execution-record", "execution_record", "exec-")) {
+            inferred.add(ToolPrecondition.EXECUTION_RECORD_EXISTS);
+        }
+        if (input.lastStepOutcome().hasBlockers() || containsAny(combined, "fail", "error", "timeout", "assertion", "5xx", "4xx")) {
+            inferred.add(ToolPrecondition.FAILURE_SIGNAL_AVAILABLE);
+        }
+        if (!input.lastStepOutcome().resultRefs().isEmpty()
+            || input.contextSummary().knowledgeHitCount() > 0
+            || input.contextSummary().memoryItemCount() > 0
+            || containsAny(combined, "reportdata", "report-data", "coverage", "observation")) {
+            inferred.add(ToolPrecondition.REPORT_DATA_AVAILABLE);
+        }
+        return Set.copyOf(inferred);
+    }
+
+    private PolicyValidationResult validateTaskOrder(
+        PlanDecision decision,
+        ToolName toolName,
+        Set<ToolPrecondition> satisfiedPreconditions
+    ) {
+        var contract = registry.find(toolName).orElseThrow();
+        if (contract.preconditions().contains(ToolPrecondition.API_SPEC_AVAILABLE)
+            && !satisfiedPreconditions.contains(ToolPrecondition.API_SPEC_AVAILABLE)) {
+            return phaseBlocked(decision, PolicyValidationReasonCode.MISSING_API_SPEC, "API spec is required before this planner suggestion.", "MISSING_API_SPEC");
+        }
+        if (contract.preconditions().contains(ToolPrecondition.CONTEXT_BUNDLE_AVAILABLE)
+            && !satisfiedPreconditions.contains(ToolPrecondition.CONTEXT_BUNDLE_AVAILABLE)) {
+            return phaseBlocked(decision, PolicyValidationReasonCode.MISSING_CONTEXT_BUNDLE, "Context bundle is required before test design suggestions.", "MISSING_CONTEXT_BUNDLE");
+        }
+        if (contract.capabilityGroup() == ToolCapabilityGroup.HTTP_EXECUTION
+            && (!satisfiedPreconditions.contains(ToolPrecondition.TEST_CASE_EXISTS)
+                || !satisfiedPreconditions.contains(ToolPrecondition.TEST_CASE_DRAFT_REVIEWED)
+                || !satisfiedPreconditions.contains(ToolPrecondition.EXECUTION_READINESS_CONFIRMED))) {
+            return phaseBlocked(decision, PolicyValidationReasonCode.MISSING_TEST_CASE, "Approved and reviewed test case readiness is required before HTTP execution.", "MISSING_TEST_CASE");
+        }
+        if (contract.capabilityGroup() == ToolCapabilityGroup.FAILURE_ANALYSIS
+            && !satisfiedPreconditions.contains(ToolPrecondition.EXECUTION_RECORD_EXISTS)) {
+            return phaseBlocked(decision, PolicyValidationReasonCode.MISSING_EXECUTION_RESULT, "Execution result is required before failure analysis.", "MISSING_EXECUTION_RESULT");
+        }
+        if (contract.capabilityGroup() == ToolCapabilityGroup.FAILURE_ANALYSIS
+            && !satisfiedPreconditions.contains(ToolPrecondition.FAILURE_SIGNAL_AVAILABLE)) {
+            return phaseBlocked(decision, PolicyValidationReasonCode.MISSING_FAILURE_SIGNAL, "Failure signal is required before failure analysis.", "MISSING_FAILURE_SIGNAL");
+        }
+        if (contract.capabilityGroup() == ToolCapabilityGroup.REPORTING
+            && !satisfiedPreconditions.contains(ToolPrecondition.REPORT_DATA_AVAILABLE)) {
+            return phaseBlocked(decision, PolicyValidationReasonCode.INSUFFICIENT_REPORT_DATA, "Task process data is insufficient for report generation.", "INSUFFICIENT_REPORT_DATA");
+        }
+        return null;
+    }
+
+    private PolicyValidationResult phaseBlocked(
+        PlanDecision decision,
+        PolicyValidationReasonCode reasonCode,
+        String message,
+        String blocker
+    ) {
+        return PolicyValidationResult.blocked(decision, reasonCode, message, List.of(blocker));
+    }
+
+    private boolean hasContext(PlannerInput input) {
+        return !input.contextSummary().summary().isBlank()
+            || !input.contextSummary().citationRefs().isEmpty()
+            || input.contextSummary().knowledgeHitCount() > 0
+            || input.contextSummary().memoryItemCount() > 0;
+    }
+
+    private boolean hasText(Object value) {
+        return value instanceof String text && !text.isBlank();
+    }
+
+    private boolean containsAny(String text, String... candidates) {
+        for (var candidate : candidates) {
+            if (text.contains(candidate)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private PolicyValidationResult allowedAfterDecisionGate(
