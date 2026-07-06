@@ -89,6 +89,9 @@ public class ReplanningApplicationService {
         if (decision.action() == PlannerAction.INSERT_STEP) {
             return applyInsertStep(request, decision, validation, plannerInput);
         }
+        if (decision.action() == PlannerAction.REPLAN) {
+            return applyReplan(request, decision, validation, plannerInput);
+        }
         return ReplanningResult.noop(
             request.trigger(),
             "Policy allowed the planner decision and the deterministic template plan remains unchanged.",
@@ -141,7 +144,9 @@ public class ReplanningApplicationService {
     }
 
     private List<String> remainingStepTypes(List<PlanStep> orderedSteps, PlanStep sourceStep) {
-        var sourceOrder = sourceStep == null ? Integer.MIN_VALUE : sourceStep.getStepOrder();
+        var sourceOrder = sourceStep == null || sourceStep.getStepOrder() == null
+            ? Integer.MIN_VALUE
+            : sourceStep.getStepOrder();
         return orderedSteps.stream()
             .filter(step -> step.getStepOrder() == null || step.getStepOrder() >= sourceOrder)
             .filter(step -> step.getStepStatus() != PlanStepStatus.SUCCESS && step.getStepStatus() != PlanStepStatus.SKIPPED)
@@ -242,22 +247,12 @@ public class ReplanningApplicationService {
         PlannerInput plannerInput
     ) {
         var proposed = decision.proposedPlanStep();
-        var stepType = parsePlanStepType(proposed);
-        if (stepType == null) {
-            return ReplanningResult.failed(request.trigger(), List.of("Planner proposed an illegal PlanStepType."));
-        }
         var orderedSteps = planSteps.findByTaskIdOrderByStepOrderAsc(request.taskId());
         var sourceStep = sourceStep(request, orderedSteps);
-        var inserted = new PlanStep();
-        inserted.setTaskId(request.taskId());
-        inserted.setStepType(stepType);
-        inserted.setStepStatus(PlanStepStatus.PENDING);
-        inserted.setStepOrder(nextRecoveryStepOrder(orderedSteps));
-        inserted.setGoal(recoveryGoal(proposed));
-        inserted.setInputRef(recoveryInputRef(request.trigger(), decision, sourceStep, proposed));
-        inserted.setRetryCount(0);
-
-        var saved = planSteps.save(inserted);
+        var saved = appendRecoveryStep(request, decision, orderedSteps, sourceStep, proposed);
+        if (saved == null) {
+            return ReplanningResult.failed(request.trigger(), List.of("Planner proposed an illegal PlanStepType."));
+        }
         var mutationSummary = new LinkedHashMap<String, Object>();
         mutationSummary.put("mutationApplied", true);
         mutationSummary.put("mutationType", PlannerAction.INSERT_STEP.name());
@@ -280,6 +275,104 @@ public class ReplanningApplicationService {
             List.of(saved.getStepId()),
             List.of()
         );
+    }
+
+    private ReplanningResult applyReplan(
+        ReplanningRequest request,
+        PlanDecision decision,
+        PolicyValidationResult validation,
+        PlannerInput plannerInput
+    ) {
+        var orderedSteps = planSteps.findByTaskIdOrderByStepOrderAsc(request.taskId());
+        var sourceStep = sourceStep(request, orderedSteps);
+        var skipped = skipPendingDownstreamSteps(orderedSteps, sourceStep);
+        var safeStop = request.trigger() == ReplanningTrigger.FAILURE_ANALYSIS_HIGH_RISK;
+        var inserted = safeStop
+            ? null
+            : appendRecoveryStep(request, decision, orderedSteps, sourceStep, recoveryStepForReplan(request.trigger()));
+
+        var mutationSummary = new LinkedHashMap<String, Object>();
+        mutationSummary.put("mutationApplied", true);
+        mutationSummary.put("mutationType", PlannerAction.REPLAN.name());
+        mutationSummary.put("safeStop", safeStop);
+        mutationSummary.put("skippedStepIds", skipped.stream().map(PlanStep::getStepId).toList());
+        mutationSummary.put("insertedStepIds", inserted == null ? List.of() : List.of(inserted.getStepId()));
+        mutationSummary.put("sourceStepId", sourceStep == null ? null : sourceStep.getStepId());
+        mutationSummary.put("trigger", request.trigger().name());
+        mutationSummary.put("decisionId", decision.decisionId());
+        mutationSummary.put("reason", safeStop
+            ? "High-risk failure analysis trigger truncated pending downstream work and performed a safe stop without adding a recovery step."
+            : "Pending downstream steps were skipped before appending a controlled recovery step.");
+        if (inserted != null) {
+            mutationSummary.put("insertedStepType", inserted.getStepType().name());
+            mutationSummary.put("insertedStepOrder", inserted.getStepOrder());
+        }
+        mutationSummary.entrySet().removeIf(entry -> entry.getValue() == null);
+
+        return ReplanningResult.applied(
+            request.trigger(),
+            decision.blockers(),
+            decisionAuditSummary(decision, plannerInput),
+            validation.auditSummary(),
+            mutationSummary,
+            inserted == null ? List.of() : List.of(inserted.getStepId()),
+            skipped.stream().map(PlanStep::getStepId).toList()
+        );
+    }
+
+    private List<PlanStep> skipPendingDownstreamSteps(List<PlanStep> orderedSteps, PlanStep sourceStep) {
+        var sourceOrder = sourceStep == null || sourceStep.getStepOrder() == null
+            ? Integer.MIN_VALUE
+            : sourceStep.getStepOrder();
+        var skipped = orderedSteps.stream()
+            .filter(step -> step.getStepOrder() != null && step.getStepOrder() > sourceOrder)
+            .filter(step -> step.getStepStatus() == PlanStepStatus.PENDING)
+            .toList();
+        skipped.forEach(step -> step.setStepStatus(PlanStepStatus.SKIPPED));
+        planSteps.saveAll(skipped);
+        return skipped;
+    }
+
+    private ProposedPlanStep recoveryStepForReplan(ReplanningTrigger trigger) {
+        if (trigger == ReplanningTrigger.PLAN_STEP_FAILED) {
+            return ProposedPlanStep.of(
+                "ANALYZE_FAILURE",
+                "Analyze failed step",
+                "Inspect the failure before rebuilding downstream work.",
+                "failure.analyze-execution"
+            );
+        }
+        if (trigger == ReplanningTrigger.CONTEXT_MISSING) {
+            return ProposedPlanStep.of(
+                "RETRIEVE_KNOWLEDGE",
+                "Retrieve missing context",
+                "Collect citations before rebuilding downstream work.",
+                "knowledge.retrieve-context"
+            );
+        }
+        return null;
+    }
+
+    private PlanStep appendRecoveryStep(
+        ReplanningRequest request,
+        PlanDecision decision,
+        List<PlanStep> orderedSteps,
+        PlanStep sourceStep,
+        ProposedPlanStep proposed
+    ) {
+        var stepType = parsePlanStepType(proposed);
+        if (stepType == null) {
+            return null;
+        }
+        var inserted = new PlanStep();
+        inserted.setTaskId(request.taskId());
+        inserted.setStepType(stepType);
+        inserted.setStepStatus(PlanStepStatus.PENDING);
+        inserted.setStepOrder(nextRecoveryStepOrder(orderedSteps));
+        inserted.setGoal(recoveryGoal(proposed));
+        inserted.setInputRef(recoveryInputRef(request.trigger(), decision, sourceStep, proposed));
+        inserted.setRetryCount(0);
+        return planSteps.save(inserted);
     }
 
     private PlanStepType parsePlanStepType(ProposedPlanStep proposed) {
