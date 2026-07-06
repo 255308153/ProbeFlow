@@ -517,6 +517,121 @@ class ReportGenerationApplicationServiceTests {
     }
 
     @Test
+    void buildsDeduplicatedPrioritizedMachineReadableSuggestions() {
+        apiSpecs.save(newApiSpec("api-auth-suggestion", HttpMethod.GET, "/api/private"));
+        apiSpecs.save(newApiSpec("api-server-suggestion", HttpMethod.GET, "/api/orders/{id}"));
+        apiSpecs.save(newApiSpec("api-validation-suggestion", HttpMethod.POST, "/api/orders"));
+        var task = tasks.save(newTask(
+            "task-suggestions",
+            List.of("api-auth-suggestion", "api-server-suggestion", "api-validation-suggestion"),
+            Map.of("environment", "qa")
+        ));
+        var authCase = testCases.save(newTestCase("case-auth-suggestion", "api-auth-suggestion"));
+        var firstServerCase = testCases.save(newTestCase("case-server-suggestion-1", "api-server-suggestion"));
+        var secondServerCase = testCases.save(newTestCase("case-server-suggestion-2", "api-server-suggestion"));
+        var validationCase = testCases.save(newTestCase("case-validation-suggestion", "api-validation-suggestion"));
+        var auth = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            authCase.getCaseId(),
+            "qa",
+            "api-auth-suggestion",
+            OverallStatus.FAILED,
+            11L,
+            403,
+            Map.of("statusCode", 403),
+            null,
+            List.of()
+        ));
+        var firstServer = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            firstServerCase.getCaseId(),
+            "qa",
+            "api-server-suggestion",
+            OverallStatus.FAILED,
+            41L,
+            500,
+            Map.of("statusCode", 500),
+            null,
+            List.of()
+        ));
+        var secondServer = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            secondServerCase.getCaseId(),
+            "qa",
+            "api-server-suggestion",
+            OverallStatus.FAILED,
+            42L,
+            500,
+            Map.of("statusCode", 500),
+            null,
+            List.of()
+        ));
+        var validation = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            validationCase.getCaseId(),
+            "qa",
+            "api-validation-suggestion",
+            OverallStatus.FAILED,
+            13L,
+            422,
+            Map.of("statusCode", 422),
+            null,
+            List.of(Map.of("type", "JSON_FIELD_EQUALS", "status", "FAILED", "expected", "CREATED", "actual", "INVALID"))
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = reportGeneration.generateTaskReport(ReportGenerationRequest.forTask(task.getTaskId()));
+
+        var report = reports.findById(result.reportId()).orElseThrow();
+        assertThat(report.getSuggestions()).hasSize(3);
+        assertThat(report.getSuggestions()).extracting(suggestion -> suggestion.get("priority"))
+            .containsExactly("P0", "P1", "P2");
+        assertThat(report.getSuggestions().get(0))
+            .containsEntry("category", "AUTH")
+            .containsEntry("priority", "P0")
+            .containsEntry("classification", "AUTH_ISSUE")
+            .containsEntry("primaryApiSpecId", "api-auth-suggestion")
+            .containsEntry("retryable", false);
+        assertThat((String) report.getSuggestions().get(0).get("action"))
+            .contains("credentials");
+
+        var retrySuggestion = report.getSuggestions().get(1);
+        assertThat(retrySuggestion)
+            .containsEntry("category", "RETRY")
+            .containsEntry("priority", "P1")
+            .containsEntry("classification", "SERVER_ERROR")
+            .containsEntry("primaryApiSpecId", "api-server-suggestion")
+            .containsEntry("statusCode", 500)
+            .containsEntry("retryable", true);
+        assertThat((String) retrySuggestion.get("stableKey"))
+            .isEqualTo("RETRY_AFTER_STABILIZATION|SERVER_ERROR|api-server-suggestion|500||");
+        @SuppressWarnings("unchecked")
+        var retryRefs = (Map<String, Object>) retrySuggestion.get("sourceReferences");
+        assertThat((List<String>) retryRefs.get("executionIds"))
+            .containsExactlyInAnyOrder(firstServer.getExecutionId(), secondServer.getExecutionId());
+        assertThat((List<String>) retryRefs.get("caseIds"))
+            .containsExactlyInAnyOrder(firstServerCase.getCaseId(), secondServerCase.getCaseId());
+        assertThat((List<String>) retryRefs.get("apiSpecIds"))
+            .containsExactly("api-server-suggestion");
+
+        assertThat(report.getSuggestions().get(2))
+            .containsEntry("category", "INVESTIGATION")
+            .containsEntry("priority", "P2")
+            .containsEntry("classification", "VALIDATION_ISSUE")
+            .containsEntry("primaryApiSpecId", "api-validation-suggestion")
+            .containsEntry("retryable", false);
+        assertThat((String) report.getSuggestions().get(2).get("rationale"))
+            .contains("non-retryable");
+        assertThat(report.getFindings()).anySatisfy(finding -> assertThat(finding)
+            .containsEntry("classification", "AUTH_ISSUE")
+            .containsEntry("executionId", auth.getExecutionId()));
+        assertThat(report.getFindings()).anySatisfy(finding -> assertThat(finding)
+            .containsEntry("classification", "VALIDATION_ISSUE")
+            .containsEntry("executionId", validation.getExecutionId()));
+    }
+
+    @Test
     void missingTaskIsRejectedClearly() {
         assertThatThrownBy(() -> reportGeneration.generateTaskReport(ReportGenerationRequest.forTask("missing-task")))
             .isInstanceOf(IllegalArgumentException.class)

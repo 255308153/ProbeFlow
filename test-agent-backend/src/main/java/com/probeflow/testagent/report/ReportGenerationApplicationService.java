@@ -72,8 +72,9 @@ public class ReportGenerationApplicationService {
         report.setFailCount(executionSummary.failed());
         report.setWarningCount(executionSummary.warning());
         report.setRiskSummary(riskSummary(state, executionSummary));
-        report.setFindings(findings(task, state, caseIds, records, executionSummary));
-        report.setSuggestions(List.of());
+        var findings = findings(task, state, caseIds, records, executionSummary);
+        report.setFindings(findings);
+        report.setSuggestions(suggestions(findings));
         report.setMetadata(metadata(task, caseIds, taskExecutions, records, state, executionSummary));
 
         var saved = reports.save(report);
@@ -285,6 +286,9 @@ public class ReportGenerationApplicationService {
         finding.put("primaryApiSpecId", apiSpecIds.isEmpty() ? null : apiSpecIds.getFirst());
         finding.put("apiSpecIds", apiSpecIds);
         finding.put("executionId", record.getExecutionId());
+        finding.put("statusCode", record.getStatusCode());
+        finding.put("errorType", stringValue((record.getResponseSnapshot() == null ? Map.<String, Object>of() : record.getResponseSnapshot()).get("errorType")));
+        finding.put("assertionTypes", assertionTypes(record));
         finding.put("observationIds", observationList.stream().map(Observation::getObservationId).toList());
         finding.put("retryable", retryable(classification));
         finding.put("evidenceType", observationList.isEmpty() ? "FACTUAL" : "FACTUAL_AND_INFERRED");
@@ -338,6 +342,7 @@ public class ReportGenerationApplicationService {
         finding.put("classification", "DATA_QUALITY_ISSUE");
         finding.put("groupKey", "DATA_QUALITY_ISSUE|" + type + "|" + record.getCaseId() + "|" + String.join(",", apiSpecIds));
         finding.put("executionId", record.getExecutionId());
+        finding.put("statusCode", record.getStatusCode());
         finding.put("observationIds", List.of());
         finding.put("retryable", false);
         finding.put("evidenceType", "FACTUAL");
@@ -345,6 +350,205 @@ public class ReportGenerationApplicationService {
         finding.put("inferredEvidence", List.of());
         finding.put("sourceReferences", sourceReferences(record, List.of(), apiSpecIds));
         return finding;
+    }
+
+    private List<Map<String, Object>> suggestions(List<Map<String, Object>> findings) {
+        var byKey = new LinkedHashMap<String, Map<String, Object>>();
+        for (var finding : findings) {
+            var classification = clean(stringValue(finding.get("classification")));
+            if (classification == null || "NONE".equals(classification)) {
+                continue;
+            }
+            var suggestion = suggestionFor(finding, classification);
+            if (suggestion == null) {
+                continue;
+            }
+            var stableKey = stringValue(suggestion.get("stableKey"));
+            if (!byKey.containsKey(stableKey)) {
+                byKey.put(stableKey, suggestion);
+            } else {
+                mergeSuggestion(byKey.get(stableKey), suggestion);
+            }
+        }
+        return byKey.values().stream()
+            .sorted(Comparator
+                .comparingInt((Map<String, Object> suggestion) -> priorityRank(stringValue(suggestion.get("priority"))))
+                .thenComparing(suggestion -> sortValue(suggestion.get("category")))
+                .thenComparing(suggestion -> sortValue(suggestion.get("classification")))
+                .thenComparing(suggestion -> sortValue(suggestion.get("primaryApiSpecId")))
+                .thenComparing(suggestion -> sortValue(suggestion.get("action"))))
+            .toList();
+    }
+
+    private Map<String, Object> suggestionFor(Map<String, Object> finding, String classification) {
+        var actionKind = actionKind(finding, classification);
+        if (actionKind == null) {
+            return null;
+        }
+        var suggestion = new LinkedHashMap<String, Object>();
+        suggestion.put("stableKey", suggestionStableKey(actionKind, finding, classification));
+        suggestion.put("category", suggestionCategory(actionKind, classification));
+        suggestion.put("priority", suggestionPriority(actionKind, classification, stringValue(finding.get("severity"))));
+        suggestion.put("classification", classification);
+        suggestion.put("primaryApiSpecId", finding.get("primaryApiSpecId"));
+        suggestion.put("statusCode", finding.get("statusCode"));
+        suggestion.put("errorType", finding.get("errorType"));
+        suggestion.put("assertionTypes", finding.getOrDefault("assertionTypes", List.of()));
+        suggestion.put("retryable", Boolean.TRUE.equals(finding.get("retryable")));
+        suggestion.put("action", suggestionAction(actionKind, classification));
+        suggestion.put("rationale", suggestionRationale(actionKind, classification));
+        suggestion.put("findingGroupKeys", List.of(stringValue(finding.get("groupKey"))));
+        suggestion.put("sourceReferences", finding.get("sourceReferences"));
+        return suggestion;
+    }
+
+    private String actionKind(Map<String, Object> finding, String classification) {
+        if ("DATA_QUALITY_ISSUE".equals(classification)) {
+            return "REPAIR_LINKED_DATA";
+        }
+        if (Boolean.TRUE.equals(finding.get("retryable"))) {
+            return "RETRY_AFTER_STABILIZATION";
+        }
+        if ("AUTH_ISSUE".equals(classification)) {
+            return "INSPECT_AUTH";
+        }
+        if ("VALIDATION_ISSUE".equals(classification)
+            || "STATUS_MISMATCH".equals(classification)
+            || "RESPONSE_SHAPE_MISMATCH".equals(classification)
+            || "RESPONSE_VALUE_MISMATCH".equals(classification)
+            || "BODY_PRESENCE_FAILURE".equals(classification)
+            || "DURATION_REGRESSION".equals(classification)
+            || "ASSERTION_FAILURE".equals(classification)) {
+            return "INVESTIGATE_TEST_OR_CONTRACT";
+        }
+        if ("BLOCKED_REQUEST".equals(classification)) {
+            return "RESOLVE_BLOCKER";
+        }
+        if ("SKIPPED".equals(classification)) {
+            return "REVIEW_SKIPPED_EXECUTION";
+        }
+        if ("PASSED_WITH_WARNING".equals(classification)) {
+            return "REVIEW_WARNING";
+        }
+        return "INVESTIGATE_FAILURE";
+    }
+
+    private String suggestionStableKey(String actionKind, Map<String, Object> finding, String classification) {
+        return actionKind + "|"
+            + classification + "|"
+            + sortValue(finding.get("primaryApiSpecId")) + "|"
+            + sortValue(finding.get("statusCode")) + "|"
+            + sortValue(finding.get("errorType")) + "|"
+            + String.join(",", stringList(finding.get("assertionTypes")));
+    }
+
+    private String suggestionCategory(String actionKind, String classification) {
+        return switch (actionKind) {
+            case "RETRY_AFTER_STABILIZATION" -> "RETRY";
+            case "REPAIR_LINKED_DATA" -> "DATA_QUALITY";
+            case "INSPECT_AUTH" -> "AUTH";
+            case "RESOLVE_BLOCKER" -> "BLOCKER";
+            case "REVIEW_SKIPPED_EXECUTION", "REVIEW_WARNING" -> "REVIEW";
+            default -> "INVESTIGATION";
+        };
+    }
+
+    private String suggestionPriority(String actionKind, String classification, String severity) {
+        if ("INSPECT_AUTH".equals(actionKind) || "CRITICAL".equals(severity)) {
+            return "P0";
+        }
+        if ("RETRY_AFTER_STABILIZATION".equals(actionKind)
+            || "REPAIR_LINKED_DATA".equals(actionKind)
+            || "HIGH".equals(severity)) {
+            return "P1";
+        }
+        if ("MEDIUM".equals(severity)) {
+            return "P2";
+        }
+        return "P3";
+    }
+
+    private String suggestionAction(String actionKind, String classification) {
+        return switch (actionKind) {
+            case "RETRY_AFTER_STABILIZATION" -> "Retry affected executions after confirming the target environment is stable.";
+            case "REPAIR_LINKED_DATA" -> "Repair missing TestCase or ApiSpec links before relying on this report.";
+            case "INSPECT_AUTH" -> "Inspect credentials, tokens and permissions before rerunning affected cases.";
+            case "INVESTIGATE_TEST_OR_CONTRACT" -> "Review request data, assertions and API contract with the owning team.";
+            case "RESOLVE_BLOCKER" -> "Resolve the blocking request condition before rerunning affected cases.";
+            case "REVIEW_SKIPPED_EXECUTION" -> "Review skipped executions and decide whether they should be rerun.";
+            case "REVIEW_WARNING" -> "Review warning-level assertion failures and decide whether they should become blocking.";
+            default -> "Investigate affected failures with the referenced execution evidence.";
+        };
+    }
+
+    private String suggestionRationale(String actionKind, String classification) {
+        return switch (actionKind) {
+            case "RETRY_AFTER_STABILIZATION" -> classification + " is marked retryable by deterministic report classification.";
+            case "REPAIR_LINKED_DATA" -> "The report found missing linked TestCase or ApiSpec data, which can make ownership and coverage ambiguous.";
+            case "INSPECT_AUTH" -> "Authentication and authorization failures are usually non-retryable until credentials or permissions change.";
+            case "INVESTIGATE_TEST_OR_CONTRACT" -> classification + " is non-retryable and needs human review of the test asset or API behavior.";
+            case "RESOLVE_BLOCKER" -> "Blocked requests require configuration or safety-policy cleanup before execution can proceed.";
+            case "REVIEW_SKIPPED_EXECUTION" -> "Skipped executions are coverage gaps, not independent API failures.";
+            case "REVIEW_WARNING" -> "Warnings indicate non-critical assertion failures that still deserve triage.";
+            default -> classification + " needs human investigation.";
+        };
+    }
+
+    @SuppressWarnings("unchecked")
+    private void mergeSuggestion(Map<String, Object> target, Map<String, Object> source) {
+        target.put("findingGroupKeys", mergeStringLists(target.get("findingGroupKeys"), source.get("findingGroupKeys")));
+        var targetRefs = (Map<String, Object>) target.getOrDefault("sourceReferences", Map.of());
+        var sourceRefs = (Map<String, Object>) source.getOrDefault("sourceReferences", Map.of());
+        var mergedRefs = new LinkedHashMap<String, Object>();
+        mergedRefs.put("executionIds", mergeStringLists(targetRefs.get("executionIds"), sourceRefs.get("executionIds")));
+        mergedRefs.put("observationIds", mergeStringLists(targetRefs.get("observationIds"), sourceRefs.get("observationIds")));
+        mergedRefs.put("caseIds", mergeStringLists(targetRefs.get("caseIds"), sourceRefs.get("caseIds")));
+        mergedRefs.put("apiSpecIds", mergeStringLists(targetRefs.get("apiSpecIds"), sourceRefs.get("apiSpecIds")));
+        target.put("sourceReferences", mergedRefs);
+    }
+
+    private List<String> mergeStringLists(Object first, Object second) {
+        var values = new LinkedHashSet<String>();
+        values.addAll(stringList(first));
+        values.addAll(stringList(second));
+        return values.stream().sorted().toList();
+    }
+
+    private List<String> assertionTypes(ExecutionRecord record) {
+        if (record.getAssertionResults() == null) {
+            return List.of();
+        }
+        return record.getAssertionResults().stream()
+            .filter(assertion -> "FAILED".equals(stringValue(assertion.get("status"))))
+            .map(assertion -> clean(stringValue(assertion.get("type"))))
+            .filter(value -> value != null)
+            .distinct()
+            .sorted()
+            .toList();
+    }
+
+    private List<String> stringList(Object value) {
+        if (!(value instanceof List<?> list)) {
+            return List.of();
+        }
+        return list.stream()
+            .map(this::cleanStringValue)
+            .filter(item -> item != null)
+            .distinct()
+            .toList();
+    }
+
+    private int priorityRank(String priority) {
+        if ("P0".equals(priority)) {
+            return 0;
+        }
+        if ("P1".equals(priority)) {
+            return 1;
+        }
+        if ("P2".equals(priority)) {
+            return 2;
+        }
+        return 3;
     }
 
     private List<String> affectedApiSpecIds(ExecutionRecord record, FindingContext context) {
@@ -430,7 +634,7 @@ public class ReportGenerationApplicationService {
         if (observationSeverity != null) {
             return observationSeverity;
         }
-        if (record.isCriticalFailed() || "SERVER_ERROR".equals(classification) || "AUTH_ISSUE".equals(classification)) {
+        if ("SERVER_ERROR".equals(classification) || "AUTH_ISSUE".equals(classification)) {
             return "HIGH";
         }
         if ("VALIDATION_ISSUE".equals(classification)
@@ -737,6 +941,10 @@ public class ReportGenerationApplicationService {
 
     private String sortValue(Object value) {
         return value == null ? "" : String.valueOf(value);
+    }
+
+    private String cleanStringValue(Object value) {
+        return clean(stringValue(value));
     }
 
     private long longValue(Object value) {
