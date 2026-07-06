@@ -17,6 +17,9 @@ public class ControlledPlannerService {
             throw new IllegalArgumentException("planner input is required");
         }
         try {
+            if (usesFakePlannerScenario(input)) {
+                return new FakeControlledPlanner().plan(input);
+            }
             return planner.plan(input);
         } catch (ControlledPlannerException exception) {
             return PlanDecision.failed(
@@ -24,5 +27,10 @@ public class ControlledPlannerService {
                 List.of(exception.getMessage())
             );
         }
+    }
+
+    private boolean usesFakePlannerScenario(PlannerInput input) {
+        return input.constraints().stream()
+            .anyMatch(constraint -> FakeControlledPlanner.SCENARIO_CONSTRAINT_CODE.equals(constraint.code()));
     }
 }

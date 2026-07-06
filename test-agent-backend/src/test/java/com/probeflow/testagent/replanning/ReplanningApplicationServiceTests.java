@@ -3,6 +3,9 @@ package com.probeflow.testagent.replanning;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.probeflow.testagent.controlledplanner.FakeControlledPlanner;
+import com.probeflow.testagent.controlledplanner.FakePlannerScenario;
+import com.probeflow.testagent.controlledplanner.PlannerConstraint;
 import com.probeflow.testagent.orchestration.StepOutcome;
 import com.probeflow.testagent.task.PlanStep;
 import com.probeflow.testagent.task.PlanStepRepository;
@@ -147,7 +150,10 @@ class ReplanningApplicationServiceTests {
             step.getStepId(),
             StepOutcome.blocked("Missing context", List.of("No auth examples found")),
             Map.of(),
-            false
+            false,
+            null,
+            null,
+            List.of(PlannerConstraint.of(FakeControlledPlanner.SCENARIO_CONSTRAINT_CODE, FakePlannerScenario.CONTINUE.name()))
         ));
 
         entityManager.flush();
@@ -155,8 +161,10 @@ class ReplanningApplicationServiceTests {
 
         assertThat(result.status()).isEqualTo(ReplanningStatus.NOOP);
         assertThat(result.trigger()).isEqualTo(ReplanningTrigger.CONTEXT_MISSING);
-        assertThat(result.decisionSummary()).containsEntry("plannerCalled", false);
-        assertThat(result.policySummary()).containsEntry("policyValidated", false);
+        assertThat(result.decisionSummary())
+            .containsEntry("action", "CONTINUE")
+            .containsEntry("plannerCalled", true);
+        assertThat(result.policySummary()).containsEntry("validationStatus", "ALLOWED");
         assertThat(result.planMutationSummary()).containsEntry("mutationApplied", false);
         assertThat(tasks.findById(task.getTaskId()).orElseThrow().getStatus()).isEqualTo(TaskStatus.ANALYZING);
         assertThat(planSteps.findById(step.getStepId()).orElseThrow().getStepStatus()).isEqualTo(PlanStepStatus.PENDING);
@@ -164,15 +172,16 @@ class ReplanningApplicationServiceTests {
     }
 
     @Test
-    void issueOneEntrypointDoesNotCallPlannerPolicyOrPlanMutationCollaborators() throws Exception {
+    void replanningEntrypointDoesNotExecuteToolsOrUseFreeAgentRuntimeCollaborators() throws Exception {
         var source = Files.readString(PROJECT_ROOT.resolve(
             "src/main/java/com/probeflow/testagent/replanning/ReplanningApplicationService.java"
         ));
 
         assertThat(source)
-            .doesNotContain("ControlledPlanner")
-            .doesNotContain("PolicyValidator")
-            .doesNotContain(".save(")
+            .doesNotContain("ToolRouter")
+            .doesNotContain("PlanStepRunner")
+            .doesNotContain("LlmProvider")
+            .doesNotContain("AutoGPT")
             .doesNotContain(".delete(");
     }
 

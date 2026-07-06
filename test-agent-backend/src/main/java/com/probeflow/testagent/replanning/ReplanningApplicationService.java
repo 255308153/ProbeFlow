@@ -1,10 +1,17 @@
 package com.probeflow.testagent.replanning;
 
+import com.probeflow.testagent.controlledplanner.ControlledPlannerService;
+import com.probeflow.testagent.controlledplanner.HumanInputField;
+import com.probeflow.testagent.controlledplanner.PlanDecision;
 import com.probeflow.testagent.controlledplanner.PlannerConstraint;
 import com.probeflow.testagent.controlledplanner.PlannerInput;
 import com.probeflow.testagent.controlledplanner.PlannerInputFactory;
 import com.probeflow.testagent.controlledplanner.PlannerInputRequest;
 import com.probeflow.testagent.controlledplanner.PlannerTaskState;
+import com.probeflow.testagent.controlledplanner.RequiredHumanInput;
+import com.probeflow.testagent.policyvalidator.PolicyValidationRequest;
+import com.probeflow.testagent.policyvalidator.PolicyValidationResult;
+import com.probeflow.testagent.policyvalidator.PolicyValidatorService;
 import com.probeflow.testagent.task.PlanStep;
 import com.probeflow.testagent.task.PlanStepRepository;
 import com.probeflow.testagent.task.PlanStepStatus;
@@ -23,18 +30,24 @@ public class ReplanningApplicationService {
     private final TaskRepository tasks;
     private final PlanStepRepository planSteps;
     private final PlannerInputFactory plannerInputFactory;
+    private final ControlledPlannerService controlledPlanner;
+    private final PolicyValidatorService policyValidator;
 
     public ReplanningApplicationService(
         TaskRepository tasks,
         PlanStepRepository planSteps,
-        PlannerInputFactory plannerInputFactory
+        PlannerInputFactory plannerInputFactory,
+        ControlledPlannerService controlledPlanner,
+        PolicyValidatorService policyValidator
     ) {
         this.tasks = tasks;
         this.planSteps = planSteps;
         this.plannerInputFactory = plannerInputFactory;
+        this.controlledPlanner = controlledPlanner;
+        this.policyValidator = policyValidator;
     }
 
-    @Transactional(readOnly = true)
+    @Transactional
     public ReplanningResult replan(ReplanningRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("Replanning request is required");
@@ -50,10 +63,24 @@ public class ReplanningApplicationService {
             return ReplanningResult.notTriggerable(request.trigger(), List.of("Cancelled task cannot be replanned"));
         }
         var plannerInput = buildPlannerInput(request);
+        var decision = controlledPlanner.plan(plannerInput);
+        var validation = policyValidator.validate(new PolicyValidationRequest(decision, plannerInput, request.policy()));
+        if (validation.blocked()) {
+            return ReplanningResult.rejectedByPolicy(
+                request.trigger(),
+                decisionAuditSummary(decision, plannerInput),
+                validation.auditSummary(),
+                validation.blockers()
+            );
+        }
+        if (validation.requiresHumanConfirmation()) {
+            return pauseForHuman(request, decision, validation, plannerInput);
+        }
         return ReplanningResult.noop(
             request.trigger(),
-            "Recovery planner input was built and the plan was left unchanged.",
-            plannerInputSummary(plannerInput)
+            "Policy allowed the planner decision and the deterministic template plan remains unchanged.",
+            decisionAuditSummary(decision, plannerInput),
+            validation.auditSummary()
         );
     }
 
@@ -125,5 +152,88 @@ public class ReplanningApplicationService {
         summary.put("availableToolCount", plannerInput.availableTools().size());
         summary.entrySet().removeIf(entry -> entry.getValue() == null);
         return Map.copyOf(summary);
+    }
+
+    private ReplanningResult pauseForHuman(
+        ReplanningRequest request,
+        PlanDecision decision,
+        PolicyValidationResult validation,
+        PlannerInput plannerInput
+    ) {
+        var task = tasks.findById(request.taskId()).orElseThrow();
+        var metadata = task.getMetadata() == null
+            ? new LinkedHashMap<String, Object>()
+            : new LinkedHashMap<>(task.getMetadata());
+        var requiredHumanInput = humanInputSummary(decision.requiredHumanInput());
+        metadata.put("requiredHumanInput", requiredHumanInput);
+        metadata.put("lastReplanning", Map.of(
+            "trigger", request.trigger().name(),
+            "decisionId", decision.decisionId(),
+            "policyStatus", validation.status().name(),
+            "policyReasonCode", validation.reasonCode().name(),
+            "status", ReplanningStatus.WAITING_FOR_HUMAN.name()
+        ));
+        task.setMetadata(metadata);
+        task.setStatus(TaskStatus.WAITING_FOR_REVIEW);
+        tasks.save(task);
+
+        var mutationSummary = new LinkedHashMap<String, Object>();
+        mutationSummary.put("mutationApplied", true);
+        mutationSummary.put("taskStatus", TaskStatus.WAITING_FOR_REVIEW.name());
+        mutationSummary.put("requiredHumanInput", requiredHumanInput);
+        mutationSummary.put("reason", "Task paused for human confirmation; no PlanStep was inserted, deleted or reordered.");
+
+        var blockers = validation.blockers().isEmpty()
+            ? List.of(validation.message())
+            : validation.blockers();
+        return ReplanningResult.waitingForHuman(
+            request.trigger(),
+            decisionAuditSummary(decision, plannerInput),
+            validation.auditSummary(),
+            mutationSummary,
+            blockers
+        );
+    }
+
+    private Map<String, Object> decisionAuditSummary(PlanDecision decision, PlannerInput plannerInput) {
+        return merge(
+            Map.of("plannerCalled", true),
+            decision.auditSummary(),
+            plannerInputSummary(plannerInput)
+        );
+    }
+
+    private Map<String, Object> humanInputSummary(RequiredHumanInput input) {
+        if (input == null) {
+            return Map.of();
+        }
+        var summary = new LinkedHashMap<String, Object>();
+        summary.put("reason", input.reason());
+        summary.put("question", input.question());
+        summary.put("blocking", input.blocking());
+        summary.put("inputSchema", input.inputSchema().stream().map(this::humanInputFieldSummary).toList());
+        return Map.copyOf(summary);
+    }
+
+    private Map<String, Object> humanInputFieldSummary(HumanInputField field) {
+        var summary = new LinkedHashMap<String, Object>();
+        summary.put("name", field.name());
+        summary.put("type", field.type());
+        summary.put("description", field.description());
+        summary.put("required", field.required());
+        summary.entrySet().removeIf(entry -> entry.getValue() == null);
+        return Map.copyOf(summary);
+    }
+
+    @SafeVarargs
+    private final Map<String, Object> merge(Map<String, Object>... summaries) {
+        var merged = new LinkedHashMap<String, Object>();
+        for (var summary : summaries) {
+            if (summary != null) {
+                merged.putAll(summary);
+            }
+        }
+        merged.entrySet().removeIf(entry -> entry.getValue() == null);
+        return Map.copyOf(merged);
     }
 }

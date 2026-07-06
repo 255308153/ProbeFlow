@@ -141,7 +141,7 @@ class ReplanningPlannerInputRecoveryTests {
             false,
             AgentPolicy.v2Phase2Default().withTaskPhase(AgentTaskPhase.CONTEXT_BUILDING),
             ContextBundleSummary.empty(),
-            List.of()
+            List.of(PlannerConstraint.of(FakeControlledPlanner.SCENARIO_CONSTRAINT_CODE, FakePlannerScenario.CONTINUE.name()))
         ));
         var input = replanning.buildPlannerInput(new ReplanningRequest(
             task.getTaskId(),
@@ -157,9 +157,10 @@ class ReplanningPlannerInputRecoveryTests {
 
         assertThat(result.status()).isEqualTo(ReplanningStatus.NOOP);
         assertThat(result.decisionSummary())
-            .containsEntry("plannerCalled", false)
+            .containsEntry("action", "CONTINUE")
             .containsEntry("sourceStepType", "GENERATE_CASES")
             .containsEntry("lastStepStatus", "SKIPPED");
+        assertThat(result.policySummary()).containsEntry("validationStatus", "ALLOWED");
         assertThat(input.contextSummary()).isEqualTo(ContextBundleSummary.empty());
         assertThat(input.lastStepOutcome().blockers()).containsExactly("No RAG citations found");
         assertThat(input.availableTools().stream()

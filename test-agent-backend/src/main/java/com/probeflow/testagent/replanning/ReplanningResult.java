@@ -1,5 +1,6 @@
 package com.probeflow.testagent.replanning;
 
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -23,9 +24,9 @@ public record ReplanningResult(
             .filter(value -> value != null && !value.isBlank())
             .map(String::trim)
             .toList();
-        decisionSummary = decisionSummary == null ? Map.of() : Map.copyOf(decisionSummary);
-        policySummary = policySummary == null ? Map.of() : Map.copyOf(policySummary);
-        planMutationSummary = planMutationSummary == null ? Map.of() : Map.copyOf(planMutationSummary);
+        decisionSummary = immutableCopy(decisionSummary);
+        policySummary = immutableCopy(policySummary);
+        planMutationSummary = immutableCopy(planMutationSummary);
         insertedStepIds = cleanIds(insertedStepIds);
         skippedStepIds = cleanIds(skippedStepIds);
     }
@@ -35,12 +36,26 @@ public record ReplanningResult(
     }
 
     public static ReplanningResult noop(ReplanningTrigger trigger, String reason, Map<String, Object> decisionDetails) {
+        return noop(
+            trigger,
+            reason,
+            decisionDetails,
+            summary("policyValidated", false, "reason", "Policy validation is not part of the minimal replanning entrypoint.")
+        );
+    }
+
+    public static ReplanningResult noop(
+        ReplanningTrigger trigger,
+        String reason,
+        Map<String, Object> decisionDetails,
+        Map<String, Object> policyDetails
+    ) {
         return new ReplanningResult(
             ReplanningStatus.NOOP,
             trigger,
             List.of(),
             decisionSummary(reason, decisionDetails),
-            summary("policyValidated", false, "reason", "Policy validation is not part of the minimal replanning entrypoint."),
+            policyDetails,
             summary("mutationApplied", false, "reason", "No plan mutation was requested."),
             List.of(),
             List.of()
@@ -73,6 +88,43 @@ public record ReplanningResult(
         );
     }
 
+    public static ReplanningResult rejectedByPolicy(
+        ReplanningTrigger trigger,
+        Map<String, Object> decisionSummary,
+        Map<String, Object> policySummary,
+        List<String> blockers
+    ) {
+        return new ReplanningResult(
+            ReplanningStatus.REJECTED_BY_POLICY,
+            trigger,
+            blockers,
+            decisionSummary,
+            policySummary,
+            summary("mutationApplied", false, "reason", "Policy rejected the planner decision."),
+            List.of(),
+            List.of()
+        );
+    }
+
+    public static ReplanningResult waitingForHuman(
+        ReplanningTrigger trigger,
+        Map<String, Object> decisionSummary,
+        Map<String, Object> policySummary,
+        Map<String, Object> planMutationSummary,
+        List<String> blockers
+    ) {
+        return new ReplanningResult(
+            ReplanningStatus.WAITING_FOR_HUMAN,
+            trigger,
+            blockers,
+            decisionSummary,
+            policySummary,
+            planMutationSummary,
+            List.of(),
+            List.of()
+        );
+    }
+
     private static Map<String, Object> summary(String firstKey, Object firstValue, String secondKey, Object secondValue) {
         var summary = new LinkedHashMap<String, Object>();
         summary.put(firstKey, firstValue);
@@ -87,7 +139,14 @@ public record ReplanningResult(
         if (decisionDetails != null) {
             summary.putAll(decisionDetails);
         }
-        return Map.copyOf(summary);
+        return immutableCopy(summary);
+    }
+
+    private static Map<String, Object> immutableCopy(Map<String, Object> values) {
+        if (values == null || values.isEmpty()) {
+            return Map.of();
+        }
+        return Collections.unmodifiableMap(new LinkedHashMap<>(values));
     }
 
     private static List<String> cleanIds(List<String> ids) {

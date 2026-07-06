@@ -4,6 +4,7 @@ import com.probeflow.testagent.agentpolicy.ToolRiskLevel;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Collections;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -152,7 +153,7 @@ public record PlanDecision(
         summary.put("blockers", blockers);
         summary.put("sourceLlmCallId", sourceLlmCallId);
         summary.put("fakeProvider", fakeProvider);
-        return Map.copyOf(summary);
+        return Collections.unmodifiableMap(summary);
     }
 
     private static PlanDecision proposed(
