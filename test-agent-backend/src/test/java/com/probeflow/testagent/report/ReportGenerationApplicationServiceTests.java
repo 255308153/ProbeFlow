@@ -1031,6 +1031,119 @@ class ReportGenerationApplicationServiceTests {
     }
 
     @Test
+    void repeatedGenerationCreatesImmutableEquivalentSnapshotsForIdenticalInputs() {
+        apiSpecs.save(newApiSpec("api-snapshot-stable", HttpMethod.GET, "/api/snapshot/stable"));
+        var task = tasks.save(newTask(
+            "task-snapshot-stable",
+            List.of("api-snapshot-stable"),
+            Map.of("environment", "qa")
+        ));
+        var testCase = testCases.save(newTestCase("case-snapshot-stable", "api-snapshot-stable"));
+        var execution = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            testCase.getCaseId(),
+            "qa",
+            "api-snapshot-stable",
+            OverallStatus.PASSED,
+            12L
+        ));
+        taskCaseExecutions.save(newTaskCaseExecution(task.getTaskId(), testCase.getCaseId(), execution.getExecutionId(), ExecutionMode.SINGLE));
+        entityManager.flush();
+        entityManager.clear();
+
+        var firstResult = reportGeneration.generateTaskReport(ReportGenerationRequest.forTask(task.getTaskId()));
+        var secondResult = reportGeneration.generateTaskReport(ReportGenerationRequest.forTask(task.getTaskId()));
+
+        assertThat(secondResult.reportId()).isNotEqualTo(firstResult.reportId());
+        var first = reports.findById(firstResult.reportId()).orElseThrow();
+        var second = reports.findById(secondResult.reportId()).orElseThrow();
+        assertThat(reports.findAll().stream().filter(report -> task.getTaskId().equals(report.getTaskId())).toList())
+            .hasSize(2);
+        assertThat(first.getCreatedAt()).isNotNull();
+        assertThat(second.getCreatedAt()).isNotNull();
+        assertThat(canonicalReportContent(first)).isEqualTo(canonicalReportContent(second));
+        assertThat((Map<String, Object>) first.getMetadata().get("snapshot"))
+            .containsEntry("immutable", true)
+            .containsEntry("generationMode", "CREATE_NEW")
+            .containsKey("generatedAt")
+            .containsKey("sourceFingerprint");
+        assertThat((Map<String, Object>) first.getMetadata().get("staleness"))
+            .containsEntry("changedInputsDetected", false)
+            .containsEntry("staleAnalysis", false);
+    }
+
+    @Test
+    void regenerationAfterNewExecutionCreatesNewSnapshotAndPreservesOlderReport() {
+        apiSpecs.save(newApiSpec("api-snapshot-pass", HttpMethod.GET, "/api/snapshot/pass"));
+        apiSpecs.save(newApiSpec("api-snapshot-fail", HttpMethod.GET, "/api/snapshot/fail"));
+        var task = tasks.save(newTask(
+            "task-snapshot-regenerate",
+            List.of("api-snapshot-pass", "api-snapshot-fail"),
+            Map.of("environment", "qa")
+        ));
+        var passCase = testCases.save(newTestCase("case-snapshot-pass", "api-snapshot-pass"));
+        var failCase = testCases.save(newTestCase("case-snapshot-fail", "api-snapshot-fail"));
+        var passed = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            passCase.getCaseId(),
+            "qa",
+            "api-snapshot-pass",
+            OverallStatus.PASSED,
+            9L
+        ));
+        taskCaseExecutions.save(newTaskCaseExecution(task.getTaskId(), passCase.getCaseId(), passed.getExecutionId(), ExecutionMode.SINGLE));
+        entityManager.flush();
+        entityManager.clear();
+
+        var oldResult = reportGeneration.generateTaskReport(ReportGenerationRequest.forTask(task.getTaskId()));
+        var oldReport = reports.findById(oldResult.reportId()).orElseThrow();
+        var oldFingerprint = sourceFingerprint(oldReport);
+
+        var failed = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            failCase.getCaseId(),
+            "qa",
+            "api-snapshot-fail",
+            OverallStatus.FAILED,
+            31L,
+            500,
+            Map.of("statusCode", 500),
+            null,
+            List.of()
+        ));
+        taskCaseExecutions.save(newTaskCaseExecution(task.getTaskId(), failCase.getCaseId(), failed.getExecutionId(), ExecutionMode.BATCH));
+        entityManager.flush();
+        entityManager.clear();
+
+        var newResult = reportGeneration.generateTaskReport(ReportGenerationRequest.forTask(task.getTaskId()));
+
+        var preservedOldReport = reports.findById(oldResult.reportId()).orElseThrow();
+        var newReport = reports.findById(newResult.reportId()).orElseThrow();
+        assertThat(newReport.getReportId()).isNotEqualTo(preservedOldReport.getReportId());
+        assertThat(reports.findAll().stream().filter(report -> task.getTaskId().equals(report.getTaskId())).toList())
+            .hasSize(2);
+        assertThat(preservedOldReport.getPassCount()).isEqualTo(1);
+        assertThat(preservedOldReport.getFailCount()).isZero();
+        assertThat((Map<String, Object>) preservedOldReport.getMetadata().get("executionSummary"))
+            .containsEntry("executionCount", 1)
+            .containsEntry("failed", 0);
+        assertThat((List<String>) preservedOldReport.getMetadata().get("executionIds"))
+            .containsExactly(passed.getExecutionId());
+
+        assertThat(newReport.getPassCount()).isEqualTo(1);
+        assertThat(newReport.getFailCount()).isEqualTo(1);
+        assertThat((Map<String, Object>) newReport.getMetadata().get("executionSummary"))
+            .containsEntry("executionCount", 2)
+            .containsEntry("failed", 1);
+        assertThat((List<String>) newReport.getMetadata().get("executionIds"))
+            .containsExactly(passed.getExecutionId(), failed.getExecutionId());
+        assertThat(sourceFingerprint(newReport)).isNotEqualTo(oldFingerprint);
+        assertThat((Map<String, Object>) newReport.getMetadata().get("snapshot"))
+            .containsEntry("immutable", true)
+            .containsEntry("generationMode", "CREATE_NEW");
+    }
+
+    @Test
     void missingTaskIsRejectedClearly() {
         assertThatThrownBy(() -> reportGeneration.generateTaskReport(ReportGenerationRequest.forTask("missing-task")))
             .isInstanceOf(IllegalArgumentException.class)
@@ -1195,6 +1308,31 @@ class ReportGenerationApplicationServiceTests {
             step.put("statusCode", statusCode);
         }
         return step;
+    }
+
+    private Map<String, Object> canonicalReportContent(Report report) {
+        var content = new java.util.LinkedHashMap<String, Object>();
+        content.put("summary", report.getSummary());
+        content.put("caseCount", report.getCaseCount());
+        content.put("passCount", report.getPassCount());
+        content.put("failCount", report.getFailCount());
+        content.put("warningCount", report.getWarningCount());
+        content.put("riskSummary", report.getRiskSummary());
+        content.put("findings", report.getFindings());
+        content.put("suggestions", report.getSuggestions());
+        content.put("executionSummary", report.getMetadata().get("executionSummary"));
+        content.put("coverage", report.getMetadata().get("coverage"));
+        content.put("executionModes", report.getMetadata().get("executionModes"));
+        content.put("suiteCoverage", report.getMetadata().get("suiteCoverage"));
+        content.put("sourceState", report.getMetadata().get("sourceState"));
+        content.put("sourceFingerprint", sourceFingerprint(report));
+        return content;
+    }
+
+    private String sourceFingerprint(Report report) {
+        @SuppressWarnings("unchecked")
+        var sourceState = (Map<String, Object>) report.getMetadata().get("sourceState");
+        return (String) sourceState.get("fingerprint");
     }
 
     private Observation newObservation(

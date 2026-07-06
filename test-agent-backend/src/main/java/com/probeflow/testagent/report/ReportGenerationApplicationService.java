@@ -22,12 +22,17 @@ import com.probeflow.testagent.taskcaseexecution.TaskCaseExecution;
 import com.probeflow.testagent.taskcaseexecution.TaskCaseExecutionRepository;
 import com.probeflow.testagent.testcase.TestCase;
 import com.probeflow.testagent.testcase.TestCaseRepository;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -80,6 +85,7 @@ public class ReportGenerationApplicationService {
         var executionSummary = executionSummary(task, caseIds, taskExecutions, records);
         var analysisCoverage = ensureBasicAnalysis(records);
         var state = reportState(caseIds.size(), records.size());
+        var generatedAt = Instant.now();
 
         var report = new Report();
         report.setTaskId(task.getTaskId());
@@ -92,7 +98,7 @@ public class ReportGenerationApplicationService {
         var findings = findings(task, state, caseIds, records, executionSummary);
         report.setFindings(findings);
         report.setSuggestions(suggestions(findings));
-        report.setMetadata(metadata(task, caseIds, taskExecutions, records, state, executionSummary, analysisCoverage));
+        report.setMetadata(metadata(task, caseIds, taskExecutions, records, state, executionSummary, analysisCoverage, generatedAt));
 
         var saved = reports.save(report);
         return new ReportGenerationResult(
@@ -910,26 +916,125 @@ public class ReportGenerationApplicationService {
         List<ExecutionRecord> records,
         String state,
         ExecutionSummary executionSummary,
-        AnalysisCoverage analysisCoverage
+        AnalysisCoverage analysisCoverage,
+        Instant generatedAt
     ) {
+        var sourceState = sourceState(task, caseIds, taskExecutions, records);
         var metadata = new LinkedHashMap<String, Object>();
         metadata.put("schemaVersion", "phase8.v1");
         metadata.put("reportType", "TASK_REPORT");
         metadata.put("state", state);
         metadata.put("scope", "HTTP_API_TESTING");
+        metadata.put("generatedAt", generatedAt.toString());
+        metadata.put("snapshot", snapshotMetadata(generatedAt, sourceState));
         metadata.put("environment", environment(task, records));
         metadata.put("environments", environments(task, records));
         metadata.put("caseIds", caseIds);
         metadata.put("executionIds", records.stream().map(ExecutionRecord::getExecutionId).toList());
         metadata.put("taskCaseExecutionCount", taskExecutions.size());
+        metadata.put("sourceState", sourceState);
         metadata.put("executionSummary", executionSummary.toMetadata());
         metadata.put("coverage", coverageMetadata(task, records));
         metadata.put("executionModes", executionModeCounts(taskExecutions));
         metadata.put("suiteCoverage", suiteCoverage(records));
         metadata.put("analysisCoverage", analysisCoverage.toMetadata());
+        metadata.put("staleness", stalenessMetadata(sourceState, analysisCoverage));
         metadata.put("memoryFeedback", memoryFeedback(task, records, analysisCoverage));
         metadata.put("task", taskMetadata(task));
         return metadata;
+    }
+
+    private Map<String, Object> snapshotMetadata(Instant generatedAt, Map<String, Object> sourceState) {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("immutable", true);
+        metadata.put("generationMode", "CREATE_NEW");
+        metadata.put("generatedAt", generatedAt.toString());
+        metadata.put("sourceFingerprint", sourceState.get("fingerprint"));
+        return metadata;
+    }
+
+    private Map<String, Object> stalenessMetadata(Map<String, Object> sourceState, AnalysisCoverage analysisCoverage) {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("sourceFingerprint", sourceState.get("fingerprint"));
+        metadata.put("analysisComplete", analysisCoverage.missingAnalysisExecutionIds().isEmpty());
+        metadata.put("staleAnalysis", !analysisCoverage.missingAnalysisExecutionIds().isEmpty());
+        metadata.put("changedInputsDetected", false);
+        metadata.put("reason", "Report is an immutable snapshot; compare sourceFingerprint with a newer report to detect changed inputs.");
+        return metadata;
+    }
+
+    private Map<String, Object> sourceState(
+        Task task,
+        List<String> caseIds,
+        List<TaskCaseExecution> taskExecutions,
+        List<ExecutionRecord> records
+    ) {
+        var state = new LinkedHashMap<String, Object>();
+        state.put("taskId", task.getTaskId());
+        state.put("taskUpdatedAt", task.getUpdatedAt() == null ? null : task.getUpdatedAt().toString());
+        state.put("caseIds", caseIds);
+        state.put("taskCaseExecutionIds", taskExecutions.stream()
+            .map(TaskCaseExecution::getId)
+            .sorted()
+            .toList());
+        state.put("executionCount", records.size());
+        state.put("executionIds", records.stream().map(ExecutionRecord::getExecutionId).toList());
+        state.put("latestExecutionCreatedAt", records.stream()
+            .map(ExecutionRecord::getCreatedAt)
+            .filter(value -> value != null)
+            .max(Comparator.naturalOrder())
+            .map(Instant::toString)
+            .orElse(null));
+        state.put("executions", records.stream().map(this::executionSourceState).toList());
+        state.put("basicObservationIds", records.stream()
+            .flatMap(record -> observations.findAllByExecutionIdAndAnalysisLevelOrderByCreatedAtAscObservationIdAsc(
+                record.getExecutionId(),
+                AnalysisLevel.BASIC
+            ).stream())
+            .map(Observation::getObservationId)
+            .sorted()
+            .toList());
+        state.put("fingerprint", fingerprint(state));
+        return state;
+    }
+
+    private Map<String, Object> executionSourceState(ExecutionRecord record) {
+        var state = new LinkedHashMap<String, Object>();
+        state.put("executionId", record.getExecutionId());
+        state.put("caseId", record.getCaseId());
+        state.put("overallStatus", record.getOverallStatus().name());
+        state.put("statusCode", record.getStatusCode());
+        state.put("durationMs", record.getDurationMs());
+        state.put("environment", record.getEnvironment());
+        state.put("apiSpecIds", apiSpecIds(record));
+        state.put("createdAt", record.getCreatedAt() == null ? null : record.getCreatedAt().toString());
+        return state;
+    }
+
+    private String fingerprint(Map<String, Object> state) {
+        try {
+            var digest = MessageDigest.getInstance("SHA-256");
+            var bytes = digest.digest(stableString(state).getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(bytes);
+        } catch (java.security.NoSuchAlgorithmException exception) {
+            throw new IllegalStateException("SHA-256 digest is unavailable", exception);
+        }
+    }
+
+    private String stableString(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            var sorted = new TreeMap<String, Object>();
+            map.forEach((key, nestedValue) -> sorted.put(String.valueOf(key), nestedValue));
+            var builder = new StringBuilder("{");
+            sorted.forEach((key, nestedValue) -> builder.append(key).append(":").append(stableString(nestedValue)).append(";"));
+            return builder.append("}").toString();
+        }
+        if (value instanceof List<?> list) {
+            var builder = new StringBuilder("[");
+            list.forEach(item -> builder.append(stableString(item)).append(";"));
+            return builder.append("]").toString();
+        }
+        return String.valueOf(value);
     }
 
     private Map<String, Object> memoryFeedback(
