@@ -11,10 +11,15 @@ import com.probeflow.testagent.controlledplanner.PlannerInputRequest;
 import com.probeflow.testagent.controlledplanner.PlannerTaskState;
 import com.probeflow.testagent.controlledplanner.ProposedPlanStep;
 import com.probeflow.testagent.controlledplanner.RequiredHumanInput;
+import com.probeflow.testagent.humanintheloop.HumanInTheLoopApplicationService;
+import com.probeflow.testagent.humanintheloop.HumanRequestType;
+import com.probeflow.testagent.humanintheloop.HumanReviewRequestCreateRequest;
+import com.probeflow.testagent.humanintheloop.HumanReviewRequestCreationResult;
 import com.probeflow.testagent.orchestration.ManualReviewGate;
 import com.probeflow.testagent.orchestration.ManualReviewGateResult;
 import com.probeflow.testagent.policyvalidator.PolicyValidationRequest;
 import com.probeflow.testagent.policyvalidator.PolicyValidationResult;
+import com.probeflow.testagent.policyvalidator.PolicyValidationReasonCode;
 import com.probeflow.testagent.policyvalidator.PolicyValidatorService;
 import com.probeflow.testagent.task.PlanStep;
 import com.probeflow.testagent.task.PlanStepRepository;
@@ -47,6 +52,7 @@ public class ReplanningApplicationService {
     private final ControlledPlannerService controlledPlanner;
     private final PolicyValidatorService policyValidator;
     private final ManualReviewGate manualReviewGate;
+    private final HumanInTheLoopApplicationService humanInTheLoop;
 
     private record AttemptScope(
         String attemptKey,
@@ -75,7 +81,8 @@ public class ReplanningApplicationService {
         PlannerInputFactory plannerInputFactory,
         ControlledPlannerService controlledPlanner,
         PolicyValidatorService policyValidator,
-        ManualReviewGate manualReviewGate
+        ManualReviewGate manualReviewGate,
+        HumanInTheLoopApplicationService humanInTheLoop
     ) {
         this.tasks = tasks;
         this.planSteps = planSteps;
@@ -83,6 +90,7 @@ public class ReplanningApplicationService {
         this.controlledPlanner = controlledPlanner;
         this.policyValidator = policyValidator;
         this.manualReviewGate = manualReviewGate;
+        this.humanInTheLoop = humanInTheLoop;
     }
 
     @Transactional
@@ -607,11 +615,15 @@ public class ReplanningApplicationService {
 
         var reviewGate = manualReviewGate.evaluate(task);
         if (!reviewGate.ready()) {
+            var humanRequest = createDraftReviewRequest(request, task, reviewGate);
             return ReplanningResult.waitingForHuman(
                 request.trigger(),
                 reviewCompletedDecisionSummary("Manual review gate is still waiting for review completion."),
                 reviewCompletedPolicySummary(),
-                reviewCompletedMutationSummary(false, task.getStatus(), task.getStatus(), true, reviewGate),
+                merge(
+                    reviewCompletedMutationSummary(false, task.getStatus(), task.getStatus(), true, reviewGate),
+                    humanRequestSummary(humanRequest)
+                ),
                 reviewGate.blockerDetails()
             );
         }
@@ -911,6 +923,7 @@ public class ReplanningApplicationService {
             : new LinkedHashMap<>(task.getMetadata());
         var resumeStatus = task.getStatus();
         var requiredHumanInput = humanInputSummary(decision.requiredHumanInput(), validation);
+        var humanRequest = createReplanningHumanRequest(request, decision, validation, plannerInput, requiredHumanInput);
         metadata.put("requiredHumanInput", requiredHumanInput);
         metadata.put("lastReplanning", Map.of(
             "trigger", request.trigger().name(),
@@ -932,6 +945,7 @@ public class ReplanningApplicationService {
         mutationSummary.put("taskStatus", TaskStatus.WAITING_FOR_REVIEW.name());
         mutationSummary.put("requiredHumanInput", requiredHumanInput);
         mutationSummary.put("reason", "Task paused for human confirmation; no PlanStep was inserted, deleted or reordered.");
+        mutationSummary.putAll(humanRequestSummary(humanRequest));
         mutationSummary.putAll(attempt.auditSummary());
 
         var blockers = validation.blockers().isEmpty()
@@ -946,6 +960,169 @@ public class ReplanningApplicationService {
         );
         recordCompletedAttempt(request.taskId(), attempt, result, PlannerAction.WAIT_FOR_HUMAN.name());
         return result;
+    }
+
+    private HumanReviewRequestCreationResult createReplanningHumanRequest(
+        ReplanningRequest request,
+        PlanDecision decision,
+        PolicyValidationResult validation,
+        PlannerInput plannerInput,
+        Map<String, Object> requiredHumanInput
+    ) {
+        var requestType = humanRequestType(request, validation);
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("sourceTrigger", request.trigger().name());
+        metadata.put("sourceStepId", request.sourceStepId());
+        metadata.put("requestType", requestType.name());
+        metadata.put("plannerAction", decision.action().name());
+        metadata.put("decisionId", decision.decisionId());
+        metadata.put("policyReason", validation.reasonCode().name());
+        metadata.put("blockers", blockerSummary(request, validation));
+        metadata.put("question", requiredHumanInput.get("question"));
+        metadata.put("plannerInputTraceId", plannerInput.planningTraceId());
+        metadata.entrySet().removeIf(entry -> entry.getValue() == null);
+
+        var idempotencyKey = humanRequestIdempotencyKey(
+            request.taskId(),
+            requestType,
+            request.trigger().name(),
+            request.sourceStepId(),
+            blockerSummary(request, validation)
+        );
+        return humanInTheLoop.createOrReusePendingRequest(new HumanReviewRequestCreateRequest(
+            request.taskId(),
+            request.sourceStepId(),
+            requestType,
+            waitingReason(requiredHumanInput, validation),
+            requiredInputSchema(requiredHumanInput),
+            decision.riskLevel(),
+            request.trigger().name(),
+            decision.decisionId(),
+            validation.reasonCode().name(),
+            metadata,
+            null
+        ), idempotencyKey);
+    }
+
+    private HumanReviewRequestCreationResult createDraftReviewRequest(
+        ReplanningRequest request,
+        Task task,
+        ManualReviewGateResult reviewGate
+    ) {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("sourceTrigger", request.trigger().name());
+        metadata.put("sourceStepId", request.sourceStepId());
+        metadata.put("requestType", HumanRequestType.DRAFT_REVIEW.name());
+        metadata.put("pendingDraftIds", reviewGate.pendingDraftIds());
+        metadata.put("promotedCaseIds", reviewGate.promotedCaseIds());
+        metadata.put("discardedDraftIds", reviewGate.discardedDraftIds());
+
+        var idempotencyKey = humanRequestIdempotencyKey(
+            task.getTaskId(),
+            HumanRequestType.DRAFT_REVIEW,
+            request.trigger().name(),
+            request.sourceStepId(),
+            reviewGate.pendingDraftIds()
+        );
+        return humanInTheLoop.createOrReusePendingRequest(new HumanReviewRequestCreateRequest(
+            task.getTaskId(),
+            request.sourceStepId(),
+            HumanRequestType.DRAFT_REVIEW,
+            reviewGate.blockerDetails().isEmpty()
+                ? "Waiting for manual review of generated drafts."
+                : String.join("; ", reviewGate.blockerDetails()),
+            List.of(
+                Map.of("name", "reviewDecision", "type", "string", "required", true),
+                Map.of("name", "draftIds", "type", "array", "required", true)
+            ),
+            com.probeflow.testagent.agentpolicy.ToolRiskLevel.LOW,
+            request.trigger().name(),
+            null,
+            "MANUAL_REVIEW_PENDING",
+            metadata,
+            null
+        ), idempotencyKey);
+    }
+
+    private HumanRequestType humanRequestType(ReplanningRequest request, PolicyValidationResult validation) {
+        if (validation.reasonCode() == PolicyValidationReasonCode.HIGH_RISK_REQUIRES_CONFIRMATION
+            || validation.reasonCode() == PolicyValidationReasonCode.HUMAN_CONFIRMATION_REQUIRED) {
+            return HumanRequestType.HIGH_RISK_APPROVAL;
+        }
+        if (request.trigger() == ReplanningTrigger.CONTEXT_MISSING) {
+            return HumanRequestType.BLOCKER_RESOLUTION;
+        }
+        if (request.trigger() == ReplanningTrigger.EXECUTION_READINESS_MISSING) {
+            return HumanRequestType.MISSING_INPUT;
+        }
+        return HumanRequestType.PLANNER_CLARIFICATION;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> requiredInputSchema(Map<String, Object> requiredHumanInput) {
+        var schema = requiredHumanInput.get("inputSchema");
+        if (!(schema instanceof List<?> values)) {
+            return List.of();
+        }
+        return values.stream()
+            .filter(Map.class::isInstance)
+            .map(value -> new LinkedHashMap<>((Map<String, Object>) value))
+            .map(Map::copyOf)
+            .toList();
+    }
+
+    private String waitingReason(Map<String, Object> requiredHumanInput, PolicyValidationResult validation) {
+        var reason = stringValue(requiredHumanInput.get("reason"));
+        var question = stringValue(requiredHumanInput.get("question"));
+        if (!reason.isBlank() && !question.isBlank()) {
+            return reason + " - " + question;
+        }
+        if (!reason.isBlank()) {
+            return reason;
+        }
+        if (!question.isBlank()) {
+            return question;
+        }
+        return validation.message();
+    }
+
+    private List<String> blockerSummary(ReplanningRequest request, PolicyValidationResult validation) {
+        if (request.stepOutcome() != null && !request.stepOutcome().blockerDetails().isEmpty()) {
+            return request.stepOutcome().blockerDetails();
+        }
+        if (!validation.blockers().isEmpty()) {
+            return validation.blockers();
+        }
+        return List.of(validation.message());
+    }
+
+    private String humanRequestIdempotencyKey(
+        String taskId,
+        HumanRequestType requestType,
+        String trigger,
+        String sourceStepId,
+        List<String> blockers
+    ) {
+        return taskId
+            + "|" + requestType.name()
+            + "|" + trigger
+            + "|" + (sourceStepId == null ? "" : sourceStepId)
+            + "|" + String.join(";", blockers == null ? List.of() : blockers);
+    }
+
+    private Map<String, Object> humanRequestSummary(HumanReviewRequestCreationResult result) {
+        if (result == null || result.request() == null) {
+            return Map.of("humanReviewRequestCreated", false);
+        }
+        return Map.of(
+            "humanReviewRequestCreated", result.status().name(),
+            "humanReviewRequestId", result.request().getRequestId(),
+            "humanReviewRequestType", result.request().getRequestType().name()
+        );
+    }
+
+    private String stringValue(Object value) {
+        return value == null ? "" : value.toString();
     }
 
     private Map<String, Object> decisionAuditSummary(PlanDecision decision, PlannerInput plannerInput) {

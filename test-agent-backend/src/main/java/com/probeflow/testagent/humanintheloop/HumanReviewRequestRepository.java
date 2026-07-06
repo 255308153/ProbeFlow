@@ -12,4 +12,10 @@ public interface HumanReviewRequestRepository extends JpaRepository<HumanReviewR
     List<HumanReviewRequest> findByRequestTypeOrderByCreatedAtAsc(HumanRequestType requestType);
 
     List<HumanReviewRequest> findByTaskIdAndStatusOrderByCreatedAtAsc(String taskId, HumanRequestStatus status);
+
+    List<HumanReviewRequest> findByTaskIdAndRequestTypeAndStatusOrderByCreatedAtAsc(
+        String taskId,
+        HumanRequestType requestType,
+        HumanRequestStatus status
+    );
 }
