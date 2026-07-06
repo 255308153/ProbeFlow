@@ -7,6 +7,8 @@ import java.util.List;
 public record StepOutcome(
     PlanStepStatus stepStatus,
     TaskStatus taskStatus,
+    String summary,
+    List<String> resultRefs,
     String resultRef,
     List<String> blockerDetails,
     boolean stopOrchestration
@@ -19,23 +21,57 @@ public record StepOutcome(
         if (stepStatus == PlanStepStatus.PENDING || stepStatus == PlanStepStatus.RUNNING) {
             throw new IllegalArgumentException("Step outcome must be terminal: " + stepStatus);
         }
+        summary = summary == null ? "" : summary;
+        resultRefs = resultRefs == null ? List.of() : List.copyOf(resultRefs);
         blockerDetails = blockerDetails == null ? List.of() : List.copyOf(blockerDetails);
     }
 
     public static StepOutcome succeeded() {
-        return new StepOutcome(PlanStepStatus.SUCCESS, null, null, List.of(), false);
+        return succeeded("", List.of());
+    }
+
+    public static StepOutcome succeeded(String summary, List<String> resultRefs) {
+        return new StepOutcome(PlanStepStatus.SUCCESS, null, summary, resultRefs, null, List.of(), false);
+    }
+
+    public static StepOutcome completed(String summary, List<String> resultRefs) {
+        return new StepOutcome(PlanStepStatus.SUCCESS, TaskStatus.COMPLETED, summary, resultRefs, null, List.of(), false);
     }
 
     public static StepOutcome failed(String blockerDetail) {
-        return new StepOutcome(PlanStepStatus.FAILED, TaskStatus.FAILED, null, blockerList(blockerDetail), true);
+        return new StepOutcome(
+            PlanStepStatus.FAILED,
+            TaskStatus.FAILED,
+            blockerDetail == null ? "" : blockerDetail,
+            List.of(),
+            null,
+            blockerList(blockerDetail),
+            true
+        );
     }
 
     public static StepOutcome skipped(String blockerDetail) {
-        return new StepOutcome(PlanStepStatus.SKIPPED, null, null, blockerList(blockerDetail), false);
+        return new StepOutcome(
+            PlanStepStatus.SKIPPED,
+            null,
+            blockerDetail == null ? "" : blockerDetail,
+            List.of(),
+            null,
+            blockerList(blockerDetail),
+            false
+        );
     }
 
     public static StepOutcome paused(TaskStatus taskStatus, String blockerDetail) {
-        return new StepOutcome(PlanStepStatus.SUCCESS, taskStatus, null, blockerList(blockerDetail), true);
+        return new StepOutcome(
+            PlanStepStatus.SUCCESS,
+            taskStatus,
+            blockerDetail == null ? "" : blockerDetail,
+            List.of(),
+            null,
+            blockerList(blockerDetail),
+            true
+        );
     }
 
     private static List<String> blockerList(String blockerDetail) {
