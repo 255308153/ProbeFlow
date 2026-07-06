@@ -9,11 +9,20 @@ import com.probeflow.testagent.task.TaskPriority;
 import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.task.TaskSourceType;
 import com.probeflow.testagent.task.TaskStatus;
+import com.probeflow.testagent.task.TaskType;
+import com.probeflow.testagent.taskcaseexecution.ExecutionMode;
+import com.probeflow.testagent.taskcaseexecution.TaskCaseExecution;
+import com.probeflow.testagent.taskcaseexecution.TaskCaseExecutionRepository;
+import com.probeflow.testagent.taskcaseexecution.TaskCaseExecutionStatus;
+import com.probeflow.testagent.testcase.StaleStatus;
+import com.probeflow.testagent.testcase.TestCase;
+import com.probeflow.testagent.testcase.TestCaseRepository;
 import com.probeflow.testagent.testcasedraft.PromotionMode;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -24,15 +33,21 @@ public class TaskInitializationService {
     private final TaskRepository tasks;
     private final PlanStepRepository planSteps;
     private final TaskTemplateRegistry taskTemplateRegistry;
+    private final TestCaseRepository testCases;
+    private final TaskCaseExecutionRepository taskCaseExecutions;
 
     public TaskInitializationService(
         TaskRepository tasks,
         PlanStepRepository planSteps,
-        TaskTemplateRegistry taskTemplateRegistry
+        TaskTemplateRegistry taskTemplateRegistry,
+        TestCaseRepository testCases,
+        TaskCaseExecutionRepository taskCaseExecutions
     ) {
         this.tasks = tasks;
         this.planSteps = planSteps;
         this.taskTemplateRegistry = taskTemplateRegistry;
+        this.testCases = testCases;
+        this.taskCaseExecutions = taskCaseExecutions;
     }
 
     @Transactional
@@ -58,9 +73,13 @@ public class TaskInitializationService {
         task.setMemoryRefinementStatus(MemoryRefinementStatus.NOT_REQUIRED);
         task.setPriority(priority(request));
         task.setCreator(trimToNull(request.creator()));
-        task.setMetadata(initialMetadata(request, template));
+        var regressionCaseSelection = regressionCaseSelection(request);
+        var metadata = initialMetadata(request, template);
+        enrichRegressionMetadata(metadata, regressionCaseSelection);
+        task.setMetadata(metadata);
 
         var savedTask = tasks.save(task);
+        prepareRegressionCaseExecutions(savedTask.getTaskId(), regressionCaseSelection);
         var savedSteps = createPlanSteps(savedTask.getTaskId(), template);
         return result(savedTask, template, savedSteps, true);
     }
@@ -129,6 +148,103 @@ public class TaskInitializationService {
         return metadata;
     }
 
+    private RegressionCaseSelection regressionCaseSelection(TaskInitializationRequest request) {
+        var selectedCaseIds = normalizeList(request.selectedCaseIds());
+        if (request.taskType() != TaskType.REGRESSION || selectedCaseIds.isEmpty()) {
+            return RegressionCaseSelection.empty();
+        }
+        var casesById = new LinkedHashMap<String, TestCase>();
+        testCases.findAllById(selectedCaseIds)
+            .forEach(testCase -> casesById.put(testCase.getCaseId(), testCase));
+        var selectedCases = selectedCaseIds.stream()
+            .map(casesById::get)
+            .filter(Objects::nonNull)
+            .toList();
+        var missingCaseIds = selectedCaseIds.stream()
+            .filter(caseId -> !casesById.containsKey(caseId))
+            .toList();
+        var staleCases = selectedCases.stream()
+            .filter(testCase -> testCase.getStaleStatus() == StaleStatus.STALE)
+            .toList();
+        return new RegressionCaseSelection(selectedCases, missingCaseIds, staleCases);
+    }
+
+    private void enrichRegressionMetadata(Map<String, Object> metadata, RegressionCaseSelection selection) {
+        if (selection.isEmpty()) {
+            return;
+        }
+        metadata.put("regressionCaseCount", selection.selectedCases().size());
+        if (!selection.missingCaseIds().isEmpty()) {
+            metadata.put("missingCaseIds", selection.missingCaseIds());
+            metadata.put("missingCaseCount", selection.missingCaseIds().size());
+        }
+        if (!selection.staleCases().isEmpty()) {
+            metadata.put("staleCaseIds", selection.staleCases().stream()
+                .map(TestCase::getCaseId)
+                .toList());
+            metadata.put("staleCaseCount", selection.staleCases().size());
+            metadata.put("staleCaseDetails", selection.staleCases().stream()
+                .map(this::staleCaseDetail)
+                .toList());
+        }
+    }
+
+    private Map<String, Object> staleCaseDetail(TestCase testCase) {
+        var detail = new LinkedHashMap<String, Object>();
+        detail.put("caseId", testCase.getCaseId());
+        detail.put("title", testCase.getTitle());
+        detail.put("primaryApiSpecId", testCase.getPrimaryApiSpecId());
+        detail.put("staleStatus", enumName(testCase.getStaleStatus()));
+        return detail;
+    }
+
+    private void prepareRegressionCaseExecutions(String taskId, RegressionCaseSelection selection) {
+        for (var testCase : selection.selectedCases()) {
+            if (taskCaseExecutions.findFirstByTaskIdAndCaseId(taskId, testCase.getCaseId()).isPresent()) {
+                continue;
+            }
+            var execution = new TaskCaseExecution();
+            execution.setTaskId(taskId);
+            execution.setCaseId(testCase.getCaseId());
+            execution.setExecutionMode(ExecutionMode.BATCH);
+            execution.setExecutionStatus(TaskCaseExecutionStatus.PENDING);
+            execution.setSnapshotJson(caseSnapshot(testCase));
+            taskCaseExecutions.save(execution);
+        }
+    }
+
+    private Map<String, Object> caseSnapshot(TestCase testCase) {
+        var snapshot = new LinkedHashMap<String, Object>();
+        snapshot.put("caseId", testCase.getCaseId());
+        snapshot.put("title", testCase.getTitle());
+        snapshot.put("primaryApiSpecId", testCase.getPrimaryApiSpecId());
+        snapshot.put("caseCategory", enumName(testCase.getCaseCategory()));
+        snapshot.put("mode", enumName(testCase.getMode()));
+        snapshot.put("priority", enumName(testCase.getPriority()));
+        snapshot.put("riskLevel", enumName(testCase.getRiskLevel()));
+        snapshot.put("status", enumName(testCase.getStatus()));
+        snapshot.put("source", enumName(testCase.getSource()));
+        snapshot.put("detailType", enumName(testCase.getDetailType()));
+        snapshot.put("detail", copyMap(testCase.getDetail()));
+        snapshot.put("steps", copyList(testCase.getSteps()));
+        snapshot.put("tags", copyList(testCase.getTags()));
+        snapshot.put("staleStatus", enumName(testCase.getStaleStatus()));
+        snapshot.put("basedOnApiSpecVersions", copyMap(testCase.getBasedOnApiSpecVersions()));
+        return snapshot;
+    }
+
+    private String enumName(Enum<?> value) {
+        return value == null ? null : value.name();
+    }
+
+    private Map<String, Object> copyMap(Map<String, Object> values) {
+        return values == null ? Map.of() : new LinkedHashMap<>(values);
+    }
+
+    private List<?> copyList(List<?> values) {
+        return values == null ? List.of() : List.copyOf(values);
+    }
+
     private void validate(TaskInitializationRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("Task initialization request is required");
@@ -169,5 +285,19 @@ public class TaskInitializationService {
 
     private String trimToNull(String value) {
         return StringUtils.hasText(value) ? value.trim() : null;
+    }
+
+    private record RegressionCaseSelection(
+        List<TestCase> selectedCases,
+        List<String> missingCaseIds,
+        List<TestCase> staleCases
+    ) {
+        private static RegressionCaseSelection empty() {
+            return new RegressionCaseSelection(List.of(), List.of(), List.of());
+        }
+
+        private boolean isEmpty() {
+            return selectedCases.isEmpty() && missingCaseIds.isEmpty() && staleCases.isEmpty();
+        }
     }
 }
