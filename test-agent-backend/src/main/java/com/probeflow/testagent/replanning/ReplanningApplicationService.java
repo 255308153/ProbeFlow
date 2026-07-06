@@ -34,12 +34,40 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class ReplanningApplicationService {
 
+    private static final int MAX_TASK_REPLANNING_ATTEMPTS = 5;
+    private static final int MAX_TRIGGER_REPLANNING_ATTEMPTS = 2;
+    private static final int MAX_SOURCE_STEP_RETRY_COUNT = 3;
+    private static final String ATTEMPT_COUNT_KEY = "replanningAttemptCount";
+    private static final String TRIGGER_ATTEMPTS_KEY = "replanningTriggerAttempts";
+    private static final String ATTEMPT_RECORDS_KEY = "replanningAttemptRecords";
+
     private final TaskRepository tasks;
     private final PlanStepRepository planSteps;
     private final PlannerInputFactory plannerInputFactory;
     private final ControlledPlannerService controlledPlanner;
     private final PolicyValidatorService policyValidator;
     private final ManualReviewGate manualReviewGate;
+
+    private record AttemptScope(
+        String attemptKey,
+        String triggerAttemptKey,
+        int totalAttemptCount,
+        int triggerAttemptCount
+    ) {
+
+        Map<String, Object> auditSummary() {
+            return Map.of(
+                "attemptKey", attemptKey,
+                "attemptCount", totalAttemptCount,
+                "triggerAttemptCount", triggerAttemptCount,
+                "maxTaskAttempts", MAX_TASK_REPLANNING_ATTEMPTS,
+                "maxTriggerAttempts", MAX_TRIGGER_REPLANNING_ATTEMPTS
+            );
+        }
+    }
+
+    private record AttemptPreparation(AttemptScope attempt, ReplanningResult result) {
+    }
 
     public ReplanningApplicationService(
         TaskRepository tasks,
@@ -75,6 +103,12 @@ public class ReplanningApplicationService {
         if (request.trigger() == ReplanningTrigger.REVIEW_COMPLETED) {
             return applyReviewCompleted(request, task.get());
         }
+        var orderedSteps = planSteps.findByTaskIdOrderByStepOrderAsc(task.get().getTaskId());
+        var sourceStep = sourceStep(request, orderedSteps);
+        var terminalGuard = terminalGuard(request, task.get(), sourceStep);
+        if (terminalGuard != null) {
+            return terminalGuard;
+        }
         var plannerInput = buildPlannerInput(request);
         var decision = controlledPlanner.plan(plannerInput);
         var validation = policyValidator.validate(new PolicyValidationRequest(
@@ -92,21 +126,28 @@ public class ReplanningApplicationService {
                 validation.blockers()
             );
         }
+        var attemptPreparation = prepareAttempt(request, task.get(), sourceStep, decision, plannerInput, validation);
+        if (attemptPreparation.result() != null) {
+            return attemptPreparation.result();
+        }
+        var attempt = attemptPreparation.attempt();
         if (validation.requiresHumanConfirmation()) {
-            return pauseForHuman(request, decision, validation, plannerInput);
+            return pauseForHuman(request, decision, validation, plannerInput, attempt);
         }
         if (decision.action() == PlannerAction.INSERT_STEP) {
-            return applyInsertStep(request, decision, validation, plannerInput);
+            return applyInsertStep(request, decision, validation, plannerInput, attempt);
         }
         if (decision.action() == PlannerAction.REPLAN) {
-            return applyReplan(request, decision, validation, plannerInput);
+            return applyReplan(request, decision, validation, plannerInput, attempt);
         }
-        return ReplanningResult.noop(
+        var result = ReplanningResult.noop(
             request.trigger(),
             "Policy allowed the planner decision and the deterministic template plan remains unchanged.",
-            decisionAuditSummary(decision, plannerInput),
+            merge(decisionAuditSummary(decision, plannerInput), attempt.auditSummary()),
             validation.auditSummary()
         );
+        recordCompletedAttempt(request.taskId(), attempt, result, decision.action().name());
+        return result;
     }
 
     PlannerInput buildPlannerInput(ReplanningRequest request) {
@@ -137,6 +178,302 @@ public class ReplanningApplicationService {
             request.contextSummary(),
             constraints
         ));
+    }
+
+    private ReplanningResult terminalGuard(ReplanningRequest request, Task task, PlanStep sourceStep) {
+        if (task.getStatus() == TaskStatus.FAILED && !explicitRecoveryTrigger(request.trigger())) {
+            return ReplanningResult.notTriggerable(
+                request.trigger(),
+                List.of("Failed task requires an explicit recovery trigger before replanning.")
+            );
+        }
+        var retryCount = retryCount(sourceStep);
+        if (retryCount >= MAX_SOURCE_STEP_RETRY_COUNT) {
+            var mutationSummary = new LinkedHashMap<String, Object>();
+            mutationSummary.put("mutationApplied", false);
+            mutationSummary.put("reason", "Source step retry count reached the replanning retry limit.");
+            mutationSummary.put("sourceStepId", sourceStep.getStepId());
+            mutationSummary.put("retryCount", retryCount);
+            mutationSummary.put("maxRetryCount", MAX_SOURCE_STEP_RETRY_COUNT);
+            return new ReplanningResult(
+                ReplanningStatus.NOT_TRIGGERABLE,
+                request.trigger(),
+                List.of("Source step retry count reached limit: " + retryCount),
+                Map.of("plannerCalled", false, "reason", "Retry guard stopped replanning before planner execution."),
+                Map.of("policyValidated", false, "reason", "Policy validation was not reached."),
+                mutationSummary,
+                List.of(),
+                List.of()
+            );
+        }
+        return null;
+    }
+
+    private boolean explicitRecoveryTrigger(ReplanningTrigger trigger) {
+        return trigger == ReplanningTrigger.PLAN_STEP_FAILED
+            || trigger == ReplanningTrigger.FAILURE_ANALYSIS_HIGH_RISK
+            || trigger == ReplanningTrigger.HUMAN_INPUT_REQUIRED
+            || trigger == ReplanningTrigger.REVIEW_COMPLETED;
+    }
+
+    private int retryCount(PlanStep sourceStep) {
+        return sourceStep == null || sourceStep.getRetryCount() == null ? 0 : sourceStep.getRetryCount();
+    }
+
+    private AttemptPreparation prepareAttempt(
+        ReplanningRequest request,
+        Task task,
+        PlanStep sourceStep,
+        PlanDecision decision,
+        PlannerInput plannerInput,
+        PolicyValidationResult validation
+    ) {
+        var metadata = mutableMetadata(task.getMetadata());
+        var attemptKey = attemptKey(request, sourceStep, decision);
+        var records = mutableMetadataMap(metadata.get(ATTEMPT_RECORDS_KEY));
+        var existingRecord = metadataMap(records.get(attemptKey));
+        if (!existingRecord.isEmpty()) {
+            return new AttemptPreparation(null, idempotentResult(request, decision, plannerInput, validation, existingRecord));
+        }
+
+        var totalAttemptCount = metadataInt(metadata.get(ATTEMPT_COUNT_KEY));
+        var triggerAttempts = mutableMetadataMap(metadata.get(TRIGGER_ATTEMPTS_KEY));
+        var triggerAttemptKey = triggerAttemptKey(request, sourceStep);
+        var triggerAttemptCount = metadataInt(triggerAttempts.get(triggerAttemptKey));
+        if (totalAttemptCount >= MAX_TASK_REPLANNING_ATTEMPTS) {
+            return new AttemptPreparation(
+                null,
+                attemptLimitResult(
+                    request,
+                    decision,
+                    plannerInput,
+                    validation,
+                    "Task replanning attempt limit reached.",
+                    totalAttemptCount,
+                    triggerAttemptCount,
+                    triggerAttemptKey
+                )
+            );
+        }
+        if (triggerAttemptCount >= MAX_TRIGGER_REPLANNING_ATTEMPTS) {
+            return new AttemptPreparation(
+                null,
+                attemptLimitResult(
+                    request,
+                    decision,
+                    plannerInput,
+                    validation,
+                    "Trigger replanning attempt limit reached.",
+                    totalAttemptCount,
+                    triggerAttemptCount,
+                    triggerAttemptKey
+                )
+            );
+        }
+
+        var attempt = new AttemptScope(attemptKey, triggerAttemptKey, totalAttemptCount + 1, triggerAttemptCount + 1);
+        triggerAttempts.put(triggerAttemptKey, attempt.triggerAttemptCount());
+        metadata.put(ATTEMPT_COUNT_KEY, attempt.totalAttemptCount());
+        metadata.put(TRIGGER_ATTEMPTS_KEY, triggerAttempts);
+        metadata.put("lastReplanningAttempt", Map.of(
+            "attemptKey", attempt.attemptKey(),
+            "triggerAttemptKey", attempt.triggerAttemptKey(),
+            "attemptCount", attempt.totalAttemptCount(),
+            "triggerAttemptCount", attempt.triggerAttemptCount(),
+            "trigger", request.trigger().name(),
+            "decisionId", decision.decisionId()
+        ));
+        task.setMetadata(metadata);
+        tasks.save(task);
+        return new AttemptPreparation(attempt, null);
+    }
+
+    private ReplanningResult idempotentResult(
+        ReplanningRequest request,
+        PlanDecision decision,
+        PlannerInput plannerInput,
+        PolicyValidationResult validation,
+        Map<String, Object> existingRecord
+    ) {
+        var insertedStepIds = metadataStringList(existingRecord.get("insertedStepIds"));
+        var skippedStepIds = metadataStringList(existingRecord.get("skippedStepIds"));
+        var mutationSummary = new LinkedHashMap<String, Object>();
+        mutationSummary.put("mutationApplied", false);
+        mutationSummary.put("idempotent", true);
+        mutationSummary.put("reason", "Duplicate replanning trigger ignored; previous controlled mutation is reused.");
+        mutationSummary.put("attemptKey", existingRecord.get("attemptKey"));
+        mutationSummary.put("attemptCount", existingRecord.get("attemptCount"));
+        mutationSummary.put("triggerAttemptCount", existingRecord.get("triggerAttemptCount"));
+        mutationSummary.put("originalStatus", existingRecord.get("status"));
+        mutationSummary.put("originalMutationType", existingRecord.get("mutationType"));
+        mutationSummary.put("insertedStepIds", insertedStepIds);
+        mutationSummary.put("skippedStepIds", skippedStepIds);
+        mutationSummary.entrySet().removeIf(entry -> entry.getValue() == null);
+        var attemptSummary = new LinkedHashMap<String, Object>();
+        attemptSummary.put("idempotent", true);
+        attemptSummary.put("attemptKey", existingRecord.get("attemptKey"));
+        attemptSummary.put("attemptCount", existingRecord.get("attemptCount"));
+        attemptSummary.put("triggerAttemptCount", existingRecord.get("triggerAttemptCount"));
+        attemptSummary.entrySet().removeIf(entry -> entry.getValue() == null);
+
+        return new ReplanningResult(
+            ReplanningStatus.NOOP,
+            request.trigger(),
+            List.of("Duplicate replanning trigger ignored."),
+            merge(decisionAuditSummary(decision, plannerInput), attemptSummary),
+            validation.auditSummary(),
+            mutationSummary,
+            insertedStepIds,
+            skippedStepIds
+        );
+    }
+
+    private ReplanningResult attemptLimitResult(
+        ReplanningRequest request,
+        PlanDecision decision,
+        PlannerInput plannerInput,
+        PolicyValidationResult validation,
+        String reason,
+        int totalAttemptCount,
+        int triggerAttemptCount,
+        String triggerAttemptKey
+    ) {
+        var mutationSummary = new LinkedHashMap<String, Object>();
+        mutationSummary.put("mutationApplied", false);
+        mutationSummary.put("reason", reason);
+        mutationSummary.put("attemptCount", totalAttemptCount);
+        mutationSummary.put("triggerAttemptCount", triggerAttemptCount);
+        mutationSummary.put("triggerAttemptKey", triggerAttemptKey);
+        mutationSummary.put("maxTaskAttempts", MAX_TASK_REPLANNING_ATTEMPTS);
+        mutationSummary.put("maxTriggerAttempts", MAX_TRIGGER_REPLANNING_ATTEMPTS);
+        return new ReplanningResult(
+            ReplanningStatus.NOT_TRIGGERABLE,
+            request.trigger(),
+            List.of(reason),
+            merge(decisionAuditSummary(decision, plannerInput), Map.of(
+                "attemptCount", totalAttemptCount,
+                "triggerAttemptCount", triggerAttemptCount
+            )),
+            validation.auditSummary(),
+            mutationSummary,
+            List.of(),
+            List.of()
+        );
+    }
+
+    private void recordCompletedAttempt(
+        String taskId,
+        AttemptScope attempt,
+        ReplanningResult result,
+        String mutationType
+    ) {
+        if (attempt == null) {
+            return;
+        }
+        var task = tasks.findById(taskId).orElseThrow();
+        var metadata = mutableMetadata(task.getMetadata());
+        var records = mutableMetadataMap(metadata.get(ATTEMPT_RECORDS_KEY));
+        records.put(attempt.attemptKey(), Map.of(
+            "attemptKey", attempt.attemptKey(),
+            "triggerAttemptKey", attempt.triggerAttemptKey(),
+            "attemptCount", attempt.totalAttemptCount(),
+            "triggerAttemptCount", attempt.triggerAttemptCount(),
+            "status", result.status().name(),
+            "mutationType", mutationType,
+            "insertedStepIds", result.insertedStepIds(),
+            "skippedStepIds", result.skippedStepIds()
+        ));
+        metadata.put(ATTEMPT_RECORDS_KEY, records);
+        metadata.put(ATTEMPT_COUNT_KEY, attempt.totalAttemptCount());
+        var triggerAttempts = mutableMetadataMap(metadata.get(TRIGGER_ATTEMPTS_KEY));
+        triggerAttempts.put(attempt.triggerAttemptKey(), attempt.triggerAttemptCount());
+        metadata.put(TRIGGER_ATTEMPTS_KEY, triggerAttempts);
+        task.setMetadata(metadata);
+        tasks.save(task);
+    }
+
+    private void rollbackAttempt(String taskId, AttemptScope attempt) {
+        if (attempt == null) {
+            return;
+        }
+        var task = tasks.findById(taskId).orElseThrow();
+        var metadata = mutableMetadata(task.getMetadata());
+        metadata.put(ATTEMPT_COUNT_KEY, Math.max(0, attempt.totalAttemptCount() - 1));
+        var triggerAttempts = mutableMetadataMap(metadata.get(TRIGGER_ATTEMPTS_KEY));
+        var previousTriggerCount = Math.max(0, attempt.triggerAttemptCount() - 1);
+        if (previousTriggerCount == 0) {
+            triggerAttempts.remove(attempt.triggerAttemptKey());
+        } else {
+            triggerAttempts.put(attempt.triggerAttemptKey(), previousTriggerCount);
+        }
+        metadata.put(TRIGGER_ATTEMPTS_KEY, triggerAttempts);
+        var lastAttempt = metadataMap(metadata.get("lastReplanningAttempt"));
+        if (attempt.attemptKey().equals(lastAttempt.get("attemptKey"))) {
+            metadata.remove("lastReplanningAttempt");
+        }
+        task.setMetadata(metadata);
+        tasks.save(task);
+    }
+
+    private String attemptKey(ReplanningRequest request, PlanStep sourceStep, PlanDecision decision) {
+        return request.taskId()
+            + "|" + request.trigger().name()
+            + "|" + sourceStepId(request, sourceStep)
+            + "|" + decision.decisionId();
+    }
+
+    private String triggerAttemptKey(ReplanningRequest request, PlanStep sourceStep) {
+        return request.trigger().name() + "|" + sourceStepId(request, sourceStep);
+    }
+
+    private String sourceStepId(ReplanningRequest request, PlanStep sourceStep) {
+        if (sourceStep != null) {
+            return sourceStep.getStepId();
+        }
+        return request.sourceStepId() == null ? "" : request.sourceStepId();
+    }
+
+    private LinkedHashMap<String, Object> mutableMetadata(Map<String, Object> metadata) {
+        return metadata == null ? new LinkedHashMap<>() : new LinkedHashMap<>(metadata);
+    }
+
+    private LinkedHashMap<String, Object> mutableMetadataMap(Object value) {
+        return new LinkedHashMap<>(metadataMap(value));
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> metadataMap(Object value) {
+        if (!(value instanceof Map<?, ?> values)) {
+            return Map.of();
+        }
+        var result = new LinkedHashMap<String, Object>();
+        values.forEach((key, item) -> result.put(key == null ? "" : key.toString(), item));
+        result.remove("");
+        return result;
+    }
+
+    private int metadataInt(Object value) {
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value != null) {
+            try {
+                return Integer.parseInt(value.toString());
+            } catch (NumberFormatException ignored) {
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    private List<String> metadataStringList(Object value) {
+        if (!(value instanceof List<?> values)) {
+            return List.of();
+        }
+        return values.stream()
+            .map(item -> item == null ? "" : item.toString())
+            .filter(item -> !item.isBlank())
+            .toList();
     }
 
     private PlanStep sourceStep(ReplanningRequest request, List<PlanStep> orderedSteps) {
@@ -382,13 +719,15 @@ public class ReplanningApplicationService {
         ReplanningRequest request,
         PlanDecision decision,
         PolicyValidationResult validation,
-        PlannerInput plannerInput
+        PlannerInput plannerInput,
+        AttemptScope attempt
     ) {
         var proposed = decision.proposedPlanStep();
         var orderedSteps = planSteps.findByTaskIdOrderByStepOrderAsc(request.taskId());
         var sourceStep = sourceStep(request, orderedSteps);
         var saved = appendRecoveryStep(request, decision, orderedSteps, sourceStep, proposed);
         if (saved == null) {
+            rollbackAttempt(request.taskId(), attempt);
             return ReplanningResult.failed(request.trigger(), List.of("Planner proposed an illegal PlanStepType."));
         }
         var mutationSummary = new LinkedHashMap<String, Object>();
@@ -402,24 +741,28 @@ public class ReplanningApplicationService {
         mutationSummary.put("decisionId", decision.decisionId());
         mutationSummary.put("sourceStepId", sourceStep == null ? null : sourceStep.getStepId());
         mutationSummary.put("inputRef", saved.getInputRef());
+        mutationSummary.putAll(attempt.auditSummary());
         mutationSummary.entrySet().removeIf(entry -> entry.getValue() == null);
 
-        return ReplanningResult.applied(
+        var result = ReplanningResult.applied(
             request.trigger(),
             List.of(),
-            decisionAuditSummary(decision, plannerInput),
+            merge(decisionAuditSummary(decision, plannerInput), attempt.auditSummary()),
             validation.auditSummary(),
             mutationSummary,
             List.of(saved.getStepId()),
             List.of()
         );
+        recordCompletedAttempt(request.taskId(), attempt, result, PlannerAction.INSERT_STEP.name());
+        return result;
     }
 
     private ReplanningResult applyReplan(
         ReplanningRequest request,
         PlanDecision decision,
         PolicyValidationResult validation,
-        PlannerInput plannerInput
+        PlannerInput plannerInput,
+        AttemptScope attempt
     ) {
         var orderedSteps = planSteps.findByTaskIdOrderByStepOrderAsc(request.taskId());
         var sourceStep = sourceStep(request, orderedSteps);
@@ -445,17 +788,20 @@ public class ReplanningApplicationService {
             mutationSummary.put("insertedStepType", inserted.getStepType().name());
             mutationSummary.put("insertedStepOrder", inserted.getStepOrder());
         }
+        mutationSummary.putAll(attempt.auditSummary());
         mutationSummary.entrySet().removeIf(entry -> entry.getValue() == null);
 
-        return ReplanningResult.applied(
+        var result = ReplanningResult.applied(
             request.trigger(),
             decision.blockers(),
-            decisionAuditSummary(decision, plannerInput),
+            merge(decisionAuditSummary(decision, plannerInput), attempt.auditSummary()),
             validation.auditSummary(),
             mutationSummary,
             inserted == null ? List.of() : List.of(inserted.getStepId()),
             skipped.stream().map(PlanStep::getStepId).toList()
         );
+        recordCompletedAttempt(request.taskId(), attempt, result, PlannerAction.REPLAN.name());
+        return result;
     }
 
     private List<PlanStep> skipPendingDownstreamSteps(List<PlanStep> orderedSteps, PlanStep sourceStep) {
@@ -556,7 +902,8 @@ public class ReplanningApplicationService {
         ReplanningRequest request,
         PlanDecision decision,
         PolicyValidationResult validation,
-        PlannerInput plannerInput
+        PlannerInput plannerInput,
+        AttemptScope attempt
     ) {
         var task = tasks.findById(request.taskId()).orElseThrow();
         var metadata = task.getMetadata() == null
@@ -571,6 +918,9 @@ public class ReplanningApplicationService {
             "policyStatus", validation.status().name(),
             "policyReasonCode", validation.reasonCode().name(),
             "resumeTaskStatus", resumeStatus.name(),
+            "attemptKey", attempt.attemptKey(),
+            "attemptCount", attempt.totalAttemptCount(),
+            "triggerAttemptCount", attempt.triggerAttemptCount(),
             "status", ReplanningStatus.WAITING_FOR_HUMAN.name()
         ));
         task.setMetadata(metadata);
@@ -582,17 +932,20 @@ public class ReplanningApplicationService {
         mutationSummary.put("taskStatus", TaskStatus.WAITING_FOR_REVIEW.name());
         mutationSummary.put("requiredHumanInput", requiredHumanInput);
         mutationSummary.put("reason", "Task paused for human confirmation; no PlanStep was inserted, deleted or reordered.");
+        mutationSummary.putAll(attempt.auditSummary());
 
         var blockers = validation.blockers().isEmpty()
             ? List.of(validation.message())
             : validation.blockers();
-        return ReplanningResult.waitingForHuman(
+        var result = ReplanningResult.waitingForHuman(
             request.trigger(),
-            decisionAuditSummary(decision, plannerInput),
+            merge(decisionAuditSummary(decision, plannerInput), attempt.auditSummary()),
             validation.auditSummary(),
             mutationSummary,
             blockers
         );
+        recordCompletedAttempt(request.taskId(), attempt, result, PlannerAction.WAIT_FOR_HUMAN.name());
+        return result;
     }
 
     private Map<String, Object> decisionAuditSummary(PlanDecision decision, PlannerInput plannerInput) {

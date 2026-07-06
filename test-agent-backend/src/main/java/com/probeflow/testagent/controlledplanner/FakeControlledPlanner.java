@@ -70,6 +70,13 @@ public class FakeControlledPlanner implements ControlledPlanner {
                 insertStepProposal(input).proposedToolName(),
                 insertStepProposal(input)
             );
+            case ILLEGAL_INSERT_STEP -> PlanDecision.insertStep(
+                "Fake planner proposed an illegal step type to test rollback guards.",
+                0.84d,
+                ToolRiskLevel.LOW,
+                null,
+                ProposedPlanStep.of("NOT_A_PLAN_STEP", "Illegal step", "This step type does not exist.", null)
+            );
             case REPLAN -> PlanDecision.replan(
                 "Fake planner detected blockers that require a new remaining plan.",
                 0.61d,
