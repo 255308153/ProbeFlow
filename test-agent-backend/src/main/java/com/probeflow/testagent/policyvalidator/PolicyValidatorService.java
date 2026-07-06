@@ -7,6 +7,7 @@ import com.probeflow.testagent.agentpolicy.ToolPolicyDecision;
 import com.probeflow.testagent.agentpolicy.ToolPolicyEvaluationRequest;
 import com.probeflow.testagent.agentpolicy.ToolPolicyReasonCode;
 import com.probeflow.testagent.agentpolicy.ToolPolicyStatus;
+import com.probeflow.testagent.agentpolicy.ToolRiskLevel;
 import com.probeflow.testagent.controlledplanner.PlanDecision;
 import com.probeflow.testagent.controlledplanner.PlannerAction;
 import java.util.List;
@@ -14,6 +15,8 @@ import org.springframework.stereotype.Service;
 
 @Service
 public class PolicyValidatorService {
+
+    private static final double MINIMUM_AUTO_CONFIDENCE = 0.5d;
 
     private final ToolContractRegistry registry;
     private final AgentPolicyService policyService;
@@ -47,7 +50,7 @@ public class PolicyValidatorService {
         return switch (decision.action()) {
             case CONTINUE -> validateContinue(decision);
             case INSERT_STEP -> validateInsertStep(request);
-            case REPLAN -> PolicyValidationResult.allowed(
+            case REPLAN -> allowedAfterDecisionGate(
                 decision,
                 PolicyValidationReasonCode.SAFE_REPLAN,
                 "Planner requested replanning as a safe signal without executing a tool."
@@ -66,7 +69,7 @@ public class PolicyValidatorService {
                 List.of("CONTINUE_WITH_TOOL_INTENT")
             );
         }
-        return PolicyValidationResult.allowed(
+        return allowedAfterDecisionGate(
             decision,
             PolicyValidationReasonCode.SAFE_CONTINUE,
             "Planner decision can continue the deterministic flow without a tool invocation."
@@ -98,7 +101,7 @@ public class PolicyValidatorService {
             }
             return validateProposedTool(decision, proposedToolName, request);
         }
-        return PolicyValidationResult.allowed(
+        return allowedAfterDecisionGate(
             decision,
             PolicyValidationReasonCode.SAFE_INSERT_STEP,
             "Planner proposed a structured step; tool policy validation can inspect it before execution."
@@ -131,7 +134,7 @@ public class PolicyValidatorService {
                 List.of("STOP_WITH_TOOL_INTENT")
             );
         }
-        return PolicyValidationResult.allowed(
+        return allowedAfterDecisionGate(
             decision,
             PolicyValidationReasonCode.SAFE_STOP,
             "Planner requested a safe task stop without executing a tool."
@@ -181,7 +184,7 @@ public class PolicyValidatorService {
     private PolicyValidationResult fromToolPolicyDecision(PlanDecision decision, ToolPolicyDecision toolDecision) {
         var reasonCode = mapReasonCode(toolDecision.reasonCode());
         if (toolDecision.status() == ToolPolicyStatus.ALLOWED) {
-            return PolicyValidationResult.allowed(decision, reasonCode, toolDecision.message());
+            return allowedAfterDecisionGate(decision, reasonCode, toolDecision.message());
         }
         if (toolDecision.status() == ToolPolicyStatus.REQUIRES_HUMAN_CONFIRMATION) {
             return PolicyValidationResult.requiresHumanConfirmation(
@@ -226,5 +229,37 @@ public class PolicyValidatorService {
             return decision.proposedToolName();
         }
         return decision.proposedPlanStep() == null ? null : decision.proposedPlanStep().proposedToolName();
+    }
+
+    private PolicyValidationResult allowedAfterDecisionGate(
+        PlanDecision decision,
+        PolicyValidationReasonCode reasonCode,
+        String message
+    ) {
+        var gate = decisionGate(decision);
+        if (gate != null) {
+            return gate;
+        }
+        return PolicyValidationResult.allowed(decision, reasonCode, message);
+    }
+
+    private PolicyValidationResult decisionGate(PlanDecision decision) {
+        if (decision.riskLevel() == ToolRiskLevel.HIGH || decision.riskLevel() == ToolRiskLevel.CRITICAL) {
+            return PolicyValidationResult.requiresHumanConfirmation(
+                decision,
+                PolicyValidationReasonCode.HIGH_RISK_REQUIRES_CONFIRMATION,
+                "Planner decision is high risk and requires human confirmation before it can proceed.",
+                List.of("HIGH_RISK_DECISION")
+            );
+        }
+        if (decision.confidence() < MINIMUM_AUTO_CONFIDENCE) {
+            return PolicyValidationResult.requiresHumanConfirmation(
+                decision,
+                PolicyValidationReasonCode.LOW_CONFIDENCE_REQUIRES_CONFIRMATION,
+                "Planner confidence is below the automatic execution threshold.",
+                List.of("LOW_CONFIDENCE_DECISION")
+            );
+        }
+        return null;
     }
 }
