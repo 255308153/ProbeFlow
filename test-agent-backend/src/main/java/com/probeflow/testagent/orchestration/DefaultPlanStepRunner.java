@@ -162,6 +162,19 @@ public class DefaultPlanStepRunner implements PlanStepRunner {
     }
 
     private StepOutcome executeHttp(Task task, ExecutionMode executionMode, HttpExecutionApplicationService httpExecution) {
+        var readiness = executionReadiness(task);
+        if (!readiness.ready()) {
+            putMetadata(task, "executionReadinessStatus", "BLOCKED");
+            putMetadata(task, "executionReadinessBlockers", readiness.structuredBlockers());
+            putMetadata(task, "needsFailureAnalysis", false);
+            putMetadata(task, "lastHttpExecutionCounts", emptyExecutionCounts());
+            return StepOutcome.blocked(
+                "HTTP execution blocked by readiness checks; blockers=" + readiness.blockers().size(),
+                readiness.blockerDetails()
+            );
+        }
+        putMetadata(task, "executionReadinessStatus", "READY");
+        putMetadata(task, "executionReadinessBlockers", List.of());
         var result = httpExecution.execute(new HttpExecutionRequest(
             task.getTaskId(),
             selectedCaseIds(task),
@@ -199,9 +212,54 @@ public class DefaultPlanStepRunner implements PlanStepRunner {
         );
     }
 
+    private ExecutionReadiness executionReadiness(Task task) {
+        var blockers = new ArrayList<ExecutionReadinessBlocker>();
+        if (selectedCaseIds(task).isEmpty()) {
+            blockers.add(new ExecutionReadinessBlocker(
+                "MISSING_SELECTED_CASES",
+                "selectedCaseIds",
+                "task metadata selectedCaseIds is required before HTTP execution"
+            ));
+        }
+        if (!hasTextMetadata(task, "environment")) {
+            blockers.add(new ExecutionReadinessBlocker(
+                "MISSING_ENVIRONMENT",
+                "environment",
+                "task metadata environment is required before HTTP execution"
+            ));
+        }
+        if (!StringUtils.hasText(firstPresent(mapMetadata(task, "environmentVariables"), "baseUrl", "base_url", "BASE_URL"))) {
+            blockers.add(new ExecutionReadinessBlocker(
+                "MISSING_BASE_URL",
+                "environmentVariables.baseUrl",
+                "task metadata environmentVariables.baseUrl is required before HTTP execution"
+            ));
+        }
+        if ((booleanMetadata(task, "authRequired", false) || booleanMetadata(task, "requiresAuth", false))
+            && !hasAnyValue(mapMetadata(task, "authVariables"))) {
+            blockers.add(new ExecutionReadinessBlocker(
+                "MISSING_AUTH",
+                "authVariables",
+                "task metadata authVariables must contain credentials when authRequired=true"
+            ));
+        }
+        return new ExecutionReadiness(blockers);
+    }
+
+    private Map<String, Object> emptyExecutionCounts() {
+        return Map.of(
+            "total", 0,
+            "passed", 0,
+            "failed", 0,
+            "error", 0,
+            "blocked", 0,
+            "skipped", 0
+        );
+    }
+
     private StepOutcome analyzeFailures(Task task, FailureAnalysisApplicationService failureAnalysis) {
         if (!booleanMetadata(task, "needsFailureAnalysis", true)) {
-            return StepOutcome.skipped("No failed, errored, blocked or warning executions need analysis");
+            return StepOutcome.skippedNonBlocking("No failed, errored, blocked or warning executions need analysis");
         }
         var result = failureAnalysis.analyzeTask(TaskFailureAnalysisRequest.basic(task.getTaskId(), executionIds(task)));
         var observationIds = result.executionResults().stream()
@@ -257,6 +315,11 @@ public class DefaultPlanStepRunner implements PlanStepRunner {
         return value == null || !StringUtils.hasText(value.toString()) ? defaultValue : value.toString();
     }
 
+    private boolean hasTextMetadata(Task task, String key) {
+        var value = task.getMetadata() == null ? null : task.getMetadata().get(key);
+        return value != null && StringUtils.hasText(value.toString());
+    }
+
     private Boolean booleanMetadata(Task task, String key, boolean defaultValue) {
         var value = task.getMetadata() == null ? null : task.getMetadata().get(key);
         if (value instanceof Boolean bool) {
@@ -290,11 +353,58 @@ public class DefaultPlanStepRunner implements PlanStepRunner {
         return Map.ofEntries(result.toArray(Map.Entry[]::new));
     }
 
+    private String firstPresent(Map<String, Object> values, String... keys) {
+        for (var key : keys) {
+            var value = values.get(key);
+            if (value != null && StringUtils.hasText(value.toString())) {
+                return value.toString();
+            }
+        }
+        return null;
+    }
+
+    private boolean hasAnyValue(Map<String, Object> values) {
+        return values.values().stream()
+            .anyMatch(value -> value != null && StringUtils.hasText(value.toString()));
+    }
+
     private void putMetadata(Task task, String key, Object value) {
         var metadata = task.getMetadata() == null
             ? new LinkedHashMap<String, Object>()
             : new LinkedHashMap<>(task.getMetadata());
         metadata.put(key, value);
         task.setMetadata(metadata);
+    }
+
+    private record ExecutionReadiness(List<ExecutionReadinessBlocker> blockers) {
+        private boolean ready() {
+            return blockers.isEmpty();
+        }
+
+        private List<String> blockerDetails() {
+            return blockers.stream()
+                .map(ExecutionReadinessBlocker::detail)
+                .toList();
+        }
+
+        private List<Map<String, Object>> structuredBlockers() {
+            return blockers.stream()
+                .map(ExecutionReadinessBlocker::structured)
+                .toList();
+        }
+    }
+
+    private record ExecutionReadinessBlocker(String code, String field, String message) {
+        private String detail() {
+            return code + ": " + message;
+        }
+
+        private Map<String, Object> structured() {
+            return Map.of(
+                "code", code,
+                "field", field,
+                "message", message
+            );
+        }
     }
 }

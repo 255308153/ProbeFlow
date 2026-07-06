@@ -135,7 +135,11 @@ class RegressionWorkflowOrchestrationTests {
             List.of("case-fresh", "case-stale"),
             TaskPriority.MEDIUM,
             "phase9-test",
-            Map.of("environment", "staging", "dryRun", true)
+            Map.of(
+                "environment", "staging",
+                "dryRun", true,
+                "environmentVariables", Map.of("baseUrl", "https://api.example.test")
+            )
         ));
         entityManager.flush();
         entityManager.clear();

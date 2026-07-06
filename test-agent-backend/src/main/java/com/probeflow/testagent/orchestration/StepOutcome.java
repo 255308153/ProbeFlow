@@ -62,6 +62,30 @@ public record StepOutcome(
         );
     }
 
+    public static StepOutcome skippedNonBlocking(String summary) {
+        return new StepOutcome(
+            PlanStepStatus.SKIPPED,
+            null,
+            summary,
+            List.of(),
+            null,
+            List.of(),
+            false
+        );
+    }
+
+    public static StepOutcome blocked(String summary, List<String> blockerDetails) {
+        return new StepOutcome(
+            PlanStepStatus.SKIPPED,
+            TaskStatus.ANALYZING_RESULTS,
+            summary,
+            List.of(),
+            null,
+            blockerDetails,
+            false
+        );
+    }
+
     public static StepOutcome paused(TaskStatus taskStatus, String blockerDetail) {
         return new StepOutcome(
             PlanStepStatus.SUCCESS,
