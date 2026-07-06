@@ -40,6 +40,7 @@ class Phase1BoundaryGuardTests {
             .collect(Collectors.toSet());
 
         assertThat(immediatePackages).isEqualTo(Set.of(
+            "agentpolicy",
             "analysis",
             "apispec",
             "changelog",

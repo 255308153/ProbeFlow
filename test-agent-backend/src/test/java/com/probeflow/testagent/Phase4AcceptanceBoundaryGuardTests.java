@@ -303,6 +303,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             .toList();
 
         assertThat(entryPoints).containsExactly(
+            "AgentPolicyService",
             "ApiAnalysisApplicationService",
             "EmbeddingService",
             "ExecutableRequestBuilder",
@@ -315,6 +316,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             "LlmApplicationService",
             "LongTermMemoryRetrievalService",
             "MemoryRefineryService",
+            "PlannerSafeToolCatalogService",
             "ReportGenerationApplicationService",
             "SessionMemoryService",
             "TaskInitializationService",
