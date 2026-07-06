@@ -3,10 +3,20 @@ package com.probeflow.testagent.report;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.probeflow.testagent.apispec.ApiSpec;
+import com.probeflow.testagent.apispec.ApiSpecRepository;
+import com.probeflow.testagent.apispec.ApiSpecSourceType;
+import com.probeflow.testagent.apispec.HttpMethod;
 import com.probeflow.testagent.executionrecord.ExecutionRecord;
 import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.ExecutorType;
 import com.probeflow.testagent.executionrecord.OverallStatus;
+import com.probeflow.testagent.observation.AnalysisLevel;
+import com.probeflow.testagent.observation.Observation;
+import com.probeflow.testagent.observation.ObservationRepository;
+import com.probeflow.testagent.observation.ObservationRiskLevel;
+import com.probeflow.testagent.observation.ObservationSource;
+import com.probeflow.testagent.observation.ObservationType;
 import com.probeflow.testagent.task.MemoryRefinementStatus;
 import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskPriority;
@@ -55,10 +65,16 @@ class ReportGenerationApplicationServiceTests {
     private TestCaseRepository testCases;
 
     @Autowired
+    private ApiSpecRepository apiSpecs;
+
+    @Autowired
     private TaskCaseExecutionRepository taskCaseExecutions;
 
     @Autowired
     private ExecutionRecordRepository executionRecords;
+
+    @Autowired
+    private ObservationRepository observations;
 
     @Autowired
     private EntityManager entityManager;
@@ -164,6 +180,7 @@ class ReportGenerationApplicationServiceTests {
 
     @Test
     void basicSnapshotUsesExecutionEnvironmentAndDoesNotMutateExecutionState() {
+        apiSpecs.save(newApiSpec("api-create", HttpMethod.GET, "/api/orders"));
         var task = tasks.save(newTask("task-executed", List.of("api-create"), Map.of("environment", "qa")));
         var testCase = testCases.save(newTestCase("case-create", "api-create"));
         var execution = executionRecords.save(newExecutionRecord(task.getTaskId(), testCase.getCaseId(), "prod"));
@@ -224,6 +241,7 @@ class ReportGenerationApplicationServiceTests {
     @Test
     void aggregatesMixedExecutionOutcomesCoverageDurationAndModes() {
         var apiSpecIds = List.of("api-pass", "api-fail", "api-warning", "api-error", "api-blocked", "api-skipped", "api-unexecuted");
+        apiSpecIds.forEach(apiSpecId -> apiSpecs.save(newApiSpec(apiSpecId, HttpMethod.GET, "/api/" + apiSpecId)));
         var task = tasks.save(newTask("task-mixed", apiSpecIds, Map.of("environment", "qa")));
         var passedCase = testCases.save(newTestCase("case-pass", "api-pass"));
         var failedCase = testCases.save(newTestCase("case-fail", "api-fail"));
@@ -340,10 +358,162 @@ class ReportGenerationApplicationServiceTests {
             .containsEntry("SINGLE", 2)
             .containsEntry("BATCH", 2)
             .containsEntry("SUITE_STEP", 2);
-        assertThat(report.getFindings()).singleElement()
-            .satisfies(finding -> assertThat(finding)
+        assertThat(report.getFindings()).anySatisfy(finding -> assertThat(finding)
                 .containsEntry("state", "BASIC_SNAPSHOT")
                 .containsEntry("unexecutedCaseIds", List.of(unexecutedCase.getCaseId())));
+    }
+
+    @Test
+    void generatesStructuredFindingsFromExecutionFactsObservationsAndMissingLinks() {
+        apiSpecs.save(newApiSpec("api-auth", HttpMethod.GET, "/api/private"));
+        apiSpecs.save(newApiSpec("api-validation", HttpMethod.POST, "/api/orders"));
+        apiSpecs.save(newApiSpec("api-server", HttpMethod.GET, "/api/orders/{id}"));
+        apiSpecs.save(newApiSpec("api-blocked", HttpMethod.GET, "/api/blocked"));
+        var task = tasks.save(newTask(
+            "task-findings",
+            List.of("api-auth", "api-validation", "api-server", "api-blocked", "api-missing"),
+            Map.of("environment", "qa")
+        ));
+        var authCase = testCases.save(newTestCase("case-auth", "api-auth"));
+        var validationCase = testCases.save(newTestCase("case-validation", "api-validation"));
+        var serverCase = testCases.save(newTestCase("case-server", "api-server"));
+        var blockedCase = testCases.save(newTestCase("case-blocked-finding", "api-blocked"));
+
+        var auth = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            authCase.getCaseId(),
+            "qa",
+            "api-auth",
+            OverallStatus.FAILED,
+            18L,
+            401,
+            Map.of("statusCode", 401),
+            null,
+            List.of(Map.of("type", "STATUS_CODE", "status", "FAILED", "expected", 200, "actual", 401))
+        ));
+        var validation = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            validationCase.getCaseId(),
+            "qa",
+            "api-validation",
+            OverallStatus.FAILED,
+            21L,
+            422,
+            Map.of("statusCode", 422),
+            null,
+            List.of(Map.of("type", "JSON_FIELD_EQUALS", "status", "FAILED", "expected", "CREATED", "actual", "INVALID"))
+        ));
+        var server = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            serverCase.getCaseId(),
+            "qa",
+            "api-server",
+            OverallStatus.FAILED,
+            50L,
+            500,
+            Map.of("statusCode", 500, "failureType", "HTTP_5XX"),
+            null,
+            List.of()
+        ));
+        var blocked = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            blockedCase.getCaseId(),
+            "qa",
+            "api-blocked",
+            OverallStatus.BLOCKED,
+            0L,
+            null,
+            Map.of("errorType", "INVALID_REQUEST"),
+            "Unresolved variable: token",
+            List.of()
+        ));
+        var missing = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            "case-missing-link",
+            "qa",
+            "api-missing",
+            OverallStatus.FAILED,
+            9L,
+            500,
+            Map.of("statusCode", 500),
+            null,
+            List.of()
+        ));
+        var authObservation = observations.save(newObservation(
+            task.getTaskId(),
+            auth.getExecutionId(),
+            ObservationType.RISK_EVALUATION,
+            ObservationRiskLevel.CRITICAL,
+            "Credentials rejected by target service",
+            "HTTP 401 indicates authentication failure",
+            "Refresh credentials before retrying"
+        ));
+        observations.save(newObservation(
+            task.getTaskId(),
+            server.getExecutionId(),
+            ObservationType.RISK_EVALUATION,
+            ObservationRiskLevel.HIGH,
+            "Server error returned",
+            "HTTP 500 indicates backend regression risk",
+            "Escalate to service owner"
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = reportGeneration.generateTaskReport(ReportGenerationRequest.forTask(task.getTaskId()));
+
+        var report = reports.findById(result.reportId()).orElseThrow();
+        assertThat(report.getFindings()).hasSizeGreaterThanOrEqualTo(7);
+        assertThat(report.getFindings().getFirst())
+            .containsEntry("classification", "AUTH_ISSUE")
+            .containsEntry("severity", "CRITICAL")
+            .containsEntry("evidenceType", "FACTUAL_AND_INFERRED")
+            .containsEntry("caseId", authCase.getCaseId())
+            .containsEntry("primaryApiSpecId", "api-auth")
+            .containsEntry("executionId", auth.getExecutionId())
+            .containsEntry("observationIds", List.of(authObservation.getObservationId()))
+            .containsEntry("retryable", false);
+        assertThat((Map<String, Object>) report.getFindings().getFirst().get("sourceReferences"))
+            .containsEntry("executionIds", List.of(auth.getExecutionId()))
+            .containsEntry("observationIds", List.of(authObservation.getObservationId()))
+            .containsEntry("caseIds", List.of(authCase.getCaseId()))
+            .containsEntry("apiSpecIds", List.of("api-auth"));
+        assertThat((List<String>) report.getFindings().getFirst().get("factualEvidence"))
+            .contains("overallStatus=FAILED", "statusCode=401", "classification=AUTH_ISSUE");
+        assertThat((List<Map<String, Object>>) report.getFindings().getFirst().get("inferredEvidence"))
+            .singleElement()
+            .satisfies(evidence -> assertThat(evidence)
+                .containsEntry("observationId", authObservation.getObservationId())
+                .containsEntry("riskLevel", "CRITICAL")
+                .containsEntry("source", "SYSTEM"));
+
+        assertThat(report.getFindings()).anySatisfy(finding -> assertThat(finding)
+            .containsEntry("classification", "VALIDATION_ISSUE")
+            .containsEntry("caseId", validationCase.getCaseId())
+            .containsEntry("primaryApiSpecId", "api-validation")
+            .containsEntry("executionId", validation.getExecutionId()));
+        assertThat(report.getFindings()).anySatisfy(finding -> assertThat(finding)
+            .containsEntry("classification", "SERVER_ERROR")
+            .containsEntry("severity", "HIGH")
+            .containsEntry("retryable", true)
+            .containsEntry("caseId", serverCase.getCaseId())
+            .containsEntry("primaryApiSpecId", "api-server")
+            .containsEntry("executionId", server.getExecutionId()));
+        assertThat(report.getFindings()).anySatisfy(finding -> assertThat(finding)
+            .containsEntry("classification", "ENVIRONMENT_ISSUE")
+            .containsEntry("caseId", blockedCase.getCaseId())
+            .containsEntry("primaryApiSpecId", "api-blocked")
+            .containsEntry("executionId", blocked.getExecutionId()));
+        assertThat(report.getFindings()).anySatisfy(finding -> assertThat(finding)
+            .containsEntry("type", "MISSING_TEST_CASE")
+            .containsEntry("classification", "DATA_QUALITY_ISSUE")
+            .containsEntry("caseId", "case-missing-link")
+            .containsEntry("executionId", missing.getExecutionId()));
+        assertThat(report.getFindings()).anySatisfy(finding -> assertThat(finding)
+            .containsEntry("type", "MISSING_API_SPEC")
+            .containsEntry("classification", "DATA_QUALITY_ISSUE")
+            .containsEntry("primaryApiSpecId", "api-missing")
+            .containsEntry("executionId", missing.getExecutionId()));
     }
 
     @Test
@@ -393,6 +563,28 @@ class ReportGenerationApplicationServiceTests {
         return testCase;
     }
 
+    private ApiSpec newApiSpec(String apiSpecId, HttpMethod method, String path) {
+        var apiSpec = new ApiSpec();
+        apiSpec.setApiSpecId(apiSpecId);
+        apiSpec.setSystemName("ProbeFlow target");
+        apiSpec.setModuleName("orders");
+        apiSpec.setHttpMethod(method);
+        apiSpec.setPath(path);
+        apiSpec.setSummary(method + " " + path);
+        apiSpec.setDescription("Phase 8 report test API");
+        apiSpec.setOperationId(apiSpecId + "-operation");
+        apiSpec.setSourceType(ApiSpecSourceType.MANUAL);
+        apiSpec.setSourceRef("phase8-test");
+        apiSpec.setSourceLocation(Map.of());
+        apiSpec.setRouteReady(true);
+        apiSpec.setBasicParamReady(true);
+        apiSpec.setDtoExpanded(true);
+        apiSpec.setValidationReady(true);
+        apiSpec.setAuthReady(true);
+        apiSpec.setKnowledgeContextReady(true);
+        return apiSpec;
+    }
+
     private ExecutionRecord newExecutionRecord(String taskId, String caseId, String environment) {
         return newExecutionRecord(taskId, caseId, environment, "api-create", OverallStatus.PASSED, 42L);
     }
@@ -405,20 +597,47 @@ class ReportGenerationApplicationServiceTests {
         OverallStatus overallStatus,
         long durationMs
     ) {
+        return newExecutionRecord(
+            taskId,
+            caseId,
+            environment,
+            apiSpecId,
+            overallStatus,
+            durationMs,
+            200,
+            Map.of("statusCode", 200),
+            null,
+            List.of()
+        );
+    }
+
+    private ExecutionRecord newExecutionRecord(
+        String taskId,
+        String caseId,
+        String environment,
+        String apiSpecId,
+        OverallStatus overallStatus,
+        long durationMs,
+        Integer statusCode,
+        Map<String, Object> responseSnapshot,
+        String errorMessage,
+        List<Map<String, Object>> assertionResults
+    ) {
         var record = new ExecutionRecord();
         record.setTaskId(taskId);
         record.setCaseId(caseId);
         record.setExecutorType(ExecutorType.HTTP);
         record.setEnvironment(environment);
         record.setRequestSnapshot(Map.of("method", "GET", "path", "/api/orders", "apiSpecId", apiSpecId));
-        record.setResponseSnapshot(Map.of("statusCode", 200));
-        record.setAssertionResults(List.of());
+        record.setResponseSnapshot(responseSnapshot);
+        record.setAssertionResults(assertionResults);
         record.setOverallStatus(overallStatus);
         record.setCriticalFailed(overallStatus == OverallStatus.FAILED
             || overallStatus == OverallStatus.ERROR
             || overallStatus == OverallStatus.BLOCKED);
         record.setDurationMs(durationMs);
-        record.setStatusCode(200);
+        record.setStatusCode(statusCode);
+        record.setErrorMessage(errorMessage);
         return record;
     }
 
@@ -440,5 +659,27 @@ class ReportGenerationApplicationServiceTests {
         execution.setExecutionRecordId(executionId);
         execution.setSnapshotJson(Map.of("caseId", caseId, "path", "/api/orders"));
         return execution;
+    }
+
+    private Observation newObservation(
+        String taskId,
+        String executionId,
+        ObservationType type,
+        ObservationRiskLevel riskLevel,
+        String summary,
+        String failureReason,
+        String nextSuggestion
+    ) {
+        var observation = new Observation();
+        observation.setTaskId(taskId);
+        observation.setExecutionId(executionId);
+        observation.setObservationType(type);
+        observation.setAnalysisLevel(AnalysisLevel.BASIC);
+        observation.setSummary(summary);
+        observation.setFailureReason(failureReason);
+        observation.setRiskLevel(riskLevel);
+        observation.setNextSuggestion(nextSuggestion);
+        observation.setSource(ObservationSource.SYSTEM);
+        return observation;
     }
 }

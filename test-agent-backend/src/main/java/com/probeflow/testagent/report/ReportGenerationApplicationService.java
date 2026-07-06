@@ -1,11 +1,16 @@
 package com.probeflow.testagent.report;
 
+import com.probeflow.testagent.apispec.ApiSpec;
+import com.probeflow.testagent.apispec.ApiSpecRepository;
 import com.probeflow.testagent.executionrecord.ExecutionRecord;
 import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.OverallStatus;
-import com.probeflow.testagent.taskcaseexecution.ExecutionMode;
+import com.probeflow.testagent.observation.AnalysisLevel;
+import com.probeflow.testagent.observation.Observation;
+import com.probeflow.testagent.observation.ObservationRepository;
 import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskRepository;
+import com.probeflow.testagent.taskcaseexecution.ExecutionMode;
 import com.probeflow.testagent.taskcaseexecution.TaskCaseExecution;
 import com.probeflow.testagent.taskcaseexecution.TaskCaseExecutionRepository;
 import com.probeflow.testagent.testcase.TestCase;
@@ -24,21 +29,27 @@ public class ReportGenerationApplicationService {
 
     private final TaskRepository tasks;
     private final TestCaseRepository testCases;
+    private final ApiSpecRepository apiSpecs;
     private final TaskCaseExecutionRepository taskCaseExecutions;
     private final ExecutionRecordRepository executionRecords;
+    private final ObservationRepository observations;
     private final ReportRepository reports;
 
     public ReportGenerationApplicationService(
         TaskRepository tasks,
         TestCaseRepository testCases,
+        ApiSpecRepository apiSpecs,
         TaskCaseExecutionRepository taskCaseExecutions,
         ExecutionRecordRepository executionRecords,
+        ObservationRepository observations,
         ReportRepository reports
     ) {
         this.tasks = tasks;
         this.testCases = testCases;
+        this.apiSpecs = apiSpecs;
         this.taskCaseExecutions = taskCaseExecutions;
         this.executionRecords = executionRecords;
+        this.observations = observations;
         this.reports = reports;
     }
 
@@ -61,7 +72,7 @@ public class ReportGenerationApplicationService {
         report.setFailCount(executionSummary.failed());
         report.setWarningCount(executionSummary.warning());
         report.setRiskSummary(riskSummary(state, executionSummary));
-        report.setFindings(List.of(noResultFinding(state, caseIds.size(), records.size(), executionSummary)));
+        report.setFindings(findings(task, state, caseIds, records, executionSummary));
         report.setSuggestions(List.of());
         report.setMetadata(metadata(task, caseIds, taskExecutions, records, state, executionSummary));
 
@@ -193,6 +204,344 @@ public class ReportGenerationApplicationService {
                 : "Task execution records were aggregated into deterministic summary counts.";
         });
         return finding;
+    }
+
+    private List<Map<String, Object>> findings(
+        Task task,
+        String state,
+        List<String> caseIds,
+        List<ExecutionRecord> records,
+        ExecutionSummary executionSummary
+    ) {
+        var findings = new ArrayList<Map<String, Object>>();
+        findings.add(noResultFinding(state, caseIds.size(), records.size(), executionSummary));
+        if (records.isEmpty()) {
+            return findings;
+        }
+
+        var context = findingContext(task, caseIds, records);
+        for (var record : records) {
+            if (record.getOverallStatus() != OverallStatus.PASSED) {
+                findings.add(executionFinding(record, context));
+            }
+            findings.addAll(dataQualityFindings(record, context));
+        }
+        return findings.stream()
+            .sorted(Comparator
+                .comparingInt(this::findingSeverityRank)
+                .thenComparing(finding -> sortValue(finding.get("classification")))
+                .thenComparing(finding -> sortValue(finding.get("primaryApiSpecId")))
+                .thenComparing(finding -> sortValue(finding.get("caseId")))
+                .thenComparing(finding -> sortValue(finding.get("executionId")))
+                .thenComparing(finding -> sortValue(finding.get("type"))))
+            .toList();
+    }
+
+    private FindingContext findingContext(Task task, List<String> caseIds, List<ExecutionRecord> records) {
+        var caseIdSet = new LinkedHashSet<>(caseIds);
+        records.stream().map(ExecutionRecord::getCaseId).forEach(caseIdSet::add);
+        var caseById = new LinkedHashMap<String, TestCase>();
+        testCases.findAllById(caseIdSet).forEach(testCase -> caseById.put(testCase.getCaseId(), testCase));
+
+        var apiSpecIds = new LinkedHashSet<String>();
+        if (task.getTargetApiSpecIds() != null) {
+            apiSpecIds.addAll(task.getTargetApiSpecIds());
+        }
+        caseById.values().stream()
+            .map(TestCase::getPrimaryApiSpecId)
+            .map(this::clean)
+            .filter(value -> value != null)
+            .forEach(apiSpecIds::add);
+        records.stream()
+            .flatMap(record -> apiSpecIds(record).stream())
+            .forEach(apiSpecIds::add);
+
+        var apiSpecById = new LinkedHashMap<String, ApiSpec>();
+        apiSpecs.findAllById(apiSpecIds).forEach(apiSpec -> apiSpecById.put(apiSpec.getApiSpecId(), apiSpec));
+
+        var observationsByExecutionId = new LinkedHashMap<String, List<Observation>>();
+        for (var record : records) {
+            observationsByExecutionId.put(
+                record.getExecutionId(),
+                observations.findAllByExecutionIdAndAnalysisLevelOrderByCreatedAtAscObservationIdAsc(
+                    record.getExecutionId(),
+                    AnalysisLevel.BASIC
+                )
+            );
+        }
+        return new FindingContext(caseById, apiSpecById, observationsByExecutionId);
+    }
+
+    private Map<String, Object> executionFinding(ExecutionRecord record, FindingContext context) {
+        var classification = classification(record);
+        var observationList = context.observationsByExecutionId().getOrDefault(record.getExecutionId(), List.of());
+        var apiSpecIds = affectedApiSpecIds(record, context);
+        var finding = new LinkedHashMap<String, Object>();
+        finding.put("type", "EXECUTION_OUTCOME");
+        finding.put("severity", severity(record, classification, observationList));
+        finding.put("classification", classification);
+        finding.put("groupKey", groupKey(classification, apiSpecIds, record));
+        finding.put("caseId", record.getCaseId());
+        finding.put("primaryApiSpecId", apiSpecIds.isEmpty() ? null : apiSpecIds.getFirst());
+        finding.put("apiSpecIds", apiSpecIds);
+        finding.put("executionId", record.getExecutionId());
+        finding.put("observationIds", observationList.stream().map(Observation::getObservationId).toList());
+        finding.put("retryable", retryable(classification));
+        finding.put("evidenceType", observationList.isEmpty() ? "FACTUAL" : "FACTUAL_AND_INFERRED");
+        finding.put("factualEvidence", factualEvidence(record, classification));
+        finding.put("inferredEvidence", inferredEvidence(observationList));
+        finding.put("sourceReferences", sourceReferences(record, observationList, apiSpecIds));
+        return finding;
+    }
+
+    private List<Map<String, Object>> dataQualityFindings(ExecutionRecord record, FindingContext context) {
+        var findings = new ArrayList<Map<String, Object>>();
+        if (!context.caseById().containsKey(record.getCaseId())) {
+            var finding = dataQualityFinding(
+                "MISSING_TEST_CASE",
+                "ExecutionRecord references a TestCase that is not available.",
+                record,
+                List.of()
+            );
+            finding.put("caseId", record.getCaseId());
+            findings.add(finding);
+        }
+
+        var apiSpecIds = affectedApiSpecIds(record, context);
+        var missingApiSpecIds = apiSpecIds.stream()
+            .filter(apiSpecId -> !context.apiSpecById().containsKey(apiSpecId))
+            .toList();
+        if (!missingApiSpecIds.isEmpty()) {
+            var finding = dataQualityFinding(
+                "MISSING_API_SPEC",
+                "ExecutionRecord or TestCase references ApiSpec ids that are not available.",
+                record,
+                missingApiSpecIds
+            );
+            finding.put("caseId", record.getCaseId());
+            finding.put("apiSpecIds", missingApiSpecIds);
+            finding.put("primaryApiSpecId", missingApiSpecIds.getFirst());
+            findings.add(finding);
+        }
+        return findings;
+    }
+
+    private Map<String, Object> dataQualityFinding(
+        String type,
+        String message,
+        ExecutionRecord record,
+        List<String> apiSpecIds
+    ) {
+        var finding = new LinkedHashMap<String, Object>();
+        finding.put("type", type);
+        finding.put("severity", "MEDIUM");
+        finding.put("classification", "DATA_QUALITY_ISSUE");
+        finding.put("groupKey", "DATA_QUALITY_ISSUE|" + type + "|" + record.getCaseId() + "|" + String.join(",", apiSpecIds));
+        finding.put("executionId", record.getExecutionId());
+        finding.put("observationIds", List.of());
+        finding.put("retryable", false);
+        finding.put("evidenceType", "FACTUAL");
+        finding.put("factualEvidence", List.of(message, "executionId=" + record.getExecutionId(), "caseId=" + record.getCaseId()));
+        finding.put("inferredEvidence", List.of());
+        finding.put("sourceReferences", sourceReferences(record, List.of(), apiSpecIds));
+        return finding;
+    }
+
+    private List<String> affectedApiSpecIds(ExecutionRecord record, FindingContext context) {
+        var apiSpecIds = new LinkedHashSet<String>();
+        apiSpecIds.addAll(apiSpecIds(record));
+        var testCase = context.caseById().get(record.getCaseId());
+        if (testCase != null) {
+            var primaryApiSpecId = clean(testCase.getPrimaryApiSpecId());
+            if (primaryApiSpecId != null) {
+                apiSpecIds.add(primaryApiSpecId);
+            }
+        }
+        return apiSpecIds.stream().sorted().toList();
+    }
+
+    private String classification(ExecutionRecord record) {
+        var response = record.getResponseSnapshot() == null ? Map.<String, Object>of() : record.getResponseSnapshot();
+        var errorType = stringValue(response.get("errorType"));
+        if (record.getOverallStatus() == OverallStatus.PASSED_WITH_WARNINGS) {
+            return failedAssertionClassification(record, "PASSED_WITH_WARNING");
+        }
+        if (record.getOverallStatus() == OverallStatus.SKIPPED) {
+            return "SKIPPED";
+        }
+        if (record.getOverallStatus() == OverallStatus.BLOCKED) {
+            if ("BLOCKED_HOST".equals(errorType) || "INVALID_REQUEST".equals(errorType)
+                || contains(record.getErrorMessage(), "Unresolved variable")
+                || contains(record.getErrorMessage(), "Invalid URL")
+                || contains(record.getErrorMessage(), "Unsupported protocol")) {
+                return "ENVIRONMENT_ISSUE";
+            }
+            return "BLOCKED_REQUEST";
+        }
+        if (record.getOverallStatus() == OverallStatus.ERROR) {
+            if ("TIMEOUT".equals(errorType) || contains(record.getErrorMessage(), "timeout") || contains(record.getErrorMessage(), "timed out")) {
+                return "TIMEOUT";
+            }
+            return "TRANSPORT_ERROR";
+        }
+        if (record.getStatusCode() != null) {
+            if (record.getStatusCode() == 401 || record.getStatusCode() == 403) {
+                return "AUTH_ISSUE";
+            }
+            if (record.getStatusCode() == 400 || record.getStatusCode() == 422) {
+                return "VALIDATION_ISSUE";
+            }
+            if (record.getStatusCode() >= 500) {
+                return "SERVER_ERROR";
+            }
+        }
+        return failedAssertionClassification(record, "UNKNOWN");
+    }
+
+    private String failedAssertionClassification(ExecutionRecord record, String fallback) {
+        var failedAssertions = record.getAssertionResults() == null
+            ? List.<Map<String, Object>>of()
+            : record.getAssertionResults().stream()
+                .filter(assertion -> "FAILED".equals(stringValue(assertion.get("status"))))
+                .toList();
+        if (failedAssertions.stream().anyMatch(assertion -> "STATUS_CODE".equals(assertion.get("type")))) {
+            return "STATUS_MISMATCH";
+        }
+        if (failedAssertions.stream().anyMatch(assertion -> "JSON_FIELD_EXISTS".equals(assertion.get("type")))) {
+            return "RESPONSE_SHAPE_MISMATCH";
+        }
+        if (failedAssertions.stream().anyMatch(assertion -> "JSON_FIELD_EQUALS".equals(assertion.get("type")))) {
+            return "RESPONSE_VALUE_MISMATCH";
+        }
+        if (failedAssertions.stream().anyMatch(assertion -> "BODY_PRESENT".equals(assertion.get("type")))) {
+            return "BODY_PRESENCE_FAILURE";
+        }
+        if (failedAssertions.stream().anyMatch(assertion -> "DURATION_LESS_THAN_MS".equals(assertion.get("type")))) {
+            return "DURATION_REGRESSION";
+        }
+        return failedAssertions.isEmpty() ? fallback : "ASSERTION_FAILURE";
+    }
+
+    private String severity(ExecutionRecord record, String classification, List<Observation> observationList) {
+        var observationSeverity = observationList.stream()
+            .map(observation -> observation.getRiskLevel().name())
+            .min(Comparator.comparingInt(this::severityRank))
+            .orElse(null);
+        if (observationSeverity != null) {
+            return observationSeverity;
+        }
+        if (record.isCriticalFailed() || "SERVER_ERROR".equals(classification) || "AUTH_ISSUE".equals(classification)) {
+            return "HIGH";
+        }
+        if ("VALIDATION_ISSUE".equals(classification)
+            || "BLOCKED_REQUEST".equals(classification)
+            || "ENVIRONMENT_ISSUE".equals(classification)
+            || "TRANSPORT_ERROR".equals(classification)
+            || "TIMEOUT".equals(classification)) {
+            return "MEDIUM";
+        }
+        if ("SKIPPED".equals(classification) || "PASSED_WITH_WARNING".equals(classification)) {
+            return "LOW";
+        }
+        return "MEDIUM";
+    }
+
+    private int findingSeverityRank(Map<String, Object> finding) {
+        return severityRank(stringValue(finding.get("severity")));
+    }
+
+    private int severityRank(String severity) {
+        if ("CRITICAL".equals(severity)) {
+            return 0;
+        }
+        if ("HIGH".equals(severity)) {
+            return 1;
+        }
+        if ("MEDIUM".equals(severity)) {
+            return 2;
+        }
+        if ("LOW".equals(severity)) {
+            return 3;
+        }
+        return 4;
+    }
+
+    private boolean retryable(String classification) {
+        return "TIMEOUT".equals(classification)
+            || "TRANSPORT_ERROR".equals(classification)
+            || "SERVER_ERROR".equals(classification)
+            || "ENVIRONMENT_ISSUE".equals(classification);
+    }
+
+    private String groupKey(String classification, List<String> apiSpecIds, ExecutionRecord record) {
+        return classification + "|"
+            + (apiSpecIds.isEmpty() ? "NO_API" : String.join(",", apiSpecIds))
+            + "|" + record.getCaseId()
+            + "|" + (record.getStatusCode() == null ? "NO_STATUS" : record.getStatusCode());
+    }
+
+    private List<String> factualEvidence(ExecutionRecord record, String classification) {
+        var evidence = new ArrayList<String>();
+        evidence.add("overallStatus=" + record.getOverallStatus());
+        if (record.getStatusCode() != null) {
+            evidence.add("statusCode=" + record.getStatusCode());
+        }
+        if (record.getDurationMs() != null) {
+            evidence.add("durationMs=" + record.getDurationMs());
+        }
+        var response = record.getResponseSnapshot() == null ? Map.<String, Object>of() : record.getResponseSnapshot();
+        var failureType = clean(stringValue(response.get("failureType")));
+        if (failureType != null) {
+            evidence.add("failureType=" + failureType);
+        }
+        var errorType = clean(stringValue(response.get("errorType")));
+        if (errorType != null) {
+            evidence.add("errorType=" + errorType);
+        }
+        if (clean(record.getErrorMessage()) != null) {
+            evidence.add("errorMessage=" + record.getErrorMessage());
+        }
+        if (record.getAssertionResults() != null) {
+            record.getAssertionResults().stream()
+                .filter(assertion -> "FAILED".equals(stringValue(assertion.get("status"))))
+                .limit(3)
+                .map(assertion -> "failedAssertion=" + assertion.get("type")
+                    + " expected=" + assertion.get("expected")
+                    + " actual=" + assertion.get("actual"))
+                .forEach(evidence::add);
+        }
+        evidence.add("classification=" + classification);
+        return List.copyOf(evidence);
+    }
+
+    private List<Map<String, Object>> inferredEvidence(List<Observation> observationList) {
+        return observationList.stream()
+            .map(observation -> {
+                Map<String, Object> evidence = new LinkedHashMap<>();
+                evidence.put("observationId", observation.getObservationId());
+                evidence.put("observationType", observation.getObservationType().name());
+                evidence.put("analysisLevel", observation.getAnalysisLevel().name());
+                evidence.put("riskLevel", observation.getRiskLevel().name());
+                evidence.put("summary", observation.getSummary());
+                evidence.put("failureReason", observation.getFailureReason());
+                evidence.put("nextSuggestion", observation.getNextSuggestion());
+                evidence.put("source", observation.getSource().name());
+                return evidence;
+            })
+            .toList();
+    }
+
+    private Map<String, Object> sourceReferences(
+        ExecutionRecord record,
+        List<Observation> observationList,
+        List<String> apiSpecIds
+    ) {
+        var sourceReferences = new LinkedHashMap<String, Object>();
+        sourceReferences.put("executionIds", List.of(record.getExecutionId()));
+        sourceReferences.put("observationIds", observationList.stream().map(Observation::getObservationId).toList());
+        sourceReferences.put("caseIds", List.of(record.getCaseId()));
+        sourceReferences.put("apiSpecIds", apiSpecIds);
+        return sourceReferences;
     }
 
     private Map<String, Object> metadata(
@@ -386,6 +735,10 @@ public class ReportGenerationApplicationService {
         return value == null ? null : String.valueOf(value);
     }
 
+    private String sortValue(Object value) {
+        return value == null ? "" : String.valueOf(value);
+    }
+
     private long longValue(Object value) {
         if (value instanceof Number number) {
             return number.longValue();
@@ -401,6 +754,11 @@ public class ReportGenerationApplicationService {
             return null;
         }
         return value.trim();
+    }
+
+    private boolean contains(String value, String fragment) {
+        return value != null && fragment != null
+            && value.toLowerCase(java.util.Locale.ROOT).contains(fragment.toLowerCase(java.util.Locale.ROOT));
     }
 
     private record ExecutionSummary(
@@ -440,5 +798,12 @@ public class ReportGenerationApplicationService {
             metadata.put("slowestCases", slowestCases);
             return metadata;
         }
+    }
+
+    private record FindingContext(
+        Map<String, TestCase> caseById,
+        Map<String, ApiSpec> apiSpecById,
+        Map<String, List<Observation>> observationsByExecutionId
+    ) {
     }
 }
