@@ -7,6 +7,11 @@ import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.OverallStatus;
 import com.probeflow.testagent.failureanalysis.FailureAnalysisApplicationService;
 import com.probeflow.testagent.failureanalysis.FailureAnalysisRequest;
+import com.probeflow.testagent.memory.LongTermMemory;
+import com.probeflow.testagent.memory.LongTermMemoryRepository;
+import com.probeflow.testagent.memory.MemoryStatus;
+import com.probeflow.testagent.memory.TaskMemoryService;
+import com.probeflow.testagent.memory.TaskMemoryView;
 import com.probeflow.testagent.observation.AnalysisLevel;
 import com.probeflow.testagent.observation.Observation;
 import com.probeflow.testagent.observation.ObservationRepository;
@@ -36,6 +41,8 @@ public class ReportGenerationApplicationService {
     private final ExecutionRecordRepository executionRecords;
     private final ObservationRepository observations;
     private final FailureAnalysisApplicationService failureAnalysis;
+    private final TaskMemoryService taskMemoryService;
+    private final LongTermMemoryRepository longTermMemories;
     private final ReportRepository reports;
 
     public ReportGenerationApplicationService(
@@ -46,6 +53,8 @@ public class ReportGenerationApplicationService {
         ExecutionRecordRepository executionRecords,
         ObservationRepository observations,
         FailureAnalysisApplicationService failureAnalysis,
+        TaskMemoryService taskMemoryService,
+        LongTermMemoryRepository longTermMemories,
         ReportRepository reports
     ) {
         this.tasks = tasks;
@@ -55,6 +64,8 @@ public class ReportGenerationApplicationService {
         this.executionRecords = executionRecords;
         this.observations = observations;
         this.failureAnalysis = failureAnalysis;
+        this.taskMemoryService = taskMemoryService;
+        this.longTermMemories = longTermMemories;
         this.reports = reports;
     }
 
@@ -404,6 +415,7 @@ public class ReportGenerationApplicationService {
         var generatedObservationIds = new ArrayList<String>();
         var missingAnalysisExecutionIds = new ArrayList<String>();
         var ineligibleExecutionIds = new ArrayList<String>();
+        var generatedCandidateResults = new ArrayList<Map<String, Object>>();
 
         for (var record : records) {
             if (!requiresBasicAnalysis(record)) {
@@ -421,6 +433,7 @@ public class ReportGenerationApplicationService {
             }
 
             var result = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
+            generatedCandidateResults.add(memoryCandidateResult(record.getExecutionId(), result.memoryCandidate()));
             if (result.observationIds().isEmpty()) {
                 missingAnalysisExecutionIds.add(record.getExecutionId());
             } else {
@@ -435,8 +448,24 @@ public class ReportGenerationApplicationService {
             generatedAnalysisExecutionIds,
             generatedObservationIds,
             missingAnalysisExecutionIds,
-            ineligibleExecutionIds
+            ineligibleExecutionIds,
+            generatedCandidateResults
         );
+    }
+
+    private Map<String, Object> memoryCandidateResult(
+        String executionId,
+        com.probeflow.testagent.failureanalysis.MemoryCandidateAnalysisResult candidate
+    ) {
+        var result = new LinkedHashMap<String, Object>();
+        result.put("executionId", executionId);
+        result.put("attempted", candidate.attempted());
+        result.put("accepted", candidate.accepted());
+        result.put("created", candidate.created());
+        result.put("merged", candidate.merged());
+        result.put("rejectionReason", candidate.rejectionReason());
+        result.put("memoryId", candidate.memoryId());
+        return result;
     }
 
     private boolean requiresBasicAnalysis(ExecutionRecord record) {
@@ -898,8 +927,146 @@ public class ReportGenerationApplicationService {
         metadata.put("executionModes", executionModeCounts(taskExecutions));
         metadata.put("suiteCoverage", suiteCoverage(records));
         metadata.put("analysisCoverage", analysisCoverage.toMetadata());
+        metadata.put("memoryFeedback", memoryFeedback(task, records, analysisCoverage));
         metadata.put("task", taskMetadata(task));
         return metadata;
+    }
+
+    private Map<String, Object> memoryFeedback(
+        Task task,
+        List<ExecutionRecord> records,
+        AnalysisCoverage analysisCoverage
+    ) {
+        var executionIds = new LinkedHashSet<String>();
+        records.stream()
+            .map(ExecutionRecord::getExecutionId)
+            .forEach(executionIds::add);
+        var caseIds = new LinkedHashSet<String>();
+        records.stream()
+            .map(ExecutionRecord::getCaseId)
+            .forEach(caseIds::add);
+        var taskMemoryReferences = taskMemoryService.readActiveTaskMemories(task.getTaskId())
+            .stream()
+            .map(this::taskMemoryReference)
+            .toList();
+        var longTermMemoryReferences = longTermMemories.findAllByStatusOrderByCreatedAtAscMemoryIdAsc(MemoryStatus.ACTIVE)
+            .stream()
+            .filter(memory -> memoryReferencesTaskRun(memory, task.getTaskId(), executionIds, caseIds))
+            .sorted(Comparator.comparing(LongTermMemory::getMemoryId))
+            .map(this::longTermMemoryReference)
+            .toList();
+        var candidateResults = analysisCoverage.generatedCandidateResults();
+        var rejectedCandidateNotes = candidateResults.stream()
+            .filter(candidate -> Boolean.TRUE.equals(candidate.get("attempted")))
+            .filter(candidate -> !Boolean.TRUE.equals(candidate.get("accepted")))
+            .filter(candidate -> clean(stringValue(candidate.get("rejectionReason"))) != null)
+            .map(candidate -> {
+                var note = new LinkedHashMap<String, Object>();
+                note.put("executionId", candidate.get("executionId"));
+                note.put("rejectionReason", candidate.get("rejectionReason"));
+                note.put("note", "Long-term memory candidate was rejected by the deterministic memory refinery.");
+                return note;
+            })
+            .toList();
+
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("summary", "Task memory items=" + taskMemoryReferences.size()
+            + ", acceptedLongTermMemories=" + longTermMemoryReferences.size()
+            + ", generatedRejectedCandidates=" + rejectedCandidateNotes.size() + ".");
+        metadata.put("taskMemoryCount", taskMemoryReferences.size());
+        metadata.put("taskMemoryReferences", taskMemoryReferences);
+        metadata.put("acceptedLongTermMemoryCount", longTermMemoryReferences.size());
+        metadata.put("longTermMemoryReferences", longTermMemoryReferences);
+        metadata.put("generatedCandidateAttemptCount", countCandidates(candidateResults, "attempted"));
+        metadata.put("generatedAcceptedCandidateCount", countCandidates(candidateResults, "accepted"));
+        metadata.put("generatedCreatedCandidateCount", countCandidates(candidateResults, "created"));
+        metadata.put("generatedMergedCandidateCount", countCandidates(candidateResults, "merged"));
+        metadata.put("generatedRejectedCandidateCount", rejectedCandidateNotes.size());
+        metadata.put("generatedCandidateResults", candidateResults);
+        metadata.put("rejectedCandidateNotes", rejectedCandidateNotes);
+        metadata.put("traceReferences", Map.of(
+            "executionIds", List.copyOf(executionIds),
+            "caseIds", List.copyOf(caseIds),
+            "taskMemoryIds", taskMemoryReferences.stream().map(reference -> stringValue(reference.get("memoryId"))).toList(),
+            "longTermMemoryIds", longTermMemoryReferences.stream().map(reference -> stringValue(reference.get("memoryId"))).toList()
+        ));
+        return metadata;
+    }
+
+    private int countCandidates(List<Map<String, Object>> candidates, String field) {
+        return (int) candidates.stream()
+            .filter(candidate -> Boolean.TRUE.equals(candidate.get(field)))
+            .count();
+    }
+
+    private Map<String, Object> taskMemoryReference(TaskMemoryView memory) {
+        var reference = new LinkedHashMap<String, Object>();
+        reference.put("memoryId", memory.memoryId());
+        reference.put("summary", memory.summary());
+        reference.put("scopeType", memory.scopeType().name());
+        reference.put("sourceType", memory.sourceType().name());
+        reference.put("sourceRef", memory.sourceRef());
+        reference.put("confidence", memory.confidence());
+        reference.put("lifecycleStage", memory.lifecycleStage());
+        reference.put("tags", memory.tags());
+        reference.put("metadata", limitedMemoryMetadata(memory.metadata()));
+        return reference;
+    }
+
+    private Map<String, Object> longTermMemoryReference(LongTermMemory memory) {
+        var reference = new LinkedHashMap<String, Object>();
+        reference.put("memoryId", memory.getMemoryId());
+        reference.put("summary", memory.getSummary());
+        reference.put("scopeType", memory.getScopeType().name());
+        reference.put("sourceType", memory.getSourceType().name());
+        reference.put("sourceRef", memory.getSourceRef());
+        reference.put("confidence", memory.getConfidence());
+        reference.put("importance", memory.getImportance());
+        reference.put("tags", memory.getTags());
+        reference.put("metadata", limitedMemoryMetadata(memory.getMetadata()));
+        return reference;
+    }
+
+    private Map<String, Object> limitedMemoryMetadata(Map<String, Object> metadata) {
+        var limited = new LinkedHashMap<String, Object>();
+        copyIfPresent(limited, metadata, "taskId");
+        copyIfPresent(limited, metadata, "executionId");
+        copyIfPresent(limited, metadata, "executionIds");
+        copyIfPresent(limited, metadata, "caseId");
+        copyIfPresent(limited, metadata, "caseIds");
+        copyIfPresent(limited, metadata, "apiSpecId");
+        copyIfPresent(limited, metadata, "classification");
+        copyIfPresent(limited, metadata, "riskLevel");
+        copyIfPresent(limited, metadata, "retryable");
+        copyIfPresent(limited, metadata, "statusCode");
+        copyIfPresent(limited, metadata, "errorCode");
+        copyIfPresent(limited, metadata, "environment");
+        copyIfPresent(limited, metadata, "occurrenceCount");
+        copyIfPresent(limited, metadata, "mergeCount");
+        return limited;
+    }
+
+    private boolean memoryReferencesTaskRun(
+        LongTermMemory memory,
+        String taskId,
+        LinkedHashSet<String> executionIds,
+        LinkedHashSet<String> caseIds
+    ) {
+        var metadata = memory.getMetadata() == null ? Map.<String, Object>of() : memory.getMetadata();
+        if (taskId.equals(stringValue(metadata.get("taskId")))) {
+            return true;
+        }
+        if (executionIds.contains(memory.getSourceRef())) {
+            return true;
+        }
+        if (intersects(executionIds, stringList(metadata.get("executionIds")))) {
+            return true;
+        }
+        return intersects(caseIds, stringList(metadata.get("caseIds")));
+    }
+
+    private boolean intersects(LinkedHashSet<String> values, List<String> candidates) {
+        return candidates.stream().anyMatch(values::contains);
     }
 
     private ExecutionSummary executionSummary(
@@ -1308,7 +1475,8 @@ public class ReportGenerationApplicationService {
         List<String> generatedAnalysisExecutionIds,
         List<String> generatedObservationIds,
         List<String> missingAnalysisExecutionIds,
-        List<String> ineligibleExecutionIds
+        List<String> ineligibleExecutionIds,
+        List<Map<String, Object>> generatedCandidateResults
     ) {
 
         private Map<String, Object> toMetadata() {
@@ -1327,6 +1495,7 @@ public class ReportGenerationApplicationService {
             metadata.put("generatedObservationIds", generatedObservationIds);
             metadata.put("missingAnalysisExecutionIds", missingAnalysisExecutionIds);
             metadata.put("ineligibleExecutionIds", ineligibleExecutionIds);
+            metadata.put("generatedCandidateResults", generatedCandidateResults);
             return metadata;
         }
     }

@@ -919,6 +919,118 @@ class ReportGenerationApplicationServiceTests {
     }
 
     @Test
+    void memoryFeedbackSummarizesTaskMemoriesAcceptedCandidatesAndRejectedNotes() {
+        apiSpecs.save(newApiSpec("api-memory-accepted", HttpMethod.POST, "/api/memory/accepted"));
+        apiSpecs.save(newApiSpec("api-memory-rejected", HttpMethod.POST, "/api/memory/rejected"));
+        var task = tasks.save(newTask(
+            "task-memory-feedback",
+            List.of("api-memory-accepted", "api-memory-rejected"),
+            Map.of("environment", "qa")
+        ));
+        var acceptedCase = testCases.save(newTestCase("case-memory-accepted", "api-memory-accepted"));
+        var rejectedCase = testCases.save(newTestCase("case-memory-rejected", "api-memory-rejected"));
+        var accepted = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            acceptedCase.getCaseId(),
+            "qa",
+            "api-memory-accepted",
+            OverallStatus.FAILED,
+            42L,
+            503,
+            Map.of("statusCode", 503),
+            null,
+            List.of()
+        ));
+        var rejected = executionRecords.save(newExecutionRecord(
+            task.getTaskId(),
+            rejectedCase.getCaseId(),
+            "qa",
+            "api-memory-rejected",
+            OverallStatus.FAILED,
+            27L,
+            409,
+            Map.of("statusCode", 409),
+            null,
+            List.of(Map.of(
+                "type", "STATUS_CODE",
+                "expected", 201,
+                "actual", 409,
+                "status", "FAILED"
+            ))
+        ));
+        rejected.setCriticalFailed(false);
+        taskCaseExecutions.save(newTaskCaseExecution(task.getTaskId(), acceptedCase.getCaseId(), accepted.getExecutionId(), ExecutionMode.SINGLE));
+        taskCaseExecutions.save(newTaskCaseExecution(task.getTaskId(), rejectedCase.getCaseId(), rejected.getExecutionId(), ExecutionMode.BATCH));
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = reportGeneration.generateTaskReport(ReportGenerationRequest.forTask(task.getTaskId()));
+
+        var report = reports.findById(result.reportId()).orElseThrow();
+        @SuppressWarnings("unchecked")
+        var memoryFeedback = (Map<String, Object>) report.getMetadata().get("memoryFeedback");
+        assertThat(memoryFeedback)
+            .containsEntry("taskMemoryCount", 2)
+            .containsEntry("acceptedLongTermMemoryCount", 1)
+            .containsEntry("generatedCandidateAttemptCount", 2)
+            .containsEntry("generatedAcceptedCandidateCount", 1)
+            .containsEntry("generatedCreatedCandidateCount", 1)
+            .containsEntry("generatedRejectedCandidateCount", 1);
+        assertThat((String) memoryFeedback.get("summary"))
+            .contains("Task memory items=2", "acceptedLongTermMemories=1", "generatedRejectedCandidates=1");
+
+        @SuppressWarnings("unchecked")
+        var taskMemoryReferences = (List<Map<String, Object>>) memoryFeedback.get("taskMemoryReferences");
+        assertThat(taskMemoryReferences)
+            .hasSize(2)
+            .allSatisfy(reference -> {
+                assertThat(reference)
+                    .containsEntry("scopeType", "FAILURE_PATTERN")
+                    .containsEntry("sourceType", "EXECUTION_RESULT")
+                    .containsKey("summary")
+                    .doesNotContainKeys("content", "fullContent");
+                assertThat((Map<String, Object>) reference.get("metadata"))
+                    .containsKeys("classification", "riskLevel", "executionId", "caseId")
+                    .doesNotContainKeys("sourceEvidence", "content", "fullContent");
+            });
+
+        @SuppressWarnings("unchecked")
+        var longTermReferences = (List<Map<String, Object>>) memoryFeedback.get("longTermMemoryReferences");
+        assertThat(longTermReferences)
+            .singleElement()
+            .satisfies(reference -> {
+                assertThat(reference)
+                    .containsEntry("scopeType", "FAILURE_PATTERN")
+                    .containsEntry("sourceType", "EXECUTION_RESULT")
+                    .containsKey("memoryId")
+                    .containsKey("summary")
+                    .doesNotContainKeys("content", "fullContent");
+                assertThat((Map<String, Object>) reference.get("metadata"))
+                    .containsEntry("classification", "SERVER_ERROR")
+                    .containsEntry("riskLevel", "HIGH")
+                    .containsEntry("statusCode", 503)
+                    .doesNotContainKeys("sourceEvidence", "content", "fullContent");
+            });
+
+        @SuppressWarnings("unchecked")
+        var rejectedNotes = (List<Map<String, Object>>) memoryFeedback.get("rejectedCandidateNotes");
+        assertThat(rejectedNotes)
+            .singleElement()
+            .satisfies(note -> assertThat(note)
+                .containsEntry("executionId", rejected.getExecutionId())
+                .containsEntry("rejectionReason", "low-confidence"));
+
+        @SuppressWarnings("unchecked")
+        var traceReferences = (Map<String, Object>) memoryFeedback.get("traceReferences");
+        assertThat((List<String>) traceReferences.get("executionIds"))
+            .containsExactly(accepted.getExecutionId(), rejected.getExecutionId());
+        assertThat((List<String>) traceReferences.get("caseIds"))
+            .containsExactly(acceptedCase.getCaseId(), rejectedCase.getCaseId());
+        assertThat((List<String>) traceReferences.get("taskMemoryIds")).hasSize(2);
+        assertThat((List<String>) traceReferences.get("longTermMemoryIds")).hasSize(1);
+    }
+
+    @Test
     void missingTaskIsRejectedClearly() {
         assertThatThrownBy(() -> reportGeneration.generateTaskReport(ReportGenerationRequest.forTask("missing-task")))
             .isInstanceOf(IllegalArgumentException.class)
