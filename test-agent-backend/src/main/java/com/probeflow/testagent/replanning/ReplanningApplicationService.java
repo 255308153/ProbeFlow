@@ -973,6 +973,7 @@ public class ReplanningApplicationService {
         var metadata = new LinkedHashMap<String, Object>();
         metadata.put("sourceTrigger", request.trigger().name());
         metadata.put("sourceStepId", request.sourceStepId());
+        metadata.put("sourceStepSummary", sourceStepSummary(request.sourceStepId()));
         metadata.put("requestType", requestType.name());
         metadata.put("plannerAction", decision.action().name());
         metadata.put("decisionId", decision.decisionId());
@@ -1056,6 +1057,24 @@ public class ReplanningApplicationService {
             return HumanRequestType.MISSING_INPUT;
         }
         return HumanRequestType.PLANNER_CLARIFICATION;
+    }
+
+    private Map<String, Object> sourceStepSummary(String sourceStepId) {
+        if (sourceStepId == null || sourceStepId.isBlank()) {
+            return Map.of();
+        }
+        return planSteps.findById(sourceStepId)
+            .map(step -> {
+                var summary = new LinkedHashMap<String, Object>();
+                summary.put("stepId", step.getStepId());
+                summary.put("stepType", step.getStepType() == null ? null : step.getStepType().name());
+                summary.put("stepStatus", step.getStepStatus() == null ? null : step.getStepStatus().name());
+                summary.put("stepOrder", step.getStepOrder());
+                summary.put("goal", step.getGoal());
+                summary.entrySet().removeIf(entry -> entry.getValue() == null);
+                return Map.copyOf(summary);
+            })
+            .orElseGet(Map::of);
     }
 
     @SuppressWarnings("unchecked")

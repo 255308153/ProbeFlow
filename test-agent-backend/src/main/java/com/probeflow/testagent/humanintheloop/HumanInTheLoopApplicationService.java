@@ -282,6 +282,59 @@ public class HumanInTheLoopApplicationService {
     }
 
     @Transactional
+    public HumanHighRiskDecisionResult applyHighRiskDecision(HumanDecisionSubmissionRequest request) {
+        var audit = new LinkedHashMap<String, Object>();
+        audit.put("requestId", request == null ? null : request.requestId());
+        audit.put("decisionType", request == null || request.decisionType() == null ? null : request.decisionType().name());
+        audit.put("actor", request == null ? null : request.actor());
+        var humanRequest = request == null || request.requestId().isBlank()
+            ? Optional.<HumanReviewRequest>empty()
+            : humanRequests.findById(request.requestId());
+
+        var validationBlockers = validateHighRiskDecision(request, humanRequest);
+        if (!validationBlockers.isEmpty()) {
+            return HumanHighRiskDecisionResult.rejected(validationBlockers, compact(audit));
+        }
+
+        var submission = submitDecision(request);
+        if (submission.status() == HumanDecisionSubmissionStatus.REJECTED) {
+            return HumanHighRiskDecisionResult.rejected(submission.blockers(), submission.auditSummary());
+        }
+
+        if (request.decisionType() == HumanDecisionType.REJECT) {
+            recordHighRiskDecision(submission.request(), submission.decision(), false);
+            submission.request().markRejected();
+            var rejectedRequest = humanRequests.save(submission.request());
+
+            var resultAudit = new LinkedHashMap<String, Object>();
+            resultAudit.putAll(submission.auditSummary());
+            resultAudit.put("requestStatus", rejectedRequest.getStatus().name());
+            resultAudit.put("taskStatus", tasks.findById(rejectedRequest.getTaskId()).orElseThrow().getStatus().name());
+            return HumanHighRiskDecisionResult.denied(
+                rejectedRequest,
+                submission.decision(),
+                compact(resultAudit)
+            );
+        }
+
+        recordHighRiskDecision(submission.request(), submission.decision(), true);
+        var consumption = consumeDecision(new HumanDecisionConsumptionRequest(request.requestId(), "high-risk-approval-workflow"));
+        if (consumption.status() == HumanDecisionConsumptionStatus.REJECTED) {
+            return HumanHighRiskDecisionResult.rejected(consumption.blockers(), consumption.auditSummary());
+        }
+
+        var resultAudit = new LinkedHashMap<String, Object>();
+        resultAudit.putAll(submission.auditSummary());
+        resultAudit.put("consumptionStatus", consumption.status().name());
+        resultAudit.put("taskStatus", tasks.findById(submission.request().getTaskId()).orElseThrow().getStatus().name());
+        return HumanHighRiskDecisionResult.approved(
+            consumption.request(),
+            submission.decision(),
+            compact(resultAudit)
+        );
+    }
+
+    @Transactional
     public HumanDecisionSubmissionResult submitDecision(HumanDecisionSubmissionRequest request) {
         var baseAudit = new LinkedHashMap<String, Object>();
         baseAudit.put("requestId", request == null ? null : request.requestId());
@@ -500,6 +553,50 @@ public class HumanInTheLoopApplicationService {
             || decisionType == HumanDecisionType.RESOLVE_BLOCKER;
     }
 
+    private List<String> validateHighRiskDecision(
+        HumanDecisionSubmissionRequest request,
+        Optional<HumanReviewRequest> humanRequest
+    ) {
+        if (request == null || request.requestId().isBlank()) {
+            return List.of("Human request id is required");
+        }
+        if (humanRequest.isEmpty()) {
+            return List.of("Human request not found: " + request.requestId());
+        }
+
+        var blockers = new ArrayList<String>();
+        if (humanRequest.get().getRequestType() != HumanRequestType.HIGH_RISK_APPROVAL) {
+            blockers.add("Human request is not a high-risk approval request: " + humanRequest.get().getRequestType().name());
+        }
+        if (humanRequest.get().getStatus() != HumanRequestStatus.PENDING) {
+            blockers.add("Human request is not pending: " + humanRequest.get().getStatus().name());
+        }
+        if (!highRiskDecisionType(request.decisionType())) {
+            blockers.add("Unsupported high-risk approval decision type: "
+                + (request.decisionType() == null ? "null" : request.decisionType().name()));
+        }
+        if (request.decisionType() == HumanDecisionType.APPROVE && !Boolean.TRUE.equals(request.payload().get("approved"))) {
+            blockers.add("High-risk approval requires approved=true");
+        }
+        if (request.decisionType() == HumanDecisionType.REJECT && metadataString(request.reason()).isBlank()) {
+            blockers.add("High-risk rejection reason is required");
+        }
+        var task = tasks.findById(humanRequest.get().getTaskId());
+        if (task.isEmpty()) {
+            blockers.add("Task not found: " + humanRequest.get().getTaskId());
+        } else if (task.get().getStatus() == TaskStatus.COMPLETED) {
+            blockers.add("Completed task cannot consume high-risk approval decision");
+        } else if (task.get().getStatus() == TaskStatus.CANCELLED) {
+            blockers.add("Cancelled task cannot consume high-risk approval decision");
+        }
+        return List.copyOf(blockers);
+    }
+
+    private boolean highRiskDecisionType(HumanDecisionType decisionType) {
+        return decisionType == HumanDecisionType.APPROVE
+            || decisionType == HumanDecisionType.REJECT;
+    }
+
     private List<String> draftIds(Object value) {
         if (!(value instanceof List<?> values)) {
             return List.of();
@@ -623,6 +720,45 @@ public class HumanInTheLoopApplicationService {
         metadata.put("lastHumanInputResolution", compact(record));
         task.setMetadata(Map.copyOf(metadata));
         task.setStatus(resumeStatusAfterHumanInput(task, metadata));
+        tasks.save(task);
+    }
+
+    private void recordHighRiskDecision(
+        HumanReviewRequest request,
+        HumanDecisionRecord decision,
+        boolean approved
+    ) {
+        var task = tasks.findById(request.getTaskId()).orElseThrow();
+        var metadata = mutableMetadata(task);
+        metadata.remove("requiredHumanInput");
+
+        var record = new LinkedHashMap<String, Object>();
+        record.put("requestId", request.getRequestId());
+        record.put("decisionId", decision.getDecisionId());
+        record.put("decisionType", decision.getDecisionType().name());
+        record.put("approved", approved);
+        record.put("actor", decision.getActor());
+        record.put("reason", decision.getReason());
+        record.put("riskLevel", request.getRiskLevel().name());
+        record.put("sourceTrigger", request.getSourceTrigger());
+        record.put("sourceStepId", request.getSourceStepId());
+        record.put("policyReason", request.getPolicyReason());
+        record.put("plannerDecisionId", request.getPlannerDecisionId());
+        record.put("plannerInputTraceId", request.getMetadata().get("plannerInputTraceId"));
+        record.put("blockers", request.getMetadata().get("blockers"));
+        record.put("payloadSummary", decision.getSanitizedPayloadSummary());
+        var compactRecord = compact(record);
+
+        appendMetadataRecord(metadata, "highRiskDecisionRecords", compactRecord);
+        metadata.put("lastHighRiskDecision", compactRecord);
+        if (approved) {
+            metadata.put("highRiskApprovalContext", compactRecord);
+            task.setStatus(resumeStatusAfterHumanInput(task, metadata));
+        } else {
+            metadata.put("highRiskRejectionContext", compactRecord);
+            task.setStatus(TaskStatus.FAILED);
+        }
+        task.setMetadata(Map.copyOf(metadata));
         tasks.save(task);
     }
 
