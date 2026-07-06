@@ -30,7 +30,8 @@ class Phase7AcceptanceBoundaryGuardTests {
             .contains("ExecutionRecord")
             .contains("Observation")
             .contains("TaskMemoryService")
-            .contains("MemoryRefineryService");
+            .contains("AgentMemoryFeedbackApplicationService")
+            .contains("refineFailureAnalysisCandidate");
         assertThat(failureAnalysisTests)
             .contains("singleExecutionAnalysisSummarizesPersistedExecutionFactsWithoutMutation")
             .contains("deterministicClassificationCoversAssertionTransportBlockedAndStatusEvidence")
