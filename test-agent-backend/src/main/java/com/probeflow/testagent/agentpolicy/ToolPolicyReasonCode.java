@@ -1,0 +1,11 @@
+package com.probeflow.testagent.agentpolicy;
+
+public enum ToolPolicyReasonCode {
+    ALLOWED_BY_POLICY,
+    HUMAN_CONFIRMATION_REQUIRED,
+    REVIEW_REQUIRED_WORKFLOW,
+    UNKNOWN_TOOL,
+    TOOL_NOT_WHITELISTED,
+    TOOL_BLOCKED_BY_CONTRACT,
+    TOOL_NOT_ALLOWED_IN_TASK_PHASE
+}
