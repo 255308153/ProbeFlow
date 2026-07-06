@@ -90,6 +90,31 @@ public class PromptTemplateRegistry {
                 "Ask one clarifying question for task {{taskId}} when context gap is: {{gap}}",
                 List.of("taskId", "gap"),
                 "Return one question and no tool calls."
+            ),
+            new PromptTemplate(
+                "v2.controlled-planner.v1",
+                "CONTROLLED_PLANNER",
+                "v1",
+                """
+                    You are ProbeFlow's Controlled Planner. Suggest the next plan decision without executing tools.
+                    Task state: {{taskState}}
+                    Current phase: {{currentPhase}}
+                    Workflow mode: {{workflowMode}}
+                    Last step outcome: {{lastStepOutcome}}
+                    Context summary: {{contextSummary}}
+                    Planner-safe tools: {{availableTools}}
+                    Constraints: {{constraints}}
+                    """,
+                List.of(
+                    "taskState",
+                    "currentPhase",
+                    "workflowMode",
+                    "lastStepOutcome",
+                    "contextSummary",
+                    "availableTools",
+                    "constraints"
+                ),
+                "Return compact structured JSON for PlanDecision only. Do not claim that any tool was executed."
             )
         );
     }
