@@ -311,6 +311,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             "FailureAnalysisApplicationService",
             "FakeEmbeddingService",
             "HttpExecutionApplicationService",
+            "HumanInTheLoopApplicationService",
             "KnowledgeChunkingService",
             "KnowledgeIngestApplicationService",
             "KnowledgeRetrievalApplicationService",

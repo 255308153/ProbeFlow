@@ -47,6 +47,7 @@ class Phase1BoundaryGuardTests {
             "controlledplanner",
             "executionrecord",
             "failureanalysis",
+            "humanintheloop",
             "httpexecution",
             "knowledge",
             "llm",

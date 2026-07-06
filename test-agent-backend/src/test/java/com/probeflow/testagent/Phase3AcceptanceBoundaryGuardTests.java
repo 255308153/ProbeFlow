@@ -240,6 +240,7 @@ class Phase3AcceptanceBoundaryGuardTests {
                 "ApiAnalysisApplicationService",
                 "FailureAnalysisApplicationService",
                 "HttpExecutionApplicationService",
+                "HumanInTheLoopApplicationService",
                 "KnowledgeIngestApplicationService",
                 "KnowledgeRetrievalApplicationService",
                 "LlmApplicationService",

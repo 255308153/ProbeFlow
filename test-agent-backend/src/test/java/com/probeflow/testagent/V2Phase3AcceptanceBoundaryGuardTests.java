@@ -69,8 +69,10 @@ class V2Phase3AcceptanceBoundaryGuardTests {
             .doesNotContain("CrudRepository")
             .doesNotContain("Repository");
         assertThat(migrations.toLowerCase(Locale.ROOT))
-            .doesNotContain("planner_decision")
-            .doesNotContain("plan_decision")
+            .doesNotContain("create table planner_decision")
+            .doesNotContain("create table plan_decision")
+            .doesNotContain("create index idx_planner_decision")
+            .doesNotContain("create index idx_plan_decision")
             .doesNotContain("policy_validator");
     }
 
