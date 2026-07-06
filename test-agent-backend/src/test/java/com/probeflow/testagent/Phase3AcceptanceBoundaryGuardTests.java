@@ -242,6 +242,7 @@ class Phase3AcceptanceBoundaryGuardTests {
                 "HttpExecutionApplicationService",
                 "KnowledgeIngestApplicationService",
                 "KnowledgeRetrievalApplicationService",
+                "LlmApplicationService",
                 "ReportGenerationApplicationService",
                 "TaskOrchestrationApplicationService",
                 "TestCaseGenerationApplicationService"

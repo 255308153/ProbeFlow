@@ -47,6 +47,7 @@ class Phase1BoundaryGuardTests {
             "failureanalysis",
             "httpexecution",
             "knowledge",
+            "llm",
             "memory",
             "observation",
             "orchestration",

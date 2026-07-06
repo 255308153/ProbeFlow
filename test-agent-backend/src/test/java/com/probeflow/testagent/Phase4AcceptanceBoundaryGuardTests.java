@@ -312,6 +312,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             "KnowledgeChunkingService",
             "KnowledgeIngestApplicationService",
             "KnowledgeRetrievalApplicationService",
+            "LlmApplicationService",
             "LongTermMemoryRetrievalService",
             "MemoryRefineryService",
             "ReportGenerationApplicationService",
