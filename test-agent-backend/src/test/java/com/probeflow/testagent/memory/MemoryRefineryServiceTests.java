@@ -175,7 +175,7 @@ class MemoryRefineryServiceTests {
         assertThat(second.created()).isFalse();
         assertThat(second.duplicateSuppressed()).isTrue();
         assertThat(second.memory().memoryId()).isEqualTo(first.memory().memoryId());
-        assertThat(second.memory().confidence()).isEqualTo(0.9f);
+        assertThat(second.memory().confidence()).isGreaterThan(0.9f).isLessThanOrEqualTo(0.95f);
         assertThat(second.memory().importance()).isGreaterThanOrEqualTo(first.memory().importance());
         assertThat(second.memory().fullContent())
             .contains("First execution showed a gateway timeout")
@@ -185,6 +185,144 @@ class MemoryRefineryServiceTests {
             .containsEntry("evidenceCount", 2);
         assertThat((List<String>) second.memory().metadata().get("mergedSourceRefs"))
             .contains("execution-merge-1", "execution-merge-2");
+    }
+
+    @Test
+    void repeatedSameSourceRefIsIdempotentAndDoesNotInflateScores() {
+        var first = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Gateway timeout retry guidance",
+            "Retry gateway timeouts with a smaller assertion window.",
+            MemorySourceType.EXECUTION_RESULT,
+            "execution-same-source",
+            "task-phase7-05-same-source",
+            List.of("retry", "payment"),
+            0.87f,
+            "Original evidence for gateway timeout.",
+            Map.of("errorCode", "GW_TIMEOUT", "module", "payment")
+        ));
+        var second = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Gateway timeout retry guidance with extra evidence",
+            "Retry gateway timeouts with a smaller assertion window and extra diagnostics.",
+            MemorySourceType.EXECUTION_RESULT,
+            "execution-same-source",
+            "task-phase7-05-same-source",
+            List.of("retry", "payment", "diagnostic"),
+            0.94f,
+            "Duplicate retry from the same source should not inflate scores.",
+            Map.of("errorCode", "GW_TIMEOUT", "module", "payment")
+        ));
+
+        assertThat(second.accepted()).isTrue();
+        assertThat(second.created()).isFalse();
+        assertThat(second.duplicateSuppressed()).isTrue();
+        assertThat(second.memory().memoryId()).isEqualTo(first.memory().memoryId());
+        assertThat(second.memory().confidence()).isEqualTo(first.memory().confidence());
+        assertThat(second.memory().importance()).isEqualTo(first.memory().importance());
+        assertThat(second.memory().successContribution()).isEqualTo(first.memory().successContribution());
+        assertThat(second.memory().metadata())
+            .containsEntry("mergeCount", 1)
+            .containsEntry("evidenceCount", 1);
+    }
+
+    @Test
+    void mergesCrossSourcePolicyAndExecutionEvidenceWithReinforcedScores() {
+        var execution = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Payment timeout should use approved internal retry tool",
+            "Payment timeout recovery should avoid external HTTP tools and use the approved retry fixture.",
+            MemorySourceType.EXECUTION_RESULT,
+            "execution-policy-merge-1",
+            "task-phase7-05-policy-1",
+            List.of("payment", "timeout", "policy-learning"),
+            0.78f,
+            "Execution failed when payment timeout recovery attempted external HTTP.",
+            Map.of(
+                "systemName", "billing",
+                "module", "payment",
+                "apiPath", "/api/payments/charge",
+                "errorCode", "GW_TIMEOUT",
+                "riskLevel", "HIGH"
+            )
+        ));
+        var executionEmbedding = execution.memory().embedding().clone();
+        var policy = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Policy rejected payment timeout recovery via external HTTP",
+            "Policy rejected planner action INSERT_STEP using external.http for payment timeout recovery.",
+            MemorySourceType.OBSERVATION,
+            "policy-validation-merge-2",
+            "task-phase7-05-policy-2",
+            List.of("payment", "timeout", "policy-learning", "external.http", "high"),
+            0.82f,
+            "PolicyValidationResult blocked external.http and recommended the approved internal retry fixture.",
+            Map.of(
+                "systemName", "billing",
+                "module", "payment",
+                "apiPath", "/api/payments/charge",
+                "errorCode", "GW_TIMEOUT",
+                "policyReason", "TOOL_NOT_WHITELISTED",
+                "toolName", "external.http",
+                "riskLevel", "HIGH"
+            )
+        ));
+
+        assertThat(policy.accepted()).isTrue();
+        assertThat(policy.created()).isFalse();
+        assertThat(policy.duplicateSuppressed()).isTrue();
+        assertThat(policy.memory().memoryId()).isEqualTo(execution.memory().memoryId());
+        assertThat(policy.memory().confidence()).isGreaterThan(0.82f).isLessThanOrEqualTo(0.95f);
+        assertThat(policy.memory().importance()).isGreaterThan(execution.memory().importance()).isLessThanOrEqualTo(0.97f);
+        assertThat(policy.memory().fullContent())
+            .contains("Execution failed when payment timeout recovery attempted external HTTP")
+            .contains("PolicyValidationResult blocked external.http");
+        assertThat((List<String>) policy.memory().metadata().get("mergedSourceRefs"))
+            .contains("execution-policy-merge-1", "policy-validation-merge-2");
+        assertThat((List<String>) policy.memory().metadata().get("mergedSourceTypes"))
+            .contains("EXECUTION_RESULT", "OBSERVATION");
+        assertThat((List<String>) policy.memory().metadata().get("evidenceSummaries"))
+            .anySatisfy(summary -> assertThat(summary).contains("Payment timeout"))
+            .anySatisfy(summary -> assertThat(summary).contains("Policy rejected"));
+        assertThat(policy.memory().embedding()).hasSize(1024);
+        assertThat(policy.memory().embedding()).isNotEqualTo(executionEmbedding);
+    }
+
+    @Test
+    void mergesHumanFeedbackPreferencesAndKeepsScoreBounds() {
+        var first = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "User prefers compact retry assertions",
+            "Prefer compact timeout and retry assertions in generated payment tests.",
+            MemorySourceType.USER_FEEDBACK,
+            "human-feedback-merge-1",
+            "task-phase7-05-human-1",
+            List.of("human-feedback", "payment", "retry"),
+            0.86f,
+            "Reviewer promoted the compact retry assertion pattern.",
+            Map.of("module", "payment", "decisionType", "PROMOTE_DRAFT")
+        ));
+
+        MemoryRefineryResult latest = first;
+        for (int index = 2; index <= 8; index++) {
+            latest = memoryRefineryService.refine(new MemoryCandidateRequest(
+                "User prefers compact retry assertions",
+                "Prefer compact timeout and retry assertions for payment tests.",
+                MemorySourceType.USER_FEEDBACK,
+                "human-feedback-merge-" + index,
+                "task-phase7-05-human-" + index,
+                List.of("human-feedback", "payment", "retry"),
+                0.90f,
+                "Reviewer repeated the same compact retry assertion preference.",
+                Map.of("module", "payment", "decisionType", "PROMOTE_DRAFT")
+            ));
+        }
+
+        assertThat(latest.created()).isFalse();
+        assertThat(latest.memory().memoryId()).isEqualTo(first.memory().memoryId());
+        assertThat(latest.memory().confidence()).isGreaterThan(first.memory().confidence()).isLessThanOrEqualTo(0.95f);
+        assertThat(latest.memory().importance()).isGreaterThan(first.memory().importance()).isLessThanOrEqualTo(0.97f);
+        assertThat(latest.memory().successContribution()).isGreaterThan(first.memory().successContribution()).isLessThanOrEqualTo(0.85f);
+        assertThat(latest.memory().metadata())
+            .containsEntry("mergeCount", 8)
+            .containsEntry("evidenceCount", 8);
+        assertThat((List<String>) latest.memory().metadata().get("mergedSourceRefs"))
+            .contains("human-feedback-merge-1", "human-feedback-merge-8");
     }
 
     @Test

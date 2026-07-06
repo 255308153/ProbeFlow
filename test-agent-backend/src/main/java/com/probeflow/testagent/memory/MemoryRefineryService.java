@@ -54,6 +54,9 @@ public class MemoryRefineryService {
 
         var existing = findMergeCandidate(scopeType, summary, content, fullContent, tags, normalized, metadata);
         if (existing.isPresent()) {
+            if (sameSource(existing.get(), normalized)) {
+                return new MemoryRefineryResult(true, false, true, null, toView(existing.get()));
+            }
             var merged = mergeIntoExisting(
                 existing.get(),
                 normalized,
@@ -158,13 +161,21 @@ public class MemoryRefineryService {
         return longTermMemories.findAllByStatusOrderByCreatedAtAscMemoryIdAsc(MemoryStatus.ACTIVE)
             .stream()
             .filter(memory -> memory.getScopeType() == scopeType)
-            .filter(memory -> equivalent(memory, scopeType, summary, content, tags, request.sourceType(), request.sourceRef())
+            .filter(memory -> sameSource(memory, request)
+                || equivalent(memory, scopeType, summary, content, tags, request.sourceType(), request.sourceRef())
                 || isSimilarCandidate(memory, summary, content, fullContent, tags, request, metadata))
             .sorted(Comparator
-                .comparing((LongTermMemory memory) -> !equivalent(memory, scopeType, summary, content, tags, request.sourceType(), request.sourceRef()))
+                .comparing((LongTermMemory memory) -> !sameSource(memory, request))
+                .thenComparing(memory -> !equivalent(memory, scopeType, summary, content, tags, request.sourceType(), request.sourceRef()))
                 .thenComparing(LongTermMemory::getCreatedAt)
                 .thenComparing(LongTermMemory::getMemoryId))
             .findFirst();
+    }
+
+    private boolean sameSource(LongTermMemory memory, MemoryCandidateRequest request) {
+        return memory.getSourceType() == request.sourceType()
+            && StringUtils.hasText(memory.getSourceRef())
+            && Objects.equals(memory.getSourceRef(), request.sourceRef());
     }
 
     private LongTermMemory mergeIntoExisting(
@@ -184,15 +195,11 @@ public class MemoryRefineryService {
         existing.setContent(preferLonger(existing.getContent(), content, CONTENT_LIMIT));
         existing.setFullContent(mergeEvidence(existing.getFullContent(), fullContent));
         existing.setTags(mergeTags(existing.getTags(), tags));
-        existing.setConfidence(Math.max(existing.getConfidence(), confidence));
-        existing.setImportance(Math.max(existing.getImportance(), importance));
-        existing.setSuccessContribution(clamp(
-            Math.max(existing.getSuccessContribution(), successContribution) + 0.02f,
-            0.25f,
-            0.85f
-        ));
+        existing.setConfidence(reinforcedConfidence(existing, request, tags, metadata, confidence));
+        existing.setImportance(reinforcedImportance(existing, request, tags, metadata, importance));
+        existing.setSuccessContribution(reinforcedSuccessContribution(existing, request, tags, metadata, successContribution));
         existing.setHitCount(existing.getHitCount() + 1);
-        existing.setMetadata(mergeMetadata(existing.getMetadata(), metadata, request.sourceRef()));
+        existing.setMetadata(mergeMetadata(existing, metadata, request));
         existing.setEmbedding(embeddingService.embedDocument(existing.getSummary() + "\n" + existing.getContent()));
         return longTermMemories.save(existing);
     }
@@ -206,10 +213,6 @@ public class MemoryRefineryService {
         MemoryCandidateRequest request,
         Map<String, Object> metadata
     ) {
-        if (memory.getSourceType() != request.sourceType()) {
-            return false;
-        }
-
         var tagOverlap = overlapCount(memory.getTags(), tags);
         var metadataHintMatch = sharesMetadataHint(memory.getMetadata(), metadata);
         var textSimilarity = Math.max(
@@ -240,6 +243,8 @@ public class MemoryRefineryService {
         return metadataHintEquals(left, right, "errorCode")
             || metadataHintEquals(left, right, "apiPath")
             || metadataHintEquals(left, right, "module")
+            || metadataHintEquals(left, right, "policyReason")
+            || metadataHintEquals(left, right, "toolName")
             || metadataHintEquals(left, right, "taskId");
     }
 
@@ -309,11 +314,95 @@ public class MemoryRefineryService {
         return merged.stream().sorted().toList();
     }
 
-    private Map<String, Object> mergeMetadata(
-        Map<String, Object> existing,
-        Map<String, Object> incoming,
-        String sourceRef
+    private float reinforcedConfidence(
+        LongTermMemory existing,
+        MemoryCandidateRequest request,
+        List<String> incomingTags,
+        Map<String, Object> incomingMetadata,
+        float incomingConfidence
     ) {
+        var base = Math.max(existing.getConfidence(), incomingConfidence);
+        var bonus = 0.025f;
+        if (isHumanConfirmed(request, incomingTags, incomingMetadata)) {
+            bonus += 0.035f;
+        }
+        if (isRisky(incomingTags, incomingMetadata)) {
+            bonus += 0.025f;
+        }
+        if (sharesMetadataHint(existing.getMetadata(), incomingMetadata)) {
+            bonus += 0.015f;
+        }
+        return clamp(base + bonus, 0.55f, 0.95f);
+    }
+
+    private float reinforcedImportance(
+        LongTermMemory existing,
+        MemoryCandidateRequest request,
+        List<String> incomingTags,
+        Map<String, Object> incomingMetadata,
+        float incomingImportance
+    ) {
+        var base = Math.max(existing.getImportance(), incomingImportance);
+        var bonus = 0.02f;
+        if (isRisky(incomingTags, incomingMetadata)) {
+            bonus += 0.04f;
+        }
+        if (isHumanConfirmed(request, incomingTags, incomingMetadata)) {
+            bonus += 0.025f;
+        }
+        if (incomingMetadata.containsKey("apiPath") || incomingMetadata.containsKey("module") || incomingMetadata.containsKey("systemName")) {
+            bonus += 0.015f;
+        }
+        return clamp(base + bonus, 0.50f, 0.97f);
+    }
+
+    private float reinforcedSuccessContribution(
+        LongTermMemory existing,
+        MemoryCandidateRequest request,
+        List<String> incomingTags,
+        Map<String, Object> incomingMetadata,
+        float incomingSuccessContribution
+    ) {
+        var base = Math.max(existing.getSuccessContribution(), incomingSuccessContribution);
+        var bonus = isHumanConfirmed(request, incomingTags, incomingMetadata) ? 0.035f : 0.02f;
+        return clamp(base + bonus, 0.25f, 0.85f);
+    }
+
+    private boolean isHumanConfirmed(
+        MemoryCandidateRequest request,
+        List<String> incomingTags,
+        Map<String, Object> incomingMetadata
+    ) {
+        if (request.sourceType() == MemorySourceType.USER_FEEDBACK) {
+            return true;
+        }
+        var decisionType = metadataValue(incomingMetadata, "decisionType");
+        return incomingTags.contains("human-feedback")
+            || incomingTags.contains("human-approved")
+            || "PROMOTE_DRAFT".equalsIgnoreCase(decisionType)
+            || "REQUEST_CHANGES".equalsIgnoreCase(decisionType)
+            || "PROVIDE_INPUT".equalsIgnoreCase(decisionType);
+    }
+
+    private boolean isRisky(List<String> incomingTags, Map<String, Object> incomingMetadata) {
+        var riskLevel = metadataValue(incomingMetadata, "riskLevel");
+        return incomingTags.contains("high")
+            || incomingTags.contains("critical")
+            || "HIGH".equalsIgnoreCase(riskLevel)
+            || "CRITICAL".equalsIgnoreCase(riskLevel);
+    }
+
+    private String metadataValue(Map<String, Object> metadata, String key) {
+        var value = metadata.get(key);
+        return value == null ? "" : value.toString().trim();
+    }
+
+    private Map<String, Object> mergeMetadata(
+        LongTermMemory existingMemory,
+        Map<String, Object> incoming,
+        MemoryCandidateRequest request
+    ) {
+        var existing = existingMemory.getMetadata();
         var merged = new TreeMap<String, Object>();
         merged.putAll(existing);
         incoming.forEach(merged::putIfAbsent);
@@ -323,10 +412,29 @@ public class MemoryRefineryService {
 
         var sourceRefs = new LinkedHashSet<String>();
         collectSourceRefs(sourceRefs, existing.get("mergedSourceRefs"));
+        collectSourceRefs(sourceRefs, existingMemory.getSourceRef());
         collectSourceRefs(sourceRefs, existing.get("sourceRef"));
-        collectSourceRefs(sourceRefs, sourceRef);
+        collectSourceRefs(sourceRefs, incoming.get("sourceRef"));
+        collectSourceRefs(sourceRefs, request.sourceRef());
         if (!sourceRefs.isEmpty()) {
             merged.put("mergedSourceRefs", List.copyOf(sourceRefs));
+        }
+
+        var sourceTypes = new LinkedHashSet<String>();
+        collectSourceRefs(sourceTypes, existing.get("mergedSourceTypes"));
+        collectSourceRefs(sourceTypes, existingMemory.getSourceType().name());
+        collectSourceRefs(sourceTypes, request.sourceType().name());
+        if (!sourceTypes.isEmpty()) {
+            merged.put("mergedSourceTypes", List.copyOf(sourceTypes));
+        }
+
+        var evidenceSummaries = new LinkedHashSet<String>();
+        collectSourceRefs(evidenceSummaries, existing.get("evidenceSummaries"));
+        collectSourceRefs(evidenceSummaries, existingMemory.getSummary());
+        collectSourceRefs(evidenceSummaries, incoming.get("summary"));
+        collectSourceRefs(evidenceSummaries, request.summary());
+        if (!evidenceSummaries.isEmpty()) {
+            merged.put("evidenceSummaries", List.copyOf(evidenceSummaries));
         }
         return new LinkedHashMap<>(merged);
     }
@@ -445,6 +553,10 @@ public class MemoryRefineryService {
         metadata.put("scopeType", scopeType.name());
         metadata.put("evidenceCount", 1);
         metadata.put("mergeCount", 1);
+        metadata.put("mergedSourceTypes", List.of(request.sourceType().name()));
+        if (StringUtils.hasText(request.summary())) {
+            metadata.put("evidenceSummaries", List.of(request.summary()));
+        }
         if (request.sourceRef() != null) {
             metadata.put("sourceRef", request.sourceRef());
             metadata.put("mergedSourceRefs", List.of(request.sourceRef()));
