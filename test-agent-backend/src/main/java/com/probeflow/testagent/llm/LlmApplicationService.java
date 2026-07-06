@@ -22,17 +22,20 @@ public class LlmApplicationService {
     private final List<LlmProvider> providers;
     private final LlmCallLogRepository logs;
     private final LlmPolicy policy;
+    private final LlmAuditSanitizer auditSanitizer;
 
     public LlmApplicationService(
         PromptTemplateRegistry templates,
         List<LlmProvider> providers,
         LlmCallLogRepository logs,
-        LlmPolicy policy
+        LlmPolicy policy,
+        LlmAuditSanitizer auditSanitizer
     ) {
         this.templates = templates;
         this.providers = providers == null ? List.of() : List.copyOf(providers);
         this.logs = logs;
         this.policy = policy;
+        this.auditSanitizer = auditSanitizer;
     }
 
     @Transactional
@@ -140,13 +143,13 @@ public class LlmApplicationService {
         log.setRequestHash(requestHash);
         log.setStatus(result.status());
         log.setErrorType(result.errorType());
-        log.setErrorMessage(result.errorMessage());
+        log.setErrorMessage(auditSanitizer.errorMessage(result.errorMessage()));
         log.setLatencyMs(latencyMs);
         log.setPromptTokens(tokenUsage.promptTokens());
         log.setCompletionTokens(tokenUsage.completionTokens());
         log.setTotalTokens(tokenUsage.totalTokens());
-        log.setPromptSummary(render.renderedPrompt());
-        log.setResponseSummary(response == null ? null : response.text());
+        log.setPromptSummary(auditSanitizer.promptSummary(render.renderedPrompt()));
+        log.setResponseSummary(response == null ? null : auditSanitizer.responseSummary(response.text()));
         log.setProviderTraceId(response == null ? null : response.providerTraceId());
         log.setFakeProvider(result.fakeProvider());
         log.setMetadata(logMetadata(request, render, providerName));

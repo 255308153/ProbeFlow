@@ -188,4 +188,108 @@ class LlmApplicationServiceTests {
             .containsEntry("timeoutMs", 2_000)
             .containsEntry("retryAttempts", 1);
     }
+
+    @Test
+    void auditLogRedactsApiKeysAndSensitiveHeadersFromPromptAndResponseSummaries() {
+        when(provider.providerName()).thenReturn("fake");
+        when(provider.generate(any())).thenReturn(new LlmResponse(
+            "fake",
+            "fake-model",
+            "Authorization: Bearer response-secret\nx-api-key: response-key\nsafe response",
+            LlmTokenUsage.of(4, 6),
+            "trace-redacted",
+            true,
+            Map.of()
+        ));
+
+        var result = llm.call(LlmCallRequest.forTemplate(
+            "task-llm-redact",
+            "step-llm-redact",
+            "v2.failure-insight.v1",
+            Map.of(
+                "taskId", "task-llm-redact",
+                "evidence", "Authorization: Bearer prompt-secret\nX-API-Key: prompt-key\napi_key=prompt-key-2"
+            ),
+            "fake",
+            "fake-model"
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var log = logs.findById(result.llmCallId()).orElseThrow();
+        assertThat(log.getPromptSummary())
+            .doesNotContain("prompt-secret")
+            .doesNotContain("prompt-key")
+            .contains("[REDACTED]");
+        assertThat(log.getResponseSummary())
+            .doesNotContain("response-secret")
+            .doesNotContain("response-key")
+            .contains("[REDACTED]");
+    }
+
+    @Test
+    void auditLogTruncatesLongPromptAndResponseSummariesAfterSanitizing() {
+        when(provider.providerName()).thenReturn("fake");
+        when(provider.generate(any())).thenReturn(new LlmResponse(
+            "fake",
+            "fake-model",
+            "Authorization: Bearer response-secret\n" + "response ".repeat(600),
+            LlmTokenUsage.of(500, 600),
+            "trace-truncated",
+            true,
+            Map.of()
+        ));
+
+        var result = llm.call(LlmCallRequest.forTemplate(
+            "task-llm-truncate",
+            "step-llm-truncate",
+            "v2.failure-insight.v1",
+            Map.of(
+                "taskId", "task-llm-truncate",
+                "evidence", "apiKey=prompt-secret " + "evidence ".repeat(600)
+            ),
+            "fake",
+            "fake-model"
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var log = logs.findById(result.llmCallId()).orElseThrow();
+        assertThat(log.getPromptSummary())
+            .hasSizeLessThanOrEqualTo(LlmAuditSanitizer.MAX_PROMPT_SUMMARY_LENGTH)
+            .contains("[TRUNCATED")
+            .doesNotContain("prompt-secret");
+        assertThat(log.getResponseSummary())
+            .hasSizeLessThanOrEqualTo(LlmAuditSanitizer.MAX_RESPONSE_SUMMARY_LENGTH)
+            .contains("[TRUNCATED")
+            .doesNotContain("response-secret");
+    }
+
+    @Test
+    void requestHashIsStableForEquivalentRequests() {
+        when(provider.providerName()).thenReturn("fake");
+        when(provider.generate(any())).thenReturn(new LlmResponse(
+            "fake",
+            "fake-model",
+            "stable hash response",
+            LlmTokenUsage.of(3, 3),
+            "trace-stable",
+            true,
+            Map.of()
+        ));
+        var request = LlmCallRequest.forTemplate(
+            "task-llm-hash",
+            "step-llm-hash",
+            "v2.report-narrative.v1",
+            Map.of("taskId", "task-llm-hash", "summary", "failed=1 passed=3"),
+            "fake",
+            "fake-model"
+        );
+
+        var first = llm.call(request);
+        var second = llm.call(request);
+
+        assertThat(first.requestHash()).isEqualTo(second.requestHash());
+        assertThat(first.requestHash()).hasSize(64);
+    }
 }
