@@ -73,6 +73,113 @@ public class AgentPolicyService {
         return ToolPolicyDecision.allowed(toolName, "Tool is allowed by current AgentPolicy: " + toolName);
     }
 
+    public ToolPolicyDecision evaluate(ToolPolicyEvaluationRequest request) {
+        if (request == null) {
+            throw new IllegalArgumentException("tool policy evaluation request is required");
+        }
+        var policyDecision = evaluateContractPolicy(request.toolName(), request.policy());
+        if (!policyDecision.allowed()) {
+            return policyDecision;
+        }
+        var contract = registry.find(request.toolName()).orElseThrow();
+        var inputDecision = validateInput(contract, request.input());
+        if (inputDecision != null) {
+            return inputDecision;
+        }
+        var preconditionDecision = validatePreconditions(contract, request.satisfiedPreconditions());
+        if (preconditionDecision != null) {
+            return preconditionDecision;
+        }
+        return evaluate(request.toolName(), request.policy());
+    }
+
+    private ToolPolicyDecision evaluateContractPolicy(ToolName toolName, AgentPolicy policy) {
+        var effectivePolicy = policy == null ? AgentPolicy.v2Phase2Default() : policy;
+        var contract = registry.find(toolName);
+        if (contract.isEmpty()) {
+            return ToolPolicyDecision.blocked(toolName, ToolPolicyReasonCode.UNKNOWN_TOOL, "Unknown tool: " + toolName);
+        }
+        if (!effectivePolicy.isWhitelisted(toolName)) {
+            return ToolPolicyDecision.blocked(
+                toolName,
+                ToolPolicyReasonCode.TOOL_NOT_WHITELISTED,
+                "Tool is not whitelisted by current AgentPolicy: " + toolName
+            );
+        }
+        var tool = contract.orElseThrow();
+        if (!allowedInPhase(tool, effectivePolicy.taskPhase())) {
+            return ToolPolicyDecision.blocked(
+                toolName,
+                ToolPolicyReasonCode.TOOL_NOT_ALLOWED_IN_TASK_PHASE,
+                "Tool " + toolName + " is not allowed in task phase " + effectivePolicy.taskPhase()
+            );
+        }
+        if (tool.executionMode() == ToolExecutionMode.BLOCKED) {
+            return ToolPolicyDecision.blocked(
+                toolName,
+                ToolPolicyReasonCode.TOOL_BLOCKED_BY_CONTRACT,
+                "Tool contract blocks execution: " + toolName
+            );
+        }
+        return ToolPolicyDecision.allowed(toolName, "Tool contract is policy-visible: " + toolName);
+    }
+
+    private ToolPolicyDecision validateInput(ToolContract contract, Map<String, Object> input) {
+        for (var field : contract.inputSchema().fields()) {
+            var value = input.get(field.name());
+            if (field.required() && missing(value)) {
+                return ToolPolicyDecision.blocked(
+                    contract.name(),
+                    ToolPolicyReasonCode.MISSING_REQUIRED_INPUT,
+                    "Missing required input '" + field.name() + "' for tool " + contract.name()
+                );
+            }
+            if (!missing(value) && !typeMatches(value, field.type())) {
+                return ToolPolicyDecision.blocked(
+                    contract.name(),
+                    ToolPolicyReasonCode.INVALID_INPUT_TYPE,
+                    "Invalid input type for '" + field.name() + "': expected " + field.type()
+                );
+            }
+            if (!missing(value) && !field.allowedValues().isEmpty() && !field.allowedValues().contains(String.valueOf(value))) {
+                return ToolPolicyDecision.blocked(
+                    contract.name(),
+                    ToolPolicyReasonCode.INVALID_INPUT_VALUE,
+                    "Invalid input value for '" + field.name() + "': " + value
+                );
+            }
+        }
+        return null;
+    }
+
+    private ToolPolicyDecision validatePreconditions(ToolContract contract, Set<ToolPrecondition> satisfiedPreconditions) {
+        for (var precondition : contract.preconditions()) {
+            if (!satisfiedPreconditions.contains(precondition)) {
+                return ToolPolicyDecision.blocked(
+                    contract.name(),
+                    ToolPolicyReasonCode.MISSING_PRECONDITION,
+                    "Missing precondition " + precondition + " for tool " + contract.name()
+                );
+            }
+        }
+        return null;
+    }
+
+    private boolean missing(Object value) {
+        return value == null || (value instanceof String text && text.isBlank());
+    }
+
+    private boolean typeMatches(Object value, ToolSchemaType type) {
+        return switch (type) {
+            case STRING -> value instanceof String;
+            case INTEGER -> value instanceof Integer || value instanceof Long;
+            case NUMBER -> value instanceof Number;
+            case BOOLEAN -> value instanceof Boolean;
+            case OBJECT -> value instanceof Map<?, ?>;
+            case ARRAY -> value instanceof Iterable<?> || value.getClass().isArray();
+        };
+    }
+
     private boolean allowedInPhase(ToolContract tool, AgentTaskPhase phase) {
         if (phase == null || phase == AgentTaskPhase.ANY) {
             return true;
