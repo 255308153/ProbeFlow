@@ -36,6 +36,28 @@ public record ManualSuiteAgentFixture(
         );
     }
 
+    static ManualSuiteAgentFixture orderSuiteDemo() {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("fixtureType", "order-suite-demo");
+        metadata.put("baseUrl", "https://fixture.local");
+        metadata.put("tenant", "tenant-demo");
+        metadata.put("auth", Map.of(
+            "Authorization", "Bearer order-demo-token",
+            "Cookie", "session=session-cookie-secret"
+        ));
+        metadata.put("businessSteps", List.of("create-order", "pay-order", "query-order"));
+        metadata.put("usesFixtureProvider", true);
+        metadata.put("usesFakeHttpGateway", true);
+        return new ManualSuiteAgentFixture(
+            "order-suite-demo",
+            "2026.07.order.v1",
+            "Order payment suite demo",
+            "Deterministic order create, pay and query fixture for the V3 manual suite harness.",
+            List.of("v3-1", "suite", "order", "fake-http"),
+            metadata
+        );
+    }
+
     ManualSuiteAgentFixtureSummary summary() {
         return new ManualSuiteAgentFixtureSummary(
             fixtureId,

@@ -1,5 +1,6 @@
 package com.probeflow.testagent.manualsuiteagent;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -8,11 +9,11 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
 public class ManualSuiteAgentReportWriter {
 
     private final ObjectMapper objectMapper;
+    private final ManualSuiteAgentRedactor redactor = new ManualSuiteAgentRedactor();
 
     public ManualSuiteAgentReportWriter() {
         this(new ObjectMapper()
@@ -54,10 +55,10 @@ public class ManualSuiteAgentReportWriter {
         report.put("schemaVersion", result.schemaVersion());
         report.put("run", runSummary(result));
         report.put("fixture", fixtureSummary(result));
-        report.put("sections", result.sections());
-        report.put("diagnostics", result.diagnostics());
-        report.put("artifacts", result.artifacts());
-        report.put("metadata", result.metadata());
+        report.put("sections", result.sections().stream().map(this::sectionSummary).toList());
+        report.put("diagnostics", result.diagnostics().stream().map(this::diagnosticSummary).toList());
+        report.put("artifacts", result.artifacts().stream().map(this::artifactSummary).toList());
+        report.put("metadata", redactor.redactMap(result.metadata()));
         return report;
     }
 
@@ -84,8 +85,36 @@ public class ManualSuiteAgentReportWriter {
         fixture.put("displayName", result.fixtureSummary().displayName());
         fixture.put("description", result.fixtureSummary().description());
         fixture.put("capabilityTags", result.fixtureSummary().capabilityTags());
-        fixture.put("metadata", result.fixtureSummary().metadata());
+        fixture.put("metadata", redactor.redactMap(result.fixtureSummary().metadata()));
         return fixture;
+    }
+
+    private Map<String, Object> sectionSummary(ManualSuiteAgentSectionSummary section) {
+        var summary = new LinkedHashMap<String, Object>();
+        summary.put("sectionId", section.sectionId());
+        summary.put("title", section.title());
+        summary.put("source", section.source().name());
+        summary.put("status", section.status());
+        summary.put("summary", redactor.redactMap(section.summary()));
+        return summary;
+    }
+
+    private Map<String, Object> diagnosticSummary(ManualSuiteAgentDiagnostic diagnostic) {
+        var summary = new LinkedHashMap<String, Object>();
+        summary.put("code", diagnostic.code());
+        summary.put("severity", diagnostic.severity());
+        summary.put("message", diagnostic.message());
+        summary.put("metadata", redactor.redactMap(diagnostic.metadata()));
+        return summary;
+    }
+
+    private Map<String, Object> artifactSummary(ManualSuiteAgentArtifactReference artifact) {
+        var summary = new LinkedHashMap<String, Object>();
+        summary.put("artifactType", artifact.artifactType());
+        summary.put("path", artifact.path());
+        summary.put("mediaType", artifact.mediaType());
+        summary.put("metadata", redactor.redactMap(artifact.metadata()));
+        return summary;
     }
 
     private String toMarkdownReport(ManualSuiteAgentRunResult result) {

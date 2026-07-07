@@ -15,7 +15,9 @@ public class ManualSuiteAgentFixtureRegistry {
     public static ManualSuiteAgentFixtureRegistry defaults() {
         var fixtures = new LinkedHashMap<String, ManualSuiteAgentFixture>();
         var smoke = ManualSuiteAgentFixture.smoke();
+        var orderSuiteDemo = ManualSuiteAgentFixture.orderSuiteDemo();
         fixtures.put(smoke.fixtureId(), smoke);
+        fixtures.put(orderSuiteDemo.fixtureId(), orderSuiteDemo);
         return new ManualSuiteAgentFixtureRegistry(fixtures);
     }
 
