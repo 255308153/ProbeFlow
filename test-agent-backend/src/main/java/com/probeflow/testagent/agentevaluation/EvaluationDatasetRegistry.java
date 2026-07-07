@@ -11,6 +11,7 @@ public class EvaluationDatasetRegistry {
     public static final String PLANNER_DATASET = "v2-phase-8-planner";
     public static final String TOOL_POLICY_DATASET = "v2-phase-8-tool-policy";
     public static final String CONTEXT_CITATION_DATASET = "v2-phase-8-context-citation";
+    public static final String FAILURE_CLASSIFICATION_DATASET = "v2-phase-8-failure-classification";
 
     public EvaluationDataset load(String datasetName) {
         var effectiveName = datasetName == null || datasetName.isBlank() ? SMOKE_DATASET : datasetName.trim();
@@ -19,6 +20,7 @@ public class EvaluationDatasetRegistry {
             case PLANNER_DATASET -> plannerDataset();
             case TOOL_POLICY_DATASET -> toolPolicyDataset();
             case CONTEXT_CITATION_DATASET -> contextCitationDataset();
+            case FAILURE_CLASSIFICATION_DATASET -> failureClassificationDataset();
             default -> throw new IllegalArgumentException("Unknown evaluation dataset: " + effectiveName);
         };
     }
@@ -260,6 +262,115 @@ public class EvaluationDatasetRegistry {
             Map.of(ContextCitationUsefulnessEvaluator.METRIC_NAME, 0.8d),
             Map.of(ContextCitationUsefulnessEvaluator.METRIC_NAME, 2.0d),
             Map.of()
+        );
+    }
+
+    private EvaluationDataset failureClassificationDataset() {
+        return new EvaluationDataset(
+            FAILURE_CLASSIFICATION_DATASET,
+            "2026-07-07",
+            List.of(
+                failureFixture(
+                    "failure-auth-401",
+                    Map.of(
+                        "overallStatus", "FAILED",
+                        "statusCode", 401,
+                        "requestPath", "/api/orders/pay",
+                        "criticalFailed", false
+                    ),
+                    Map.of(
+                        "classification", "AUTH_ISSUE",
+                        "failureReasonContains", "AUTH_ISSUE",
+                        "riskLevel", "MEDIUM",
+                        "nextSuggestionContains", "Inspect auth variables",
+                        "memoryCandidatePresent", true
+                    )
+                ),
+                failureFixture(
+                    "failure-validation-422",
+                    Map.of(
+                        "overallStatus", "FAILED",
+                        "statusCode", 422,
+                        "requestPath", "/api/orders",
+                        "criticalFailed", false
+                    ),
+                    Map.of(
+                        "classification", "VALIDATION_ISSUE",
+                        "failureReasonContains", "VALIDATION_ISSUE",
+                        "riskLevel", "LOW",
+                        "nextSuggestionContains", "Review request data",
+                        "memoryCandidatePresent", true
+                    )
+                ),
+                failureFixture(
+                    "failure-environment-missing",
+                    Map.of(
+                        "overallStatus", "BLOCKED",
+                        "requestPath", "/api/orders",
+                        "responseSnapshot", Map.of("errorType", "INVALID_REQUEST"),
+                        "errorMessage", "Unresolved variable ${baseUrl}",
+                        "criticalFailed", false
+                    ),
+                    Map.of(
+                        "classification", "ENVIRONMENT_ISSUE",
+                        "failureReasonContains", "Unresolved variable",
+                        "riskLevel", "MEDIUM",
+                        "nextSuggestionContains", "Inspect environment variables",
+                        "memoryCandidatePresent", true
+                    )
+                ),
+                failureFixture(
+                    "failure-server-503",
+                    Map.of(
+                        "overallStatus", "FAILED",
+                        "statusCode", 503,
+                        "requestPath", "/api/orders/pay",
+                        "criticalFailed", false
+                    ),
+                    Map.of(
+                        "classification", "SERVER_ERROR",
+                        "failureReasonContains", "SERVER_ERROR",
+                        "riskLevel", "HIGH",
+                        "nextSuggestionContains", "Retry once",
+                        "memoryCandidatePresent", true
+                    )
+                ),
+                failureFixture(
+                    "failure-high-value-memory-candidate",
+                    Map.of(
+                        "overallStatus", "FAILED",
+                        "statusCode", 503,
+                        "requestPath", "/api/payments/capture",
+                        "durationMs", 2500,
+                        "criticalFailed", true
+                    ),
+                    Map.of(
+                        "classification", "SERVER_ERROR",
+                        "riskLevel", "HIGH",
+                        "nextSuggestionContains", "investigate API regression",
+                        "memoryCandidatePresent", true
+                    )
+                )
+            ),
+            0.8d,
+            Map.of(FailureClassificationAccuracyEvaluator.METRIC_NAME, 0.8d),
+            Map.of(FailureClassificationAccuracyEvaluator.METRIC_NAME, 2.0d),
+            Map.of()
+        );
+    }
+
+    private GoldenTaskFixture failureFixture(
+        String fixtureId,
+        Map<String, Object> setup,
+        Map<String, Object> expected
+    ) {
+        return new GoldenTaskFixture(
+            fixtureId,
+            List.of("failure-classification"),
+            "Evaluate FailureAnalysis classification and recovery suggestion for " + fixtureId + ".",
+            EvaluationFixtureType.FAILURE_CLASSIFICATION,
+            expected,
+            setup
         );
     }
 }
