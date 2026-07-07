@@ -213,6 +213,9 @@ public class MemoryRefineryService {
         MemoryCandidateRequest request,
         Map<String, Object> metadata
     ) {
+        if (hasConflictingIdentityHint(memory.getMetadata(), metadata)) {
+            return false;
+        }
         var tagOverlap = overlapCount(memory.getTags(), tags);
         var metadataHintMatch = sharesMetadataHint(memory.getMetadata(), metadata);
         var textSimilarity = Math.max(
@@ -226,6 +229,24 @@ public class MemoryRefineryService {
             || (metadataHintMatch && tagOverlap >= 1)
             || (metadataHintMatch && textSimilarity >= 0.30d)
             || (tagOverlap >= 2 && textSimilarity >= 0.45d);
+    }
+
+    private boolean hasConflictingIdentityHint(Map<String, Object> left, Map<String, Object> right) {
+        return metadataHintConflicts(left, right, "systemName")
+            || metadataHintConflicts(left, right, "module")
+            || metadataHintConflicts(left, right, "apiPath")
+            || metadataHintConflicts(left, right, "errorCode");
+    }
+
+    private boolean metadataHintConflicts(Map<String, Object> left, Map<String, Object> right, String key) {
+        if (!left.containsKey(key) || !right.containsKey(key)) {
+            return false;
+        }
+        var leftValue = String.valueOf(left.get(key)).trim();
+        var rightValue = String.valueOf(right.get(key)).trim();
+        return StringUtils.hasText(leftValue)
+            && StringUtils.hasText(rightValue)
+            && !leftValue.equalsIgnoreCase(rightValue);
     }
 
     private int overlapCount(List<String> left, List<String> right) {

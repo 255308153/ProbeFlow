@@ -355,6 +355,47 @@ class MemoryRefineryServiceTests {
     }
 
     @Test
+    void doesNotMergeSimilarCandidatesWhenStructuredIdentityConflicts() {
+        var first = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Payment auth failed when tenant bootstrap was skipped",
+            "Payment auth failed because tenant bootstrap was skipped before the request.",
+            MemorySourceType.EXECUTION_RESULT,
+            "execution-identity-conflict-a",
+            "task-identity-conflict-a",
+            List.of("payment", "auth", "tenant", "phase8"),
+            0.88f,
+            "Execution showed MR_ALPHA disappears after tenant bootstrap is restored.",
+            Map.of(
+                "systemName", "order-platform",
+                "module", "payment-alpha",
+                "apiPath", "/api/phase8/alpha/pay",
+                "errorCode", "MR_ALPHA"
+            )
+        ));
+        var second = memoryRefineryService.refine(new MemoryCandidateRequest(
+            "Payment auth failed when tenant bootstrap was skipped",
+            "Payment auth failed because tenant bootstrap was skipped before the request.",
+            MemorySourceType.EXECUTION_RESULT,
+            "execution-identity-conflict-b",
+            "task-identity-conflict-b",
+            List.of("payment", "auth", "tenant", "phase8"),
+            0.89f,
+            "Execution showed MR_BRAVO disappears after tenant bootstrap is restored.",
+            Map.of(
+                "systemName", "order-platform",
+                "module", "payment-bravo",
+                "apiPath", "/api/phase8/bravo/pay",
+                "errorCode", "MR_BRAVO"
+            )
+        ));
+
+        assertThat(first.created()).isTrue();
+        assertThat(second.created()).isTrue();
+        assertThat(second.memory().memoryId()).isNotEqualTo(first.memory().memoryId());
+        assertThat(second.memory().metadata()).containsEntry("errorCode", "MR_BRAVO");
+    }
+
+    @Test
     void doesNotReviveArchivedOrInactiveMemoriesSilently() {
         var archived = memoryRefineryService.refine(new MemoryCandidateRequest(
             "Gateway timeout retry guidance",

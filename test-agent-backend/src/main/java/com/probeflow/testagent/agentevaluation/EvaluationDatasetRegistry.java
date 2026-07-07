@@ -14,6 +14,7 @@ public class EvaluationDatasetRegistry {
     public static final String FAILURE_CLASSIFICATION_DATASET = "v2-phase-8-failure-classification";
     public static final String CASE_COVERAGE_DATASET = "v2-phase-8-case-coverage";
     public static final String REPORT_USEFULNESS_DATASET = "v2-phase-8-report-usefulness";
+    public static final String MEMORY_REUSE_DATASET = "v2-phase-8-memory-reuse";
 
     public EvaluationDataset load(String datasetName) {
         var effectiveName = datasetName == null || datasetName.isBlank() ? SMOKE_DATASET : datasetName.trim();
@@ -25,6 +26,7 @@ public class EvaluationDatasetRegistry {
             case FAILURE_CLASSIFICATION_DATASET -> failureClassificationDataset();
             case CASE_COVERAGE_DATASET -> caseCoverageDataset();
             case REPORT_USEFULNESS_DATASET -> reportUsefulnessDataset();
+            case MEMORY_REUSE_DATASET -> memoryReuseDataset();
             default -> throw new IllegalArgumentException("Unknown evaluation dataset: " + effectiveName);
         };
     }
@@ -498,6 +500,49 @@ public class EvaluationDatasetRegistry {
             List.of("report-usefulness"),
             "Evaluate generated report usefulness and no-secret safety for " + fixtureId + ".",
             EvaluationFixtureType.REPORT_USEFULNESS,
+            expected,
+            setup
+        );
+    }
+
+    private EvaluationDataset memoryReuseDataset() {
+        return new EvaluationDataset(
+            MEMORY_REUSE_DATASET,
+            "2026-07-07",
+            List.of(memoryReuseFixture(
+                "memory-reuse-payment-auth-loop",
+                Map.of(
+                    "systemName", "order-platform",
+                    "moduleName", "payment"
+                ),
+                Map.of(
+                    "expectedFirstStageLearning", true,
+                    "expectedRepeatedFailureMerge", true,
+                    "expectedRecall", true,
+                    "expectedCitation", true,
+                    "expectedUsageRecord", true,
+                    "expectedPositiveFeedbackIncrease", true,
+                    "expectedNegativeFeedbackDecrease", true,
+                    "expectedConsumer", "AGENT_EVALUATION"
+                )
+            )),
+            0.8d,
+            Map.of(MemoryReuseClosedLoopEvaluator.METRIC_NAME, 0.8d),
+            Map.of(MemoryReuseClosedLoopEvaluator.METRIC_NAME, 2.0d),
+            Map.of("memory-reuse-payment-auth-loop", 0.8d)
+        );
+    }
+
+    private GoldenTaskFixture memoryReuseFixture(
+        String fixtureId,
+        Map<String, Object> setup,
+        Map<String, Object> expected
+    ) {
+        return new GoldenTaskFixture(
+            fixtureId,
+            List.of("memory-reuse"),
+            "Evaluate two-stage long-term memory learning, recall, usage audit and usefulness feedback.",
+            EvaluationFixtureType.MEMORY_REUSE,
             expected,
             setup
         );
