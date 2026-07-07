@@ -124,6 +124,7 @@ public class ManualSuiteAgentHarness {
             "READY",
             testCaseSummary(testCase)
         ));
+        sections.addAll(v3StagedSections(request, fixture, testCase));
         sections.add(new ManualSuiteAgentSectionSummary(
             "execution-result",
             "Fake HTTP execution summary",
@@ -132,6 +133,109 @@ public class ManualSuiteAgentHarness {
             executionSummary
         ));
         return new OrderFixtureRun(sections, metadata);
+    }
+
+    private List<ManualSuiteAgentSectionSummary> v3StagedSections(
+        ManualSuiteAgentRunRequest request,
+        ManualSuiteAgentFixture fixture,
+        TestCase testCase
+    ) {
+        return List.of(
+            new ManualSuiteAgentSectionSummary(
+                "generated-suite-draft",
+                "Generated suite draft summary",
+                ManualSuiteAgentSectionSource.FIXTURE,
+                "READY",
+                orderedMap(
+                    "sourceMarker", "fixture",
+                    "phaseNote", "Fixture-provided suite draft awaits V3-2/V3-3 Business Flow Discovery and DependencyLinker.",
+                    "scenarioName", testCase.getScenarioName(),
+                    "steps", testCase.getSteps().stream()
+                        .map(step -> orderedMap(
+                            "order", step.get("order"),
+                            "stepName", step.get("stepName"),
+                            "critical", step.get("critical"),
+                            "sourceRefs", List.of(step.get("apiSpecId")),
+                            "sourceMarker", "fixture"
+                        ))
+                        .toList()
+                )
+            ),
+            new ManualSuiteAgentSectionSummary(
+                "variable-audit",
+                "Variable audit integration slot",
+                ManualSuiteAgentSectionSource.PENDING_RUNTIME,
+                "PENDING_RUNTIME",
+                orderedMap(
+                    "sourceMarker", "pending-runtime",
+                    "phaseNote", "Variable producer and consumer audit awaits V3-4 ExecutionContext runtime.",
+                    "producer", "create-order.response.body.orderId",
+                    "consumer", "pay-order.request.path.orderId",
+                    "targetScope", "suite",
+                    "targetKey", "orderId",
+                    "auditEvents", List.of(
+                        orderedMap(
+                            "producer", "create-order",
+                            "consumer", "pay-order",
+                            "targetScope", "suite",
+                            "targetKey", "orderId",
+                            "eventSummary", "orderId will be extracted from create response and consumed by payment step"
+                        ),
+                        orderedMap(
+                            "producer", "pay-order",
+                            "consumer", "query-order",
+                            "targetScope", "suite",
+                            "targetKey", "paymentId",
+                            "eventSummary", "paymentId will be available for downstream analysis and reporting"
+                        )
+                    )
+                )
+            ),
+            new ManualSuiteAgentSectionSummary(
+                "failure-analysis",
+                "Suite failure analysis integration slot",
+                ManualSuiteAgentSectionSource.STAGED,
+                "STAGED",
+                orderedMap(
+                    "sourceMarker", "staged",
+                    "phaseNote", "Suite failure analysis slot awaits V3-5.",
+                    "rootStep", "pay-order",
+                    "affectedSteps", List.of("query-order"),
+                    "failureType", "STAGED_SUITE_FAILURE_SLOT",
+                    "evidence", List.of("fake-http happy path passed; staged failure slot kept for downstream phase replacement"),
+                    "nextSuggestion", "Replace this staged summary with V3-5 Suite Failure Analysis output."
+                )
+            ),
+            new ManualSuiteAgentSectionSummary(
+                "memory-feedback",
+                "Memory feedback summary integration slot",
+                ManualSuiteAgentSectionSource.STAGED,
+                "STAGED",
+                orderedMap(
+                    "sourceMarker", "staged",
+                    "phaseNote", "Memory feedback slot awaits V3-6.",
+                    "candidateCount", 1,
+                    "sourceType", "FIXTURE_EXECUTION_SUMMARY",
+                    "tags", List.of("order-suite", "fake-http", "happy-path"),
+                    "confidence", "0.80",
+                    "learningNote", "Successful order payment chains should query final order status after payment."
+                )
+            ),
+            new ManualSuiteAgentSectionSummary(
+                "evaluation-comparison",
+                "Agent evaluation comparison integration slot",
+                ManualSuiteAgentSectionSource.NOT_RUN,
+                "NOT_RUN",
+                orderedMap(
+                    "sourceMarker", "not-run",
+                    "phaseNote", "V3 Agent Evaluation comparison awaits V3-6 and remains non-required for default CI.",
+                    "providerMode", request.providerMode().name(),
+                    "fixtureId", fixture.fixtureId(),
+                    "capabilityTags", fixture.capabilityTags(),
+                    "expectedMarkers", List.of("suite-draft-present", "fake-http-passed", "no-external-llm", "no-external-http")
+                )
+            )
+        );
     }
 
     private List<ApiSpec> orderApiSpecs() {

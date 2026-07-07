@@ -145,6 +145,10 @@ public class ManualSuiteAgentReportWriter {
                 .append("): ")
                 .append(section.title())
                 .append("\n");
+            var phaseNote = section.summary().get("phaseNote");
+            if (phaseNote != null) {
+                markdown.append("  - Note: ").append(phaseNote).append("\n");
+            }
         }
         markdown.append("\n");
 
