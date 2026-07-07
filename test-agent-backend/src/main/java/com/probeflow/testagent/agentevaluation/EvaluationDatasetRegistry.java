@@ -12,6 +12,7 @@ public class EvaluationDatasetRegistry {
     public static final String TOOL_POLICY_DATASET = "v2-phase-8-tool-policy";
     public static final String CONTEXT_CITATION_DATASET = "v2-phase-8-context-citation";
     public static final String FAILURE_CLASSIFICATION_DATASET = "v2-phase-8-failure-classification";
+    public static final String CASE_COVERAGE_DATASET = "v2-phase-8-case-coverage";
 
     public EvaluationDataset load(String datasetName) {
         var effectiveName = datasetName == null || datasetName.isBlank() ? SMOKE_DATASET : datasetName.trim();
@@ -21,6 +22,7 @@ public class EvaluationDatasetRegistry {
             case TOOL_POLICY_DATASET -> toolPolicyDataset();
             case CONTEXT_CITATION_DATASET -> contextCitationDataset();
             case FAILURE_CLASSIFICATION_DATASET -> failureClassificationDataset();
+            case CASE_COVERAGE_DATASET -> caseCoverageDataset();
             default -> throw new IllegalArgumentException("Unknown evaluation dataset: " + effectiveName);
         };
     }
@@ -369,6 +371,82 @@ public class EvaluationDatasetRegistry {
             List.of("failure-classification"),
             "Evaluate FailureAnalysis classification and recovery suggestion for " + fixtureId + ".",
             EvaluationFixtureType.FAILURE_CLASSIFICATION,
+            expected,
+            setup
+        );
+    }
+
+    private EvaluationDataset caseCoverageDataset() {
+        return new EvaluationDataset(
+            CASE_COVERAGE_DATASET,
+            "2026-07-07",
+            List.of(
+                caseCoverageFixture(
+                    "case-coverage-single-order",
+                    Map.of(
+                        "generationMode", "SINGLE",
+                        "scenarioCategories", List.of(
+                            "HAPPY_PATH",
+                            "MISSING_REQUIRED",
+                            "INVALID_VALUE",
+                            "BOUNDARY_VALUE",
+                            "AUTHENTICATION_FAILURE",
+                            "BUSINESS_RULE"
+                        ),
+                        "includeKnowledge", true
+                    ),
+                    Map.of(
+                        "expectedCoverageCategories", List.of(
+                            "happy-path",
+                            "validation-negative",
+                            "auth-negative",
+                            "boundary-value",
+                            "business-rule"
+                        ),
+                        "requiredHappyPathScenario", "HAPPY_PATH",
+                        "requiredValidationNegativeCases", List.of("MISSING_REQUIRED", "INVALID_VALUE"),
+                        "requiredAuthNegativeCases", List.of("AUTHENTICATION_FAILURE"),
+                        "requiredBoundaryValueCases", List.of("BOUNDARY_VALUE"),
+                        "requiredBusinessRuleCases", List.of("BUSINESS_RULE"),
+                        "requireRequestVariationEvidence", true,
+                        "requireAssertionEvidence", true,
+                        "requireScenarioMetadata", true,
+                        "allowedDuplicateCount", 0
+                    )
+                ),
+                caseCoverageFixture(
+                    "case-coverage-suite-flow",
+                    Map.of(
+                        "generationMode", "SUITE",
+                        "scenarioCategories", List.of("BUSINESS_FLOW")
+                    ),
+                    Map.of(
+                        "expectedCoverageCategories", List.of("suite-dependency"),
+                        "requiredSuiteDependencyCoverage", true,
+                        "requireRequestVariationEvidence", true,
+                        "requireAssertionEvidence", true,
+                        "requireScenarioMetadata", true,
+                        "allowedDuplicateCount", 0
+                    )
+                )
+            ),
+            0.8d,
+            Map.of(TestCaseCoverageEvaluator.METRIC_NAME, 0.8d),
+            Map.of(TestCaseCoverageEvaluator.METRIC_NAME, 2.0d),
+            Map.of()
+        );
+    }
+
+    private GoldenTaskFixture caseCoverageFixture(
+        String fixtureId,
+        Map<String, Object> setup,
+        Map<String, Object> expected
+    ) {
+        return new GoldenTaskFixture(
+            fixtureId,
+            List.of("case-coverage"),
+            "Evaluate generated TestCaseDraft coverage for " + fixtureId + ".",
+            EvaluationFixtureType.TEST_CASE_COVERAGE,
             expected,
             setup
         );
