@@ -1031,6 +1031,96 @@ class HttpExecutionApplicationServiceTests {
     }
 
     @Test
+    void suiteExecutionContextExtractsOrderIdAndResolvesDownstreamRequests() {
+        var createOrder = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/orders", 201));
+        var payOrder = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/orders/order-123/pay", 200));
+        var queryOrder = apiSpecs.save(newApiSpec(HttpMethod.GET, "/api/orders/order-123", 200));
+        var task = tasks.save(newTask(List.of(createOrder.getApiSpecId(), payOrder.getApiSpecId(), queryOrder.getApiSpecId())));
+        var suite = testCases.save(newSuiteTestCase(createOrder.getApiSpecId(), List.of(
+            suiteStepWithRuntime(
+                1,
+                "create-order",
+                createOrder.getApiSpecId(),
+                "POST",
+                "/api/orders",
+                201,
+                List.of(Map.of(
+                    "sourceType", "BODY_JSON",
+                    "sourcePath", "$.data.orderId",
+                    "targetScope", "SUITE",
+                    "targetKey", "orderId",
+                    "required", true,
+                    "failureStrategy", "FAIL_FAST"
+                ))
+            ),
+            suiteStepWithRuntime(2, "pay-order", payOrder.getApiSpecId(), "POST", "/api/orders/${suite.orderId}/pay", 200, List.of()),
+            suiteStepWithRuntime(3, "query-order", queryOrder.getApiSpecId(), "GET", "/api/orders/${suite.orderId}", 200, List.of())
+        )));
+        fakeHttpClient.respondWithSequence(
+            new HttpClientResponse(201, Map.of(), Map.of("data", Map.of("orderId", "order-123")), 21L),
+            new HttpClientResponse(200, Map.of(), Map.of("paid", true), 11L),
+            new HttpClientResponse(200, Map.of(), Map.of("orderId", "order-123", "status", "PAID"), 9L)
+        );
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(suite.getCaseId()),
+            ExecutionMode.SUITE_STEP,
+            "test",
+            false,
+            HttpExecutionOptions.defaults(),
+            Map.of("baseUrl", "https://api.example.test"),
+            Map.of("authToken", "secret-token")
+        ));
+
+        assertThat(result.caseResults()).singleElement()
+            .satisfies(caseResult -> assertThat(caseResult.status()).isEqualTo(HttpExecutionOutcomeStatus.PASSED));
+        assertThat(fakeHttpClient.requests()).extracting(HttpClientRequest::path)
+            .containsExactly("/api/orders", "/api/orders/order-123/pay", "/api/orders/order-123");
+        assertThat(fakeHttpClient.requests()).extracting(HttpClientRequest::url)
+            .containsExactly(
+                "https://api.example.test/api/orders",
+                "https://api.example.test/api/orders/order-123/pay",
+                "https://api.example.test/api/orders/order-123"
+            );
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getOverallStatus()).isEqualTo(OverallStatus.PASSED);
+        assertThat(record.getRequestSnapshot()).containsEntry("suite", true);
+
+        @SuppressWarnings("unchecked")
+        var responseSnapshot = record.getResponseSnapshot();
+        @SuppressWarnings("unchecked")
+        var auditSummary = (Map<String, Object>) responseSnapshot.get("variableAuditSummary");
+        assertThat(auditSummary).containsEntry("productionEvents", 1L);
+        assertThat(auditSummary).containsEntry("consumptionEvents", 2L);
+
+        @SuppressWarnings("unchecked")
+        var events = (List<Map<String, Object>>) auditSummary.get("events");
+        assertThat(events)
+            .anySatisfy(event -> assertThat(event)
+                .containsEntry("eventType", "PRODUCTION")
+                .containsEntry("stepId", "create-order")
+                .containsEntry("targetScope", "suite")
+                .containsEntry("targetKey", "orderId"))
+            .anySatisfy(event -> assertThat(event)
+                .containsEntry("eventType", "CONSUMPTION")
+                .containsEntry("stepId", "pay-order")
+                .containsEntry("expression", "${suite.orderId}")
+                .containsEntry("resolved", true))
+            .anySatisfy(event -> assertThat(event)
+                .containsEntry("eventType", "CONSUMPTION")
+                .containsEntry("stepId", "query-order")
+                .containsEntry("expression", "${suite.orderId}")
+                .containsEntry("resolved", true));
+
+        @SuppressWarnings("unchecked")
+        var contextSummary = (Map<String, Object>) responseSnapshot.get("contextSummary");
+        assertThat(contextSummary.toString()).contains("order-123").doesNotContain("secret-token");
+        assertThat(responseSnapshot).containsKey("runtimeDiagnostics");
+    }
+
+    @Test
     void suiteStopsDependentStepsAfterFailedPrerequisiteWhenConfigured() {
         var createOrder = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/orders", 201));
         var readOrder = apiSpecs.save(newApiSpec(HttpMethod.GET, "/api/orders/order-123", 200));
@@ -1214,6 +1304,31 @@ class HttpExecutionApplicationServiceTests {
                 "headers", Map.of("Content-Type", "application/json")
             )
         );
+    }
+
+    private Map<String, Object> suiteStepWithRuntime(
+        int order,
+        String stepId,
+        String apiSpecId,
+        String method,
+        String path,
+        int expectedStatus,
+        List<Map<String, Object>> extractRules
+    ) {
+        var step = new java.util.LinkedHashMap<String, Object>();
+        step.put("order", order);
+        step.put("stepId", stepId);
+        step.put("apiSpecId", apiSpecId);
+        step.put("method", method);
+        step.put("path", path);
+        step.put("expectedStatus", expectedStatus);
+        step.put("requestTemplate", Map.of(
+            "method", method,
+            "path", path,
+            "headers", Map.of("Content-Type", "application/json")
+        ));
+        step.put("extractRules", extractRules);
+        return step;
     }
 
     @TestConfiguration

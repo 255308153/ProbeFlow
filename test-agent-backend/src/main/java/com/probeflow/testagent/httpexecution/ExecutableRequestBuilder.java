@@ -276,6 +276,10 @@ public class ExecutableRequestBuilder {
         return requestShape(testCase, null);
     }
 
+    public Map<String, Object> requestShapeFor(TestCase testCase, Map<String, Object> step) {
+        return requestShape(testCase, step);
+    }
+
     private Map<String, Object> requestShape(TestCase testCase, Map<String, Object> step) {
         if (step != null) {
             var stepShape = objectMap(step.get("requestShape"));

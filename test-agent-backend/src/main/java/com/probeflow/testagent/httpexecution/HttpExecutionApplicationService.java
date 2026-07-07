@@ -10,6 +10,11 @@ import com.probeflow.testagent.memory.MemoryScopeType;
 import com.probeflow.testagent.memory.MemorySourceType;
 import com.probeflow.testagent.memory.TaskMemoryService;
 import com.probeflow.testagent.memory.TaskMemoryWriteRequest;
+import com.probeflow.testagent.suiteruntime.ExecutionContext;
+import com.probeflow.testagent.suiteruntime.ResponseExtractor;
+import com.probeflow.testagent.suiteruntime.RuntimeRedactor;
+import com.probeflow.testagent.suiteruntime.VariableResolver;
+import com.probeflow.testagent.suiteruntime.VariableWriteBackService;
 import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.taskcaseexecution.ExecutionMode;
@@ -43,6 +48,9 @@ public class HttpExecutionApplicationService {
     private final HttpResponseSnapshotFactory responseSnapshotFactory;
     private final BaselineHttpAssertionChecker assertionChecker;
     private final ObjectProvider<TaskMemoryService> taskMemoryServiceProvider;
+    private final VariableResolver variableResolver;
+    private final ResponseExtractor responseExtractor;
+    private final VariableWriteBackService variableWriteBackService;
 
     public HttpExecutionApplicationService(
         TaskRepository tasks,
@@ -54,7 +62,10 @@ public class HttpExecutionApplicationService {
         ExecutableRequestBuilder executableRequestBuilder,
         HttpResponseSnapshotFactory responseSnapshotFactory,
         BaselineHttpAssertionChecker assertionChecker,
-        ObjectProvider<TaskMemoryService> taskMemoryServiceProvider
+        ObjectProvider<TaskMemoryService> taskMemoryServiceProvider,
+        VariableResolver variableResolver,
+        ResponseExtractor responseExtractor,
+        VariableWriteBackService variableWriteBackService
     ) {
         this.tasks = tasks;
         this.testCases = testCases;
@@ -66,6 +77,9 @@ public class HttpExecutionApplicationService {
         this.responseSnapshotFactory = responseSnapshotFactory;
         this.assertionChecker = assertionChecker;
         this.taskMemoryServiceProvider = taskMemoryServiceProvider;
+        this.variableResolver = variableResolver;
+        this.responseExtractor = responseExtractor;
+        this.variableWriteBackService = variableWriteBackService;
     }
 
     @Transactional
@@ -258,6 +272,7 @@ public class HttpExecutionApplicationService {
     }
 
     private HttpExecutionCaseResult executeSuiteCase(Task task, HttpExecutionRequest request, TestCase testCase) {
+        var executionContext = ExecutionContext.create(task, testCase, request);
         var stepResults = new ArrayList<Map<String, Object>>();
         var flattenedAssertions = new ArrayList<Map<String, Object>>();
         var totalDurationMs = 0L;
@@ -267,18 +282,21 @@ public class HttpExecutionApplicationService {
 
         for (var step : orderedSteps(testCase)) {
             if (halted) {
-                stepResults.add(skippedStepResult(step, skipReason));
+                stepResults.add(withStepRuntime(skippedStepResult(step, skipReason), executionContext, stepId(step), executionContext.summary()));
                 continue;
             }
 
-            var stepResult = executeSuiteStep(task, request, testCase, step);
+            var stepResult = executeSuiteStep(task, request, testCase, step, executionContext);
             stepResults.add(stepResult);
             totalDurationMs += longValue(stepResult.get("durationMs"));
             if (stepResult.get("statusCode") instanceof Number statusCode) {
                 lastStatusCode = statusCode.intValue();
             }
             flattenedAssertions.addAll(stepAssertionsWithStepRefs(stepResult));
-            if (request.options().stopOnCriticalFailure() && stepCriticalFailure(stepResult)) {
+            if (Boolean.TRUE.equals(stepResult.get("runtimeBlockingFailure"))) {
+                halted = true;
+                skipReason = "Skipped because prerequisite runtime variable failure in step: " + stepId(step);
+            } else if (request.options().stopOnCriticalFailure() && stepCriticalFailure(stepResult)) {
                 halted = true;
                 skipReason = "Skipped because prerequisite step failed: " + stepId(step);
             }
@@ -286,11 +304,12 @@ public class HttpExecutionApplicationService {
 
         var overallStatus = suiteOverallStatus(stepResults);
         var outcomeStatus = outcomeStatusFor(overallStatus);
+        var suiteRequestSnapshot = suiteRequestSnapshot(testCase, executionContext);
         var record = persistExecutionRecord(
             request,
             testCase,
-            suiteRequestSnapshot(testCase),
-            suiteResponseSnapshot(stepResults),
+            suiteRequestSnapshot,
+            suiteResponseSnapshot(stepResults, executionContext),
             overallStatus,
             flattenedAssertions,
             totalDurationMs,
@@ -305,7 +324,7 @@ public class HttpExecutionApplicationService {
             totalDurationMs,
             lastStatusCode,
             firstStepMessage(stepResults),
-            suiteRequestSnapshot(testCase)
+            suiteRequestSnapshot
         );
     }
 
@@ -313,33 +332,53 @@ public class HttpExecutionApplicationService {
         Task task,
         HttpExecutionRequest request,
         TestCase testCase,
-        Map<String, Object> step
+        Map<String, Object> step,
+        ExecutionContext executionContext
     ) {
+        var currentStepId = stepId(step);
+        var contextBefore = executionContext.summary();
         var apiSpecId = stringValue(firstPresent(step, "apiSpecId", "targetApiSpecId"));
         if (!StringUtils.hasText(apiSpecId)) {
             apiSpecId = testCase.getPrimaryApiSpecId();
         }
         var apiSpec = apiSpecs.findById(apiSpecId).orElse(null);
         if (apiSpec == null) {
-            return terminalStepResult(step, HttpExecutionOutcomeStatus.ERROR, OverallStatus.ERROR,
-                "ApiSpec not found: " + apiSpecId, minimalRequestSnapshot(testCase.getCaseId()), Map.of(), List.of(), 0L, null);
+            return withStepRuntime(terminalStepResult(step, HttpExecutionOutcomeStatus.ERROR, OverallStatus.ERROR,
+                "ApiSpec not found: " + apiSpecId, minimalRequestSnapshot(testCase.getCaseId()), Map.of(), List.of(), 0L, null),
+                executionContext, currentStepId, contextBefore);
         }
         if (!task.getTargetApiSpecIds().isEmpty() && !task.getTargetApiSpecIds().contains(apiSpec.getApiSpecId())) {
-            var message = "Suite step " + stepId(step) + " is not selected by Task " + task.getTaskId();
-            return terminalStepResult(step, HttpExecutionOutcomeStatus.BLOCKED, OverallStatus.BLOCKED,
-                message, minimalRequestSnapshot(testCase.getCaseId()), responseSnapshotFactory.blocked(message), List.of(), 0L, null);
+            var message = "Suite step " + currentStepId + " is not selected by Task " + task.getTaskId();
+            return withStepRuntime(terminalStepResult(step, HttpExecutionOutcomeStatus.BLOCKED, OverallStatus.BLOCKED,
+                message, minimalRequestSnapshot(testCase.getCaseId()), responseSnapshotFactory.blocked(message), List.of(), 0L, null),
+                executionContext, currentStepId, contextBefore);
         }
 
-        var preparedRequest = executableRequestBuilder.buildStep(testCase, step, apiSpec, request);
+        var requestTemplate = executableRequestBuilder.requestShapeFor(testCase, step);
+        var resolvedTemplate = variableResolver.resolveRequestTemplate(executionContext, currentStepId, requestTemplate);
+        if (!resolvedTemplate.successful()) {
+            var message = "Variable resolution failed for suite step " + currentStepId;
+            var requestSnapshot = runtimeBlockedRequestSnapshot(testCase, step, requestTemplate, contextBefore);
+            var result = terminalStepResult(step, HttpExecutionOutcomeStatus.BLOCKED, OverallStatus.BLOCKED,
+                message, requestSnapshot, responseSnapshotFactory.blocked(message), List.of(), 0L, null);
+            result.put("runtimeBlockingFailure", true);
+            return withStepRuntime(result, executionContext, currentStepId, contextBefore);
+        }
+
+        var resolvedStep = new LinkedHashMap<>(step);
+        resolvedStep.put("requestShape", objectMap(resolvedTemplate.resolvedValue()));
+        var preparedRequest = executableRequestBuilder.buildStep(testCase, resolvedStep, apiSpec, request);
         if (preparedRequest.blocked()) {
             var message = preparedRequest.message();
-            return terminalStepResult(step, HttpExecutionOutcomeStatus.BLOCKED, OverallStatus.BLOCKED,
-                message, preparedRequest.requestSnapshot(), responseSnapshotFactory.blocked(message), List.of(), 0L, null);
+            return withStepRuntime(terminalStepResult(step, HttpExecutionOutcomeStatus.BLOCKED, OverallStatus.BLOCKED,
+                message, withRequestRuntime(preparedRequest.requestSnapshot(), contextBefore), responseSnapshotFactory.blocked(message),
+                List.of(), 0L, null), executionContext, currentStepId, contextBefore);
         }
         if (request.dryRun()) {
             var message = "Dry run prepared request; transport not called";
-            return terminalStepResult(step, HttpExecutionOutcomeStatus.SKIPPED, OverallStatus.SKIPPED,
-                message, preparedRequest.requestSnapshot(), responseSnapshotFactory.dryRun(message), List.of(), 0L, null);
+            return withStepRuntime(terminalStepResult(step, HttpExecutionOutcomeStatus.SKIPPED, OverallStatus.SKIPPED,
+                message, withRequestRuntime(preparedRequest.requestSnapshot(), contextBefore), responseSnapshotFactory.dryRun(message),
+                List.of(), 0L, null), executionContext, currentStepId, contextBefore);
         }
 
         var startedAt = System.nanoTime();
@@ -350,29 +389,40 @@ public class HttpExecutionApplicationService {
             var overallStatus = overallStatusForResponse(httpResponse.statusCode(), assertionResults);
             var responseSnapshot = responseSnapshotFactory.success(httpResponse, durationMs);
             classifyAssertionFailure(responseSnapshot, overallStatus, assertionResults);
-            return terminalStepResult(
+            var extractedVariables = responseExtractor.extract(currentStepId, step, httpResponse);
+            var writeBackBlockingFailure = variableWriteBackService.write(executionContext, currentStepId, extractedVariables);
+            if (writeBackBlockingFailure) {
+                overallStatus = OverallStatus.BLOCKED;
+                responseSnapshot.put("runtimeFailure", "VARIABLE_EXTRACTION_FAILED");
+            }
+            var message = writeBackBlockingFailure ? "Required variable extraction failed for suite step " + currentStepId : null;
+            responseSnapshot.put("contextAfter", executionContext.summary());
+            var stepResult = terminalStepResult(
                 step,
                 outcomeStatusFor(overallStatus),
                 overallStatus,
-                null,
-                preparedRequest.requestSnapshot(),
+                message,
+                withRequestRuntime(preparedRequest.requestSnapshot(), contextBefore),
                 responseSnapshot,
                 assertionResults,
                 durationMs,
                 httpResponse.statusCode()
             );
+            return withStepRuntime(stepResult, executionContext, currentStepId, contextBefore, writeBackBlockingFailure);
         } catch (HttpTransportException exception) {
-            return terminalStepResult(step, HttpExecutionOutcomeStatus.ERROR, OverallStatus.ERROR,
-                exception.getMessage(), preparedRequest.requestSnapshot(), responseSnapshotFactory.transportError(exception),
-                List.of(), exception.durationMs(), null);
+            return withStepRuntime(terminalStepResult(step, HttpExecutionOutcomeStatus.ERROR, OverallStatus.ERROR,
+                exception.getMessage(), withRequestRuntime(preparedRequest.requestSnapshot(), contextBefore),
+                responseSnapshotFactory.transportError(exception),
+                List.of(), exception.durationMs(), null), executionContext, currentStepId, contextBefore);
         } catch (RuntimeException exception) {
             var durationMs = normalizedDuration(-1L, startedAt);
             var message = StringUtils.hasText(exception.getMessage())
                 ? exception.getMessage()
                 : exception.getClass().getSimpleName();
-            return terminalStepResult(step, HttpExecutionOutcomeStatus.ERROR, OverallStatus.ERROR,
-                message, preparedRequest.requestSnapshot(), responseSnapshotFactory.transportError(message, durationMs),
-                List.of(), durationMs, null);
+            return withStepRuntime(terminalStepResult(step, HttpExecutionOutcomeStatus.ERROR, OverallStatus.ERROR,
+                message, withRequestRuntime(preparedRequest.requestSnapshot(), contextBefore),
+                responseSnapshotFactory.transportError(message, durationMs),
+                List.of(), durationMs, null), executionContext, currentStepId, contextBefore);
         }
     }
 
@@ -468,7 +518,7 @@ public class HttpExecutionApplicationService {
         return stepResults.stream().anyMatch(step -> status.name().equals(step.get("overallStatus")));
     }
 
-    private Map<String, Object> suiteRequestSnapshot(TestCase testCase) {
+    private Map<String, Object> suiteRequestSnapshot(TestCase testCase, ExecutionContext executionContext) {
         var snapshot = new LinkedHashMap<String, Object>();
         snapshot.put("caseId", testCase.getCaseId());
         snapshot.put("suite", true);
@@ -482,14 +532,94 @@ public class HttpExecutionApplicationService {
                 return ref;
             })
             .toList());
+        snapshot.put("contextSummary", executionContext.summary());
         return snapshot;
     }
 
-    private Map<String, Object> suiteResponseSnapshot(List<Map<String, Object>> stepResults) {
+    private Map<String, Object> suiteResponseSnapshot(List<Map<String, Object>> stepResults, ExecutionContext executionContext) {
         var snapshot = new LinkedHashMap<String, Object>();
         snapshot.put("suite", true);
         snapshot.put("steps", stepResults);
+        snapshot.put("contextSummary", executionContext.summary());
+        snapshot.put("variableAuditSummary", executionContext.variableAuditSummary());
+        snapshot.put("runtimeDiagnostics", executionContext.diagnostics());
         return snapshot;
+    }
+
+    private Map<String, Object> withStepRuntime(
+        Map<String, Object> stepResult,
+        ExecutionContext executionContext,
+        String stepId,
+        Map<String, Object> contextBefore
+    ) {
+        return withStepRuntime(stepResult, executionContext, stepId, contextBefore, false);
+    }
+
+    private Map<String, Object> withStepRuntime(
+        Map<String, Object> stepResult,
+        ExecutionContext executionContext,
+        String stepId,
+        Map<String, Object> contextBefore,
+        boolean runtimeBlockingFailure
+    ) {
+        stepResult.put("contextBefore", contextBefore);
+        stepResult.put("contextAfter", executionContext.summary());
+        stepResult.put("variableEvents", eventsForStep(executionContext, stepId));
+        stepResult.put("runtimeDiagnostics", diagnosticsForStep(executionContext, stepId));
+        if (runtimeBlockingFailure) {
+            stepResult.put("runtimeBlockingFailure", true);
+        }
+        return stepResult;
+    }
+
+    private List<Map<String, Object>> eventsForStep(ExecutionContext executionContext, String stepId) {
+        return executionContext.auditEvents().stream()
+            .filter(event -> stepId.equals(event.get("stepId")))
+            .toList();
+    }
+
+    private List<Map<String, Object>> diagnosticsForStep(ExecutionContext executionContext, String stepId) {
+        return executionContext.diagnostics().stream()
+            .filter(diagnostic -> stepId.equals(diagnostic.get("stepId")))
+            .toList();
+    }
+
+    private Map<String, Object> withRequestRuntime(
+        Map<String, Object> requestSnapshot,
+        Map<String, Object> contextBefore
+    ) {
+        var snapshot = new LinkedHashMap<>(requestSnapshot);
+        snapshot.put("contextBefore", contextBefore);
+        return snapshot;
+    }
+
+    private Map<String, Object> runtimeBlockedRequestSnapshot(
+        TestCase testCase,
+        Map<String, Object> step,
+        Map<String, Object> requestTemplate,
+        Map<String, Object> contextBefore
+    ) {
+        var snapshot = new LinkedHashMap<String, Object>();
+        snapshot.put("caseId", testCase.getCaseId());
+        snapshot.put("stepId", stepId(step));
+        snapshot.put("stepOrder", stepOrder(step));
+        snapshot.put("apiSpecId", firstPresent(step, "apiSpecId", "targetApiSpecId"));
+        snapshot.put("requestTemplate", RuntimeRedactor.redact(requestTemplate, "requestTemplate"));
+        snapshot.put("contextBefore", contextBefore);
+        return snapshot;
+    }
+
+    private Map<String, Object> objectMap(Object value) {
+        if (!(value instanceof Map<?, ?> incoming)) {
+            return new LinkedHashMap<>();
+        }
+        var copied = new LinkedHashMap<String, Object>();
+        incoming.forEach((key, mapValue) -> {
+            if (key != null) {
+                copied.put(key.toString(), mapValue);
+            }
+        });
+        return copied;
     }
 
     private String firstStepMessage(List<Map<String, Object>> stepResults) {
