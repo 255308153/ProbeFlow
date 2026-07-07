@@ -36,6 +36,7 @@ public class VariableWriteBackService {
                 diagnostic.put("targetScope", extracted.targetScope());
                 diagnostic.put("targetKey", extracted.targetKey());
                 context.addDiagnostic(diagnostic);
+                auditFailure(context, extracted, diagnostic, true);
             }
         }
         return blockingFailure;
@@ -56,6 +57,10 @@ public class VariableWriteBackService {
         event.put("targetKey", extracted.targetKey());
         event.put("success", true);
         event.put("overwritten", overwritten);
+        event.put("required", extracted.required());
+        event.put("failureStrategy", extracted.failureStrategy());
+        event.put("fallbackApplied", extracted.fallbackApplied());
+        event.put("valueOrigin", extracted.fallbackApplied() ? extracted.failureStrategy() : "EXTRACTED");
         if (overwritten) {
             event.put("oldValueSummary", RuntimeRedactor.valueSummary(extracted.targetKey(), oldValue));
         }
@@ -64,6 +69,15 @@ public class VariableWriteBackService {
     }
 
     private void auditFailure(ExecutionContext context, ExtractedVariable extracted) {
+        auditFailure(context, extracted, extracted.diagnostic(), extracted.blockingFailure());
+    }
+
+    private void auditFailure(
+        ExecutionContext context,
+        ExtractedVariable extracted,
+        java.util.Map<String, Object> diagnostic,
+        boolean blockingFailure
+    ) {
         var event = new LinkedHashMap<String, Object>();
         event.put("eventType", "PRODUCTION");
         event.put("stepId", extracted.stepId());
@@ -72,8 +86,14 @@ public class VariableWriteBackService {
         event.put("targetScope", extracted.targetScope());
         event.put("targetKey", extracted.targetKey());
         event.put("success", false);
-        event.put("blockingFailure", extracted.blockingFailure());
-        event.put("failureReason", extracted.diagnostic().get("code"));
+        event.put("blockingFailure", blockingFailure);
+        event.put("required", extracted.required());
+        event.put("failureStrategy", extracted.failureStrategy());
+        event.put("fallbackApplied", extracted.fallbackApplied());
+        event.put("failureReason", diagnostic.get("code"));
+        if (extracted.success()) {
+            event.put("attemptedValueSummary", RuntimeRedactor.valueSummary(extracted.targetKey(), extracted.value()));
+        }
         context.addAuditEvent(event);
     }
 }

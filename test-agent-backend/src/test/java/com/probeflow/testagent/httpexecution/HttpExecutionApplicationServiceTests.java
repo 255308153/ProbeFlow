@@ -1697,6 +1697,249 @@ class HttpExecutionApplicationServiceTests {
     }
 
     @Test
+    void variableWriteBackAuditsSuiteStepOverwriteFallbackAndConsumptionLifecycle() {
+        var createOrder = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/orders", 201));
+        var readOrder = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/orders/order-2/step/order-1", 200));
+        var task = tasks.save(newTask(List.of(createOrder.getApiSpecId(), readOrder.getApiSpecId())));
+        var suite = testCases.save(newSuiteTestCase(createOrder.getApiSpecId(), List.of(
+            suiteStepWithRuntime(
+                1,
+                "create-order",
+                createOrder.getApiSpecId(),
+                "POST",
+                "/api/orders",
+                201,
+                List.of(
+                    Map.of(
+                        "sourceType", "BODY_JSON",
+                        "sourcePath", "$.data.orderId",
+                        "targetScope", "SUITE",
+                        "targetKey", "orderId",
+                        "required", true,
+                        "failureStrategy", "FAIL_FAST"
+                    ),
+                    Map.of(
+                        "sourceType", "BODY_JSON",
+                        "sourcePath", "$.data.replacementOrderId",
+                        "targetScope", "SUITE",
+                        "targetKey", "orderId",
+                        "required", true,
+                        "failureStrategy", "FAIL_FAST"
+                    ),
+                    Map.of(
+                        "sourceType", "BODY_JSON",
+                        "sourcePath", "$.data.orderId",
+                        "targetScope", "STEP",
+                        "targetKey", "orderId",
+                        "required", true,
+                        "failureStrategy", "FAIL_FAST"
+                    ),
+                    Map.of(
+                        "sourceType", "BODY_JSON",
+                        "sourcePath", "$.data.optionalValue",
+                        "targetScope", "SUITE",
+                        "targetKey", "optionalValue",
+                        "required", false,
+                        "failureStrategy", "WRITE_NULL"
+                    ),
+                    Map.of(
+                        "sourceType", "BODY_JSON",
+                        "sourcePath", "$.data.fallbackStatus",
+                        "targetScope", "SUITE",
+                        "targetKey", "fallbackStatus",
+                        "required", false,
+                        "failureStrategy", "WRITE_DEFAULT",
+                        "defaultValue", "UNKNOWN"
+                    )
+                )
+            ),
+            suiteStepWithTemplate(
+                2,
+                "read-order",
+                readOrder.getApiSpecId(),
+                Map.of(
+                    "method", "POST",
+                    "path", "/api/orders/${suite.orderId}/step/${step.create-order.orderId}",
+                    "body", Map.of(
+                        "optionalValue", "${suite.optionalValue}",
+                        "fallbackStatus", "${suite.fallbackStatus}"
+                    )
+                ),
+                200,
+                List.of()
+            )
+        )));
+        fakeHttpClient.respondWithSequence(
+            new HttpClientResponse(201, Map.of(), Map.of(
+                "data", Map.of(
+                    "orderId", "order-1",
+                    "replacementOrderId", "order-2"
+                )
+            ), 10L),
+            new HttpClientResponse(200, Map.of(), Map.of("ok", true), 4L)
+        );
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(suite.getCaseId()),
+            ExecutionMode.SUITE_STEP,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        assertThat(result.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.PASSED);
+        assertThat(fakeHttpClient.requests()).hasSize(2);
+        var readRequest = fakeHttpClient.requests().get(1);
+        assertThat(readRequest.path()).isEqualTo("/api/orders/order-2/step/order-1");
+        @SuppressWarnings("unchecked")
+        var body = (Map<String, Object>) readRequest.body();
+        assertThat(body).containsEntry("optionalValue", null).containsEntry("fallbackStatus", "UNKNOWN");
+
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        @SuppressWarnings("unchecked")
+        var responseSnapshot = record.getResponseSnapshot();
+        @SuppressWarnings("unchecked")
+        var auditSummary = (Map<String, Object>) responseSnapshot.get("variableAuditSummary");
+        assertThat(auditSummary)
+            .containsEntry("productionEvents", 5L)
+            .containsEntry("consumptionEvents", 4L)
+            .containsEntry("failureEvents", 0L);
+        @SuppressWarnings("unchecked")
+        var events = (List<Map<String, Object>>) auditSummary.get("events");
+        assertThat(events).extracting(event -> event.get("sequence"))
+            .containsExactly(1, 2, 3, 4, 5, 6, 7, 8, 9);
+        assertThat(events)
+            .anySatisfy(event -> {
+                assertThat(event)
+                    .containsEntry("eventType", "PRODUCTION")
+                    .containsEntry("targetScope", "suite")
+                    .containsEntry("targetKey", "orderId")
+                    .containsEntry("overwritten", true)
+                    .containsEntry("valueOrigin", "EXTRACTED");
+                @SuppressWarnings("unchecked")
+                var oldSummary = (Map<String, Object>) event.get("oldValueSummary");
+                @SuppressWarnings("unchecked")
+                var newSummary = (Map<String, Object>) event.get("newValueSummary");
+                assertThat(oldSummary).containsEntry("value", "order-1");
+                assertThat(newSummary).containsEntry("value", "order-2");
+            })
+            .anySatisfy(event -> assertThat(event)
+                .containsEntry("eventType", "PRODUCTION")
+                .containsEntry("targetScope", "step")
+                .containsEntry("targetKey", "orderId")
+                .containsEntry("newValueSummary", Map.of("type", "string", "value", "order-1", "truncated", false, "redacted", false)))
+            .anySatisfy(event -> assertThat(event)
+                .containsEntry("eventType", "PRODUCTION")
+                .containsEntry("targetKey", "optionalValue")
+                .containsEntry("fallbackApplied", true)
+                .containsEntry("valueOrigin", "WRITE_NULL"))
+            .anySatisfy(event -> assertThat(event)
+                .containsEntry("eventType", "PRODUCTION")
+                .containsEntry("targetKey", "fallbackStatus")
+                .containsEntry("fallbackApplied", true)
+                .containsEntry("valueOrigin", "WRITE_DEFAULT"))
+            .anySatisfy(event -> assertThat(event)
+                .containsEntry("eventType", "CONSUMPTION")
+                .containsEntry("stepId", "read-order")
+                .containsEntry("expression", "${step.create-order.orderId}")
+                .containsEntry("resolved", true));
+
+        @SuppressWarnings("unchecked")
+        var steps = (List<Map<String, Object>>) responseSnapshot.get("steps");
+        assertThat(steps.get(0).get("contextAfter").toString()).contains("order-2").contains("fallbackStatus=UNKNOWN");
+        assertThat(steps.get(1).get("contextBefore").toString()).contains("order-2").contains("order-1");
+    }
+
+    @Test
+    void variableWriteBackFailuresAndSensitiveValuesAreAuditedWithRedaction() {
+        var createOrder = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/orders", 201));
+        var task = tasks.save(newTask(createOrder.getApiSpecId()));
+        var unsupportedWriteRule = new java.util.LinkedHashMap<String, Object>();
+        unsupportedWriteRule.put("sourceType", "BODY_JSON");
+        unsupportedWriteRule.put("sourcePath", "$.data.authToken");
+        unsupportedWriteRule.put("targetScope", "GLOBAL");
+        unsupportedWriteRule.put("targetKey", "leakedCredential");
+        unsupportedWriteRule.put("required", true);
+        unsupportedWriteRule.put("failureStrategy", "FAIL_FAST");
+        var suite = testCases.save(newSuiteTestCase(createOrder.getApiSpecId(), List.of(
+            suiteStepWithRuntime(
+                1,
+                "create-order",
+                createOrder.getApiSpecId(),
+                "POST",
+                "/api/orders",
+                201,
+                List.of(
+                    Map.of(
+                        "sourceType", "BODY_JSON",
+                        "sourcePath", "$.data.authToken",
+                        "targetScope", "SUITE",
+                        "targetKey", "authToken",
+                        "required", true,
+                        "failureStrategy", "FAIL_FAST"
+                    ),
+                    unsupportedWriteRule
+                )
+            )
+        )));
+        fakeHttpClient.respondWith(new HttpClientResponse(
+            201,
+            Map.of("Authorization", "Bearer secret-token", "X-Trace-Id", "trace-1"),
+            Map.of("data", Map.of(
+                "authToken", "secret-token",
+                "password", "plain-password"
+            )),
+            9L
+        ));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(suite.getCaseId()),
+            ExecutionMode.SUITE_STEP,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        assertThat(result.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.BLOCKED);
+        assertRuntimeDiagnostic(result.caseResults().getFirst().executionRecordId(), "UNSUPPORTED_WRITE_SCOPE", "create-order");
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        assertThat(record.getResponseSnapshot().toString())
+            .doesNotContain("secret-token")
+            .doesNotContain("plain-password")
+            .contains("[REDACTED]");
+
+        @SuppressWarnings("unchecked")
+        var auditSummary = (Map<String, Object>) record.getResponseSnapshot().get("variableAuditSummary");
+        assertThat(auditSummary).containsEntry("failureEvents", 1L);
+        @SuppressWarnings("unchecked")
+        var events = (List<Map<String, Object>>) auditSummary.get("events");
+        assertThat(events)
+            .anySatisfy(event -> {
+                assertThat(event)
+                    .containsEntry("eventType", "PRODUCTION")
+                    .containsEntry("targetKey", "authToken")
+                    .containsEntry("success", true);
+                @SuppressWarnings("unchecked")
+                var summary = (Map<String, Object>) event.get("newValueSummary");
+                assertThat(summary).containsEntry("value", "[REDACTED]").containsEntry("redacted", true);
+            })
+            .anySatisfy(event -> {
+                assertThat(event)
+                    .containsEntry("eventType", "PRODUCTION")
+                    .containsEntry("targetScope", "global")
+                    .containsEntry("targetKey", "leakedCredential")
+                    .containsEntry("success", false)
+                    .containsEntry("failureReason", "UNSUPPORTED_WRITE_SCOPE")
+                    .containsEntry("blockingFailure", true);
+                @SuppressWarnings("unchecked")
+                var attempted = (Map<String, Object>) event.get("attemptedValueSummary");
+                assertThat(attempted).containsEntry("value", "[REDACTED]").containsEntry("redacted", true);
+            });
+    }
+
+    @Test
     void suiteStopsDependentStepsAfterFailedPrerequisiteWhenConfigured() {
         var createOrder = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/orders", 201));
         var readOrder = apiSpecs.save(newApiSpec(HttpMethod.GET, "/api/orders/order-123", 200));

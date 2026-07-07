@@ -2,6 +2,7 @@ package com.probeflow.testagent.httpexecution;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.probeflow.testagent.suiteruntime.RuntimeRedactor;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -21,7 +22,7 @@ public class HttpResponseSnapshotFactory {
     public Map<String, Object> success(HttpClientResponse response, long durationMs) {
         var snapshot = new LinkedHashMap<String, Object>();
         snapshot.put("statusCode", response.statusCode());
-        snapshot.put("headers", response.headers() == null ? Map.of() : response.headers());
+        snapshot.put("headers", response.headers() == null ? Map.of() : RuntimeRedactor.redact(response.headers(), "headers"));
         snapshot.put("durationMs", durationMs);
         putBodyMetadata(snapshot, response.body());
         return snapshot;
@@ -95,7 +96,7 @@ public class HttpResponseSnapshotFactory {
         }
 
         snapshot.put("bodyType", "json");
-        snapshot.put("body", body);
+        snapshot.put("body", RuntimeRedactor.redact(body, "body"));
         snapshot.put("bodySizeBytes", jsonSizeBytes(body));
         snapshot.put("bodyTruncated", false);
     }
