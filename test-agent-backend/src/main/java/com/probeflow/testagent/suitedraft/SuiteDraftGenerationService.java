@@ -105,15 +105,29 @@ public class SuiteDraftGenerationService {
     ) {
         var apiSpecs = request.apiSpecs().stream()
             .collect(Collectors.toMap(ApiSpec::getApiSpecId, Function.identity(), (left, right) -> left, LinkedHashMap::new));
+        var singleTemplates = request.singleCaseTemplates().stream()
+            .collect(Collectors.toMap(
+                SuiteSingleCaseTemplate::apiSpecId,
+                Function.identity(),
+                (left, right) -> left,
+                LinkedHashMap::new
+            ));
         return request.candidate().steps().stream()
             .sorted(Comparator.comparingInt(BusinessFlowDiscoveryStep::order))
-            .map(step -> draftStep(step, apiSpecs.get(step.apiSpecId()), dependencies, artifacts))
+            .map(step -> draftStep(
+                step,
+                apiSpecs.get(step.apiSpecId()),
+                singleTemplates.get(step.apiSpecId()),
+                dependencies,
+                artifacts
+            ))
             .toList();
     }
 
     private SuiteDraftStep draftStep(
         BusinessFlowDiscoveryStep step,
         ApiSpec apiSpec,
+        SuiteSingleCaseTemplate singleTemplate,
         List<SuiteVariableDependency> dependencies,
         SuiteDependencyArtifacts artifacts
     ) {
@@ -122,24 +136,28 @@ public class SuiteDraftGenerationService {
                 || dependency.consumerStepId().equals(step.stepId()))
             .map(SuiteVariableDependency::dependencyId)
             .toList();
+        var variableReferences = artifacts.referencesByConsumer().getOrDefault(step.stepId(), List.of());
         return new SuiteDraftStep(
             step.stepId(),
             step.stepName(),
             step.order(),
             step.apiSpecId(),
             step.critical(),
-            fallbackRequestTemplate(apiSpec, step),
+            requestTemplate(apiSpec, step, singleTemplate, variableReferences),
             expectedStatus(step),
-            List.of(orderedMap("source", "api-spec", "summary", "status code should match expectedStatus")),
+            assertionHints(singleTemplate),
             artifacts.extractRulesByProducer().getOrDefault(step.stepId(), List.of()),
-            artifacts.referencesByConsumer().getOrDefault(step.stepId(), List.of()),
+            variableReferences,
             step.sourceRefs(),
             dependencyRefs,
             SuiteReadinessStatus.READY,
             orderedMap(
                 "snapshotType", "SUITE_STEP_DRAFT",
                 "sourceOperationKind", step.operationKind().name(),
-                "sourcePath", step.path()
+                "sourcePath", step.path(),
+                "requestTemplateSource", singleTemplate == null ? "API_SPEC_FALLBACK" : "SINGLE_CASE_TEMPLATE",
+                "singleTemplateId", singleTemplate == null ? null : singleTemplate.templateId(),
+                "snapshotFrozen", true
             )
         );
     }
@@ -200,6 +218,30 @@ public class SuiteDraftGenerationService {
         );
     }
 
+    private Map<String, Object> requestTemplate(
+        ApiSpec apiSpec,
+        BusinessFlowDiscoveryStep step,
+        SuiteSingleCaseTemplate singleTemplate,
+        List<SuiteVariableReference> variableReferences
+    ) {
+        var template = singleTemplate == null || singleTemplate.requestTemplate().isEmpty()
+            ? fallbackRequestTemplate(apiSpec, step)
+            : deepCopyMap(singleTemplate.requestTemplate());
+        template.putIfAbsent("method", step.httpMethod().name());
+        template.putIfAbsent("path", step.path());
+        template.putIfAbsent("templateSource", singleTemplate == null ? "API_SPEC_FALLBACK" : "SINGLE_CASE_TEMPLATE");
+        template.putIfAbsent("headers", new LinkedHashMap<String, Object>());
+        template.putIfAbsent("query", new LinkedHashMap<String, Object>());
+        template.putIfAbsent("body", new LinkedHashMap<String, Object>());
+        for (var reference : variableReferences) {
+            rewriteTemplate(template, reference);
+        }
+        if (apiSpec != null) {
+            template.putIfAbsent("apiSpecVersion", apiSpec.getVersion());
+        }
+        return template;
+    }
+
     private Map<String, Object> fallbackRequestTemplate(ApiSpec apiSpec, BusinessFlowDiscoveryStep step) {
         var template = new LinkedHashMap<String, Object>();
         template.put("method", step.httpMethod().name());
@@ -212,6 +254,48 @@ public class SuiteDraftGenerationService {
             template.put("apiSpecVersion", apiSpec.getVersion());
         }
         return template;
+    }
+
+    private List<Map<String, Object>> assertionHints(SuiteSingleCaseTemplate singleTemplate) {
+        if (singleTemplate == null || singleTemplate.assertionHints().isEmpty()) {
+            return List.of(orderedMap("source", "api-spec", "summary", "status code should match expectedStatus"));
+        }
+        return List.of(singleTemplate.assertionHints());
+    }
+
+    @SuppressWarnings("unchecked")
+    private void rewriteTemplate(Map<String, Object> template, SuiteVariableReference reference) {
+        var field = reference.consumerField() == null || reference.consumerField().isBlank()
+            ? reference.targetKey()
+            : reference.consumerField();
+        switch (reference.consumerLocation()) {
+            case PATH -> {
+                var path = String.valueOf(template.getOrDefault("path", ""));
+                template.put("path", path.replace("{" + field + "}", reference.referenceExpression()));
+            }
+            case QUERY -> mutableSection(template, "query").put(field, reference.referenceExpression());
+            case BODY -> mutableSection(template, "body").put(field, reference.referenceExpression());
+            case HEADER -> mutableSection(template, "headers").put(field, reference.referenceExpression());
+            case NONE -> {
+                // A dependency may be generated only for downstream runtime analysis metadata.
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> mutableSection(Map<String, Object> template, String key) {
+        var value = template.get(key);
+        if (value instanceof Map<?, ?> map) {
+            var typed = new LinkedHashMap<String, Object>();
+            for (var entry : map.entrySet()) {
+                typed.put(String.valueOf(entry.getKey()), entry.getValue());
+            }
+            template.put(key, typed);
+            return typed;
+        }
+        var section = new LinkedHashMap<String, Object>();
+        template.put(key, section);
+        return section;
     }
 
     private Integer expectedStatus(BusinessFlowDiscoveryStep step) {
@@ -309,6 +393,25 @@ public class SuiteDraftGenerationService {
         var copy = new LinkedHashMap<String, List<T>>();
         for (var entry : source.entrySet()) {
             copy.put(entry.getKey(), List.copyOf(entry.getValue()));
+        }
+        return copy;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> deepCopyMap(Map<String, Object> source) {
+        var copy = new LinkedHashMap<String, Object>();
+        for (var entry : source.entrySet()) {
+            if (entry.getValue() instanceof Map<?, ?> map) {
+                var nested = new LinkedHashMap<String, Object>();
+                for (var nestedEntry : map.entrySet()) {
+                    nested.put(String.valueOf(nestedEntry.getKey()), nestedEntry.getValue());
+                }
+                copy.put(entry.getKey(), nested);
+            } else if (entry.getValue() instanceof List<?> list) {
+                copy.put(entry.getKey(), List.copyOf(list));
+            } else {
+                copy.put(entry.getKey(), entry.getValue());
+            }
         }
         return copy;
     }

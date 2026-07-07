@@ -18,7 +18,47 @@ public class DependencyLinker {
     public List<SuiteVariableDependency> link(SuiteDraftGenerationRequest request) {
         var dependencies = new ArrayList<SuiteVariableDependency>();
         dependencies.addAll(orderIdDependencies(request));
+        dependencies.addAll(hintedDependencies(request));
         return dependencies;
+    }
+
+    private List<SuiteVariableDependency> hintedDependencies(SuiteDraftGenerationRequest request) {
+        var result = new ArrayList<SuiteVariableDependency>();
+        var stepsById = new LinkedHashMap<String, BusinessFlowDiscoveryStep>();
+        for (var step : request.candidate().steps()) {
+            stepsById.put(step.stepId(), step);
+        }
+        for (var hint : request.dependencyHints()) {
+            var producer = stepsById.get(hint.producerStepId());
+            var consumer = stepsById.get(hint.consumerStepId());
+            if (producer == null || consumer == null) {
+                continue;
+            }
+            var targetKey = blankToDefault(hint.targetKey(), hint.variableName());
+            var targetScope = hint.targetScope() == null ? request.options().defaultTargetScope() : hint.targetScope();
+            result.add(dependency(
+                producer,
+                consumer,
+                blankToDefault(hint.variableName(), targetKey),
+                hint.sourceType(),
+                hint.sourcePath(),
+                hint.consumerLocation(),
+                blankToDefault(hint.consumerField(), targetKey),
+                targetScope,
+                targetScope == SuiteVariableScope.STEP || request.options().preferStepScopedReferences(),
+                hint.confidence() <= 0 ? 0.85 : hint.confidence(),
+                hint.evidenceRefs(),
+                hint.conflict(),
+                hint.required(),
+                highRisk(consumer) ? "HIGH" : "MEDIUM",
+                orderedMap(
+                    "hintId", hint.hintId(),
+                    "inference", "dependency-hint",
+                    "hintMetadata", hint.metadata()
+                )
+            ));
+        }
+        return result;
     }
 
     private List<SuiteVariableDependency> orderIdDependencies(SuiteDraftGenerationRequest request) {
@@ -141,6 +181,18 @@ public class DependencyLinker {
 
     private String normalize(String value) {
         return value == null ? "" : value.replace("_", "").replace("-", "").toLowerCase(Locale.ROOT);
+    }
+
+    private String blankToDefault(String value, String fallback) {
+        return value == null || value.isBlank() ? fallback : value;
+    }
+
+    private Map<String, Object> orderedMap(Object... keyValues) {
+        var map = new LinkedHashMap<String, Object>();
+        for (int i = 0; i < keyValues.length; i += 2) {
+            map.put(keyValues[i].toString(), keyValues[i + 1]);
+        }
+        return map;
     }
 
     Map<String, ApiSpec> apiSpecsById(List<ApiSpec> apiSpecs) {
