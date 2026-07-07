@@ -21,7 +21,7 @@ class V3Phase2AcceptanceBoundaryGuardTests {
     private Path outputDir;
 
     @Test
-    void orderSuiteDemoContainsRealBusinessFlowDiscoveryAndSuiteDraftButNoRuntimeVariableOutput() throws Exception {
+    void orderSuiteDemoContainsRealBusinessFlowDiscoverySuiteDraftAndRuntimeVariableAudit() throws Exception {
         var result = ManualSuiteAgentHarness.defaults()
             .run(ManualSuiteAgentRunRequest.fake("order-suite-demo", outputDir));
 
@@ -52,8 +52,11 @@ class V3Phase2AcceptanceBoundaryGuardTests {
             .filter(section -> section.sectionId().equals("variable-audit"))
             .findFirst()
             .orElseThrow();
-        assertThat(variableAudit.source()).isEqualTo(ManualSuiteAgentSectionSource.PENDING_RUNTIME);
-        assertThat(variableAudit.status()).isEqualTo("PENDING_RUNTIME");
+        assertThat(variableAudit.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(variableAudit.status()).isEqualTo("PASSED");
+        assertThat(variableAudit.summary())
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("runtime", "ExecutionContext");
 
         assertThat(result.sections())
             .extracting(section -> section.sectionId())

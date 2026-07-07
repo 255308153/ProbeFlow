@@ -70,8 +70,11 @@ class SuiteDraftGenerationIssue07HarnessIntegrationTests {
 
         assertThat(result.metadata().get("generatedSuiteDraft")).isEqualTo(generated.summary());
         var variableAudit = section(result, "variable-audit");
-        assertThat(variableAudit.source()).isEqualTo(ManualSuiteAgentSectionSource.PENDING_RUNTIME);
-        assertThat(variableAudit.status()).isEqualTo("PENDING_RUNTIME");
+        assertThat(variableAudit.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(variableAudit.status()).isEqualTo("PASSED");
+        assertThat(variableAudit.summary())
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("runtime", "ExecutionContext");
     }
 
     @Test
@@ -107,8 +110,8 @@ class SuiteDraftGenerationIssue07HarnessIntegrationTests {
             .contains("dep-create-order-to-query-order-orderId")
             .contains("rule-create-order-orderId")
             .contains("${suite.orderId}")
-            .contains("variable-audit (PENDING_RUNTIME, PENDING_RUNTIME)")
-            .contains("awaits V3-4 ExecutionContext runtime");
+            .contains("variable-audit (REAL, PASSED)")
+            .contains("Runtime: ExecutionContext");
         assertNoSensitiveValues(Files.readString(artifactPath(first, "JSON_REPORT")));
         assertNoSensitiveValues(markdown);
     }

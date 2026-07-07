@@ -334,7 +334,8 @@ class Phase4AcceptanceBoundaryGuardTests {
             "TaskOrchestrationApplicationService",
             "TestCaseGenerationApplicationService",
             "TestCasePromotionService",
-            "UnifiedContextBuilder"
+            "UnifiedContextBuilder",
+            "VariableWriteBackService"
         );
         assertThat(controllerAnnotations).isEmpty();
         assertThat(presentForbiddenTerms).isEmpty();

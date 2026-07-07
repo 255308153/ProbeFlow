@@ -63,6 +63,7 @@ class Phase1BoundaryGuardTests {
             "report",
             "sourcematerial",
             "suitedraft",
+            "suiteruntime",
             "task",
             "taskcaseexecution",
             "testcase",

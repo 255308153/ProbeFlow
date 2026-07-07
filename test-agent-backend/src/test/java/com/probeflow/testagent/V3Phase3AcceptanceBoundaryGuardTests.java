@@ -151,7 +151,7 @@ class V3Phase3AcceptanceBoundaryGuardTests {
     }
 
     @Test
-    void defaultHarnessRunShowsRealSuiteDraftButKeepsRuntimeVariableAuditPending() throws Exception {
+    void defaultHarnessRunShowsRealSuiteDraftAndV3Phase4RuntimeVariableAudit() throws Exception {
         var result = ManualSuiteAgentHarness.defaults()
             .run(ManualSuiteAgentRunRequest.fake("order-suite-demo", outputDir));
 
@@ -182,11 +182,11 @@ class V3Phase3AcceptanceBoundaryGuardTests {
             .contains("${suite.orderId}");
 
         var variableAudit = section(result, "variable-audit");
-        assertThat(variableAudit.source()).isEqualTo(ManualSuiteAgentSectionSource.PENDING_RUNTIME);
-        assertThat(variableAudit.status()).isEqualTo("PENDING_RUNTIME");
-        assertThat(variableAudit.summary().toString())
-            .contains("pending-runtime")
-            .contains("awaits V3-4 ExecutionContext runtime");
+        assertThat(variableAudit.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(variableAudit.status()).isEqualTo("PASSED");
+        assertThat(variableAudit.summary())
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("runtime", "ExecutionContext");
 
         assertThat(result.sections())
             .extracting(ManualSuiteAgentSectionSummary::sectionId)
@@ -224,7 +224,8 @@ class V3Phase3AcceptanceBoundaryGuardTests {
             .contains("generated-suite-draft (REAL, READY)")
             .contains("rule-create-order-orderId")
             .contains("${suite.orderId}")
-            .contains("variable-audit (PENDING_RUNTIME, PENDING_RUNTIME)");
+            .contains("variable-audit (REAL, PASSED)")
+            .contains("Runtime: ExecutionContext");
 
         assertNoSensitiveValues(json);
         assertNoSensitiveValues(markdown);
