@@ -237,6 +237,7 @@ class Phase3AcceptanceBoundaryGuardTests {
 
         assertThat(applicationServices)
             .containsExactly(
+                "AgentEvaluationApplicationService",
                 "AgentMemoryFeedbackApplicationService",
                 "ApiAnalysisApplicationService",
                 "FailureAnalysisApplicationService",

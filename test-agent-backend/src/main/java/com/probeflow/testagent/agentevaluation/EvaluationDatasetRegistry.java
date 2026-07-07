@@ -43,7 +43,7 @@ public class EvaluationDatasetRegistry {
                 "Run the deterministic smoke fixture through the evaluation harness.",
                 EvaluationFixtureType.SMOKE,
                 Map.of("providerMode", EvaluationProviderMode.DETERMINISTIC_FAKE.name(), "status", "PASSED"),
-                Map.of("isolated", true, "usesRealLlm", false, "usesRealEmbedding", false, "usesExternalHttp", false)
+                Map.of("isolated", true, "uses_real_llm", false, "uses_real_embedding", false, "uses_external_http", false)
             )),
             0.8d,
             Map.of("evaluation-foundation", 0.8d),
@@ -112,7 +112,7 @@ public class EvaluationDatasetRegistry {
             "Evaluate deterministic fake planner scenario " + scenario + ".",
             EvaluationFixtureType.PLANNER_DECISION,
             expected,
-            Map.of("fakePlannerScenario", scenario, "isolated", true, "usesRealLlm", false)
+            Map.of("fakePlannerScenario", scenario, "isolated", true, "uses_real_llm", false)
         );
     }
 

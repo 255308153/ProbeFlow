@@ -122,9 +122,9 @@ class V2Phase8AcceptanceBoundaryGuardTests {
             .doesNotContain("RestTemplate");
         assertThat(datasetRegistry)
             .contains("REGRESSION_SUITE_DATASET")
-            .contains("usesRealLlm\", false")
-            .contains("usesRealEmbedding\", false")
-            .contains("usesExternalHttp\", false");
+            .contains("uses_real_llm\", false")
+            .contains("uses_real_embedding\", false")
+            .contains("uses_external_http\", false");
         assertThat(plannerEvaluator)
             .contains("EvaluationProviderMode.DETERMINISTIC_FAKE")
             .contains("FakeControlledPlanner")
