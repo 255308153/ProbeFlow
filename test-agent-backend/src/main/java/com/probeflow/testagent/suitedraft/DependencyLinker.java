@@ -31,26 +31,41 @@ public class DependencyLinker {
         for (var hint : request.dependencyHints()) {
             var producer = stepsById.get(hint.producerStepId());
             var consumer = stepsById.get(hint.consumerStepId());
-            if (producer == null || consumer == null) {
+            if (producer == null) {
+                continue;
+            }
+            if (consumer == null && hint.consumerLocation() != SuiteConsumerLocation.NONE) {
                 continue;
             }
             var targetKey = blankToDefault(hint.targetKey(), hint.variableName());
             var targetScope = hint.targetScope() == null ? request.options().defaultTargetScope() : hint.targetScope();
-            result.add(dependency(
-                producer,
-                consumer,
+            var effectiveScope = targetScope == SuiteVariableScope.STEP || request.options().preferStepScopedReferences()
+                ? SuiteVariableScope.STEP
+                : targetScope;
+            var consumerStepId = consumer == null ? "" : consumer.stepId();
+            var riskLevel = consumer != null && highRisk(consumer) ? "HIGH" : "MEDIUM";
+            var dependencyId = "dep-" + producer.stepId() + "-to-"
+                + (consumerStepId.isBlank() ? "suite" : consumerStepId)
+                + "-" + targetKey;
+            result.add(new SuiteVariableDependency(
+                dependencyId,
+                producer.stepId(),
+                consumerStepId,
                 blankToDefault(hint.variableName(), targetKey),
                 hint.sourceType(),
                 hint.sourcePath(),
                 hint.consumerLocation(),
                 blankToDefault(hint.consumerField(), targetKey),
-                targetScope,
-                targetScope == SuiteVariableScope.STEP || request.options().preferStepScopedReferences(),
+                effectiveScope,
+                targetKey,
+                hint.consumerLocation() == SuiteConsumerLocation.NONE
+                    ? ""
+                    : referenceExpression(effectiveScope, producer.stepId(), targetKey),
                 hint.confidence() <= 0 ? 0.85 : hint.confidence(),
                 hint.evidenceRefs(),
                 hint.conflict(),
                 hint.required(),
-                highRisk(consumer) ? "HIGH" : "MEDIUM",
+                riskLevel,
                 orderedMap(
                     "hintId", hint.hintId(),
                     "inference", "dependency-hint",
@@ -172,7 +187,7 @@ public class DependencyLinker {
         return refs.stream().distinct().toList();
     }
 
-    private String referenceExpression(SuiteVariableScope scope, String producerStepId, String targetKey) {
+    String referenceExpression(SuiteVariableScope scope, String producerStepId, String targetKey) {
         if (scope == SuiteVariableScope.STEP) {
             return "${step." + producerStepId + "." + targetKey + "}";
         }

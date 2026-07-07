@@ -51,16 +51,19 @@ public class SuiteDraftGenerationService {
         }
 
         var dependencies = dependencyLinker.link(request);
+        var diagnostics = dependencyDiagnostics(dependencies);
         var artifacts = dependencyArtifacts(dependencies);
         var steps = draftSteps(request, dependencies, artifacts);
-        var readinessStatus = request.candidate().requiresHumanReview()
+        var readinessStatus = !diagnostics.isEmpty()
+            ? SuiteReadinessStatus.REVIEW_REQUIRED
+            : request.candidate().requiresHumanReview()
             ? SuiteReadinessStatus.REVIEW_REQUIRED
             : SuiteReadinessStatus.READY;
         var draft = new SuiteDraft(
             request.candidate().candidateId(),
             request.candidate().scenarioName(),
             steps,
-            draftMetadata(request, dependencies, readinessStatus, List.of())
+            draftMetadata(request, dependencies, readinessStatus, diagnostics)
         );
         return new SuiteDraftGenerationResult(
             SuiteDraftGenerationResult.SCHEMA_VERSION,
@@ -72,7 +75,7 @@ public class SuiteDraftGenerationService {
             false,
             draft,
             dependencies,
-            List.of(),
+            diagnostics,
             List.of(),
             resultMetadata(request, dependencies)
         );
@@ -179,6 +182,9 @@ public class SuiteDraftGenerationService {
         var referencesByConsumer = new LinkedHashMap<String, List<SuiteVariableReference>>();
         for (var dependenciesForRule : grouped.values()) {
             var first = dependenciesForRule.get(0);
+            if (first.sourceType() == SuiteDependencySourceType.UNSUPPORTED) {
+                continue;
+            }
             var rule = new SuiteExtractRule(
                 "rule-" + first.producerStepId() + "-" + first.targetKey(),
                 first.producerStepId(),
@@ -190,14 +196,27 @@ public class SuiteDraftGenerationService {
                 first.required() ? SuiteExtractFailureStrategy.FAIL_FAST : SuiteExtractFailureStrategy.WRITE_NULL,
                 null,
                 "Extract " + first.targetKey() + " for "
-                    + dependenciesForRule.stream().map(SuiteVariableDependency::consumerStepId).distinct().toList(),
+                    + dependenciesForRule.stream()
+                    .map(SuiteVariableDependency::consumerStepId)
+                    .filter(consumerStepId -> consumerStepId != null && !consumerStepId.isBlank())
+                    .distinct()
+                    .toList(),
                 dependenciesForRule.stream().mapToDouble(SuiteVariableDependency::confidence).min().orElse(0.0),
                 dependenciesForRule.stream().flatMap(dependency -> dependency.evidenceRefs().stream()).distinct().toList(),
-                dependenciesForRule.stream().map(SuiteVariableDependency::consumerStepId).distinct().toList(),
+                dependenciesForRule.stream()
+                    .map(SuiteVariableDependency::consumerStepId)
+                    .filter(consumerStepId -> consumerStepId != null && !consumerStepId.isBlank())
+                    .distinct()
+                    .toList(),
                 dependenciesForRule.stream().map(SuiteVariableDependency::dependencyId).toList()
             );
             extractRulesByProducer.computeIfAbsent(first.producerStepId(), ignored -> new ArrayList<>()).add(rule);
             for (var dependency : dependenciesForRule) {
+                if (dependency.consumerLocation() == SuiteConsumerLocation.NONE
+                    || dependency.consumerStepId() == null
+                    || dependency.consumerStepId().isBlank()) {
+                    continue;
+                }
                 var reference = new SuiteVariableReference(
                     dependency.consumerStepId(),
                     dependency.consumerLocation(),
@@ -216,6 +235,25 @@ public class SuiteDraftGenerationService {
             copyListMap(extractRulesByProducer),
             copyListMap(referencesByConsumer)
         );
+    }
+
+    private List<SuiteReadinessDiagnostic> dependencyDiagnostics(List<SuiteVariableDependency> dependencies) {
+        return dependencies.stream()
+            .filter(dependency -> dependency.sourceType() == SuiteDependencySourceType.UNSUPPORTED)
+            .map(dependency -> SuiteReadinessDiagnostic.warn(
+                "UNSUPPORTED_DEPENDENCY_SOURCE",
+                List.of(dependency.producerStepId(), dependency.consumerStepId()),
+                dependency.dependencyId(),
+                "Unsupported dependency source type cannot produce a V3-3 extractRule.",
+                "Keep the dependency as review evidence or model it with BODY_JSON, HEADER or STATUS_CODE.",
+                orderedMap(
+                    "sourceType", dependency.sourceType().name(),
+                    "sourcePath", dependency.sourcePath(),
+                    "targetKey", dependency.targetKey(),
+                    "metadata", dependency.metadata()
+                )
+            ))
+            .toList();
     }
 
     private Map<String, Object> requestTemplate(
