@@ -307,6 +307,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             "AgentMemoryFeedbackApplicationService",
             "AgentPolicyService",
             "ApiAnalysisApplicationService",
+            "BusinessFlowDiscoveryService",
             "ControlledPlannerService",
             "EmbeddingService",
             "ExecutableRequestBuilder",

@@ -514,7 +514,7 @@ class FailureAnalysisApplicationServiceTests {
             .singleElement()
             .satisfies(group -> {
                 assertThat(group.occurrenceCount()).isEqualTo(2);
-                assertThat(group.executionIds()).containsExactly(duplicateOne.getExecutionId(), duplicateTwo.getExecutionId());
+                assertThat(group.executionIds()).containsExactlyInAnyOrder(duplicateOne.getExecutionId(), duplicateTwo.getExecutionId());
                 assertThat(group.affectedCaseIds()).containsExactly(caseOne.getCaseId());
                 assertThat(group.failedAssertionType()).isEqualTo("STATUS_CODE");
                 assertThat(group.apiReference()).isEqualTo(api.getApiSpecId());

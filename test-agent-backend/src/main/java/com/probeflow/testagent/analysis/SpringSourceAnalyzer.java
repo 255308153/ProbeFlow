@@ -130,7 +130,7 @@ class SpringSourceAnalyzer {
         var sourceLocation = new LinkedHashMap<String, Object>();
         sourceLocation.put("materialId", material.getMaterialId());
         sourceLocation.put("filePath", javaFile.toString());
-        sourceLocation.put("relativePath", sourceRoot.relativize(javaFile).toString());
+        sourceLocation.put("relativePath", sourceRoot.relativize(javaFile).toString().replace('\\', '/'));
         sourceLocation.put("className", controller.getNameAsString());
         sourceLocation.put("methodName", method.getNameAsString());
         method.getBegin().ifPresent(position -> sourceLocation.put("line", position.line));

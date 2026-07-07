@@ -14,7 +14,7 @@ public record BusinessFlowDiscoveryRequest(
     List<LongTermMemoryRetrievalHit> memoryHits,
     List<String> selectedApiSpecIds,
     BusinessFlowDiscoveryProviderMode providerMode,
-    boolean allowManualRealLlm,
+    boolean allowManualLlmProvider,
     List<BusinessFlowDiscoveryEvidence> llmSuggestionEvidence,
     String runProfile,
     Map<String, Object> metadata

@@ -17,7 +17,7 @@ public class BusinessFlowDiscoveryService {
 
     public BusinessFlowDiscoveryResult discover(BusinessFlowDiscoveryRequest request) {
         if (request.providerMode() == BusinessFlowDiscoveryProviderMode.MANUAL_REAL_LLM
-            && !request.allowManualRealLlm()) {
+            && !request.allowManualLlmProvider()) {
             var blocker = blocker(
                 "LLM_PROVIDER_BLOCKED",
                 "ERROR",
@@ -92,7 +92,7 @@ public class BusinessFlowDiscoveryService {
             blockers.isEmpty() ? BusinessFlowDiscoveryStatus.COMPLETED : BusinessFlowDiscoveryStatus.BLOCKED,
             request.fixtureId(),
             request.providerMode(),
-            request.providerMode() == BusinessFlowDiscoveryProviderMode.MANUAL_REAL_LLM && request.allowManualRealLlm(),
+            request.providerMode() == BusinessFlowDiscoveryProviderMode.MANUAL_REAL_LLM && request.allowManualLlmProvider(),
             false,
             List.of(candidate),
             blockers,

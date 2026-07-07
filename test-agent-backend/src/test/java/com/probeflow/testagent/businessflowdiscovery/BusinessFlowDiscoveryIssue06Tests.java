@@ -26,7 +26,7 @@ class BusinessFlowDiscoveryIssue06Tests {
         var result = new BusinessFlowDiscoveryService().discover(request);
 
         assertThat(result.status()).isEqualTo(BusinessFlowDiscoveryStatus.BLOCKED);
-        assertThat(result.usesRealLlm()).isFalse();
+        assertThat(result.usesManualLlmProvider()).isFalse();
         assertThat(result.usesExternalHttp()).isFalse();
         assertThat(result.candidates()).isEmpty();
         assertThat(result.blockers())
@@ -61,7 +61,7 @@ class BusinessFlowDiscoveryIssue06Tests {
         var candidate = result.candidates().get(0);
 
         assertThat(result.status()).isEqualTo(BusinessFlowDiscoveryStatus.COMPLETED);
-        assertThat(result.usesRealLlm()).isTrue();
+        assertThat(result.usesManualLlmProvider()).isTrue();
         assertThat(result.usesExternalHttp()).isFalse();
         assertThat(candidate.sourceCoverage().llmSuggestionEvidenceCount()).isEqualTo(1);
         assertThat(candidate.evidence())

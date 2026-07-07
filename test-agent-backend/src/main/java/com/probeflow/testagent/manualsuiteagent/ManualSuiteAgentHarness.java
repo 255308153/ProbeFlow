@@ -595,7 +595,7 @@ public class ManualSuiteAgentHarness {
             "schemaVersion", result.schemaVersion(),
             "status", result.status().name(),
             "providerMode", result.providerMode().name(),
-            "usesRealLlm", result.usesRealLlm(),
+            ManualSuiteAgentRunResult.USES_REAL_LLM_REPORT_KEY, result.usesManualLlmProvider(),
             "usesExternalHttp", result.usesExternalHttp(),
             "candidateCount", result.candidates().size(),
             "sourceCoverage", sourceCoverageSummary(result.sourceCoverage()),

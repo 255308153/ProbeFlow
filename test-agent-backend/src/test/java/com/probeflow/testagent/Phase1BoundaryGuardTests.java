@@ -45,6 +45,7 @@ class Phase1BoundaryGuardTests {
             "agentpolicy",
             "analysis",
             "apispec",
+            "businessflowdiscovery",
             "changelog",
             "controlledplanner",
             "executionrecord",

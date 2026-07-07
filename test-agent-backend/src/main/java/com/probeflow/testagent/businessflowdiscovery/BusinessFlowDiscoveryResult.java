@@ -9,7 +9,7 @@ public record BusinessFlowDiscoveryResult(
     BusinessFlowDiscoveryStatus status,
     String fixtureId,
     BusinessFlowDiscoveryProviderMode providerMode,
-    boolean usesRealLlm,
+    boolean usesManualLlmProvider,
     boolean usesExternalHttp,
     List<BusinessFlowCandidate> candidates,
     List<BusinessFlowDiscoveryBlocker> blockers,

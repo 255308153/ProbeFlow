@@ -21,7 +21,7 @@ class BusinessFlowDiscoveryIssue01Tests {
         assertThat(result.schemaVersion()).isEqualTo(BusinessFlowDiscoveryResult.SCHEMA_VERSION);
         assertThat(result.fixtureId()).isEqualTo("order-suite-demo");
         assertThat(result.providerMode()).isEqualTo(BusinessFlowDiscoveryProviderMode.DETERMINISTIC_FAKE);
-        assertThat(result.usesRealLlm()).isFalse();
+        assertThat(result.usesManualLlmProvider()).isFalse();
         assertThat(result.usesExternalHttp()).isFalse();
         assertThat(result.candidates()).hasSize(1);
 
@@ -55,7 +55,7 @@ class BusinessFlowDiscoveryIssue01Tests {
         assertThat(result.blockers())
             .extracting(BusinessFlowDiscoveryBlocker::code)
             .containsExactly("MISSING_API_SPECS");
-        assertThat(result.usesRealLlm()).isFalse();
+        assertThat(result.usesManualLlmProvider()).isFalse();
         assertThat(result.usesExternalHttp()).isFalse();
     }
 

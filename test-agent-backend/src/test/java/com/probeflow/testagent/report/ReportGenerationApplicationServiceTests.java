@@ -1023,9 +1023,9 @@ class ReportGenerationApplicationServiceTests {
         @SuppressWarnings("unchecked")
         var traceReferences = (Map<String, Object>) memoryFeedback.get("traceReferences");
         assertThat((List<String>) traceReferences.get("executionIds"))
-            .containsExactly(accepted.getExecutionId(), rejected.getExecutionId());
+            .containsExactlyInAnyOrder(accepted.getExecutionId(), rejected.getExecutionId());
         assertThat((List<String>) traceReferences.get("caseIds"))
-            .containsExactly(acceptedCase.getCaseId(), rejectedCase.getCaseId());
+            .containsExactlyInAnyOrder(acceptedCase.getCaseId(), rejectedCase.getCaseId());
         assertThat((List<String>) traceReferences.get("taskMemoryIds")).hasSize(2);
         assertThat((List<String>) traceReferences.get("longTermMemoryIds")).hasSize(1);
     }

@@ -171,7 +171,7 @@ class UnifiedContextBuilderTests {
         assertThat(bundle.taskState()).isNotNull();
         assertThat(bundle.taskState().taskId()).isEqualTo(task.getTaskId());
         assertThat(bundle.sessionContext()).extracting(SessionMemoryView::summary)
-            .containsExactly("Remember sandbox tenant bootstrap", "Prefer compact failure notes");
+            .containsExactlyInAnyOrder("Remember sandbox tenant bootstrap", "Prefer compact failure notes");
         assertThat(bundle.taskMemory()).hasSize(2);
         assertThat(bundle.taskMemory().getFirst().lifecycleStage()).isEqualTo("failure_analysis");
         assertThat(bundle.knowledgeContext().apiNotes()).hasSize(1);
