@@ -25,7 +25,7 @@ class ManualSuiteAgentHarnessIssue01Tests {
         assertThat(first.fixtureId()).isEqualTo("v3-smoke");
         assertThat(first.fixtureVersion()).isEqualTo("2026.07.v1");
         assertThat(first.providerMode()).isEqualTo(ManualSuiteAgentProviderMode.DETERMINISTIC_FAKE);
-        assertThat(first.usesRealLlm()).isFalse();
+        assertThat(first.usesRealProvider()).isFalse();
         assertThat(first.usesExternalHttp()).isFalse();
         assertThat(first.sections())
             .extracting(ManualSuiteAgentSectionSummary::sectionId)

@@ -11,6 +11,8 @@ public record ManualSuiteAgentArtifactReference(
 ) {
 
     public ManualSuiteAgentArtifactReference {
-        metadata = metadata == null ? Map.of() : new LinkedHashMap<>(metadata);
+        metadata = metadata == null
+            ? Map.of()
+            : new LinkedHashMap<>(new ManualSuiteAgentRedactor().redactMap(metadata));
     }
 }

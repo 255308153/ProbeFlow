@@ -102,7 +102,7 @@ public class ManualSuiteAgentHarness {
         }
 
         if (request.providerMode() == ManualSuiteAgentProviderMode.MANUAL_REAL_LLM
-            && !request.allowManualRealLlm()) {
+            && !request.allowManualProvider()) {
             var completedAt = Instant.now();
             return writeBestEffort(baseResult(
                 request,
@@ -113,11 +113,11 @@ public class ManualSuiteAgentHarness {
                 List.of(),
                 List.of(ManualSuiteAgentDiagnostic.error(
                     "PROVIDER_BLOCKED",
-                    "Manual real LLM mode requires explicit allowManualRealLlm=true.",
+                    "Manual LLM provider mode requires explicit --allow-manual-real-llm.",
                     Map.of(
                         "fixtureId", request.fixtureId(),
                         "providerMode", request.providerMode().name(),
-                        "allowManualRealLlm", request.allowManualRealLlm()
+                        "allowManualProvider", request.allowManualProvider()
                     )
                 )),
                 Map.of()
@@ -557,7 +557,7 @@ public class ManualSuiteAgentHarness {
             startedAt,
             completedAt,
             request.runProfile(),
-            request.providerMode() == ManualSuiteAgentProviderMode.MANUAL_REAL_LLM && request.allowManualRealLlm(),
+            request.providerMode() == ManualSuiteAgentProviderMode.MANUAL_REAL_LLM && request.allowManualProvider(),
             request.allowExternalHttp(),
             fixtureSummary,
             sections,
@@ -600,7 +600,7 @@ public class ManualSuiteAgentHarness {
                 ManualSuiteAgentSectionSource.REAL,
                 "READY",
                 orderedMap(
-                    "usesRealLlm", false,
+                    ManualSuiteAgentRunResult.USES_REAL_LLM_REPORT_KEY, false,
                     "usesExternalHttp", false,
                     "runProfile", request.runProfile()
                 )

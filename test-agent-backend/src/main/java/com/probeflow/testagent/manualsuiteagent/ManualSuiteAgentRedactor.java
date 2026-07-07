@@ -5,8 +5,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 public class ManualSuiteAgentRedactor {
+
+    private static final Pattern BEARER_TOKEN = Pattern.compile("(?i)Bearer\\s+[^\\s,;)}]+");
 
     public Object redact(Object value) {
         return redactValue("", value);
@@ -37,8 +40,8 @@ public class ManualSuiteAgentRedactor {
             }
             return redacted;
         }
-        if (value instanceof String text && text.regionMatches(true, 0, "Bearer ", 0, "Bearer ".length())) {
-            return "Bearer [REDACTED]";
+        if (value instanceof String text) {
+            return BEARER_TOKEN.matcher(text).replaceAll("Bearer [REDACTED]");
         }
         return value;
     }

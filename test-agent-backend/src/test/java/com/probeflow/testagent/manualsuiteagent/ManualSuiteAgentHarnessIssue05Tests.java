@@ -26,7 +26,7 @@ class ManualSuiteAgentHarnessIssue05Tests {
         assertThat(result.status()).isEqualTo(ManualSuiteAgentRunStatus.COMPLETED);
         assertThat(result.fixtureId()).isEqualTo("order-suite-demo");
         assertThat(result.providerMode()).isEqualTo(ManualSuiteAgentProviderMode.DETERMINISTIC_FAKE);
-        assertThat(result.usesRealLlm()).isFalse();
+        assertThat(result.usesRealProvider()).isFalse();
         assertThat(result.usesExternalHttp()).isFalse();
 
         var output = stdout.toString(StandardCharsets.UTF_8);

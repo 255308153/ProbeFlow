@@ -28,7 +28,7 @@ public final class ManualSuiteAgentHarnessCli {
         out.println("fixtureId=" + result.fixtureId());
         out.println("fixtureVersion=" + result.fixtureVersion());
         out.println("providerMode=" + result.providerMode().name());
-        out.println("usesRealLlm=" + result.usesRealLlm());
+        out.println(ManualSuiteAgentRunResult.USES_REAL_LLM_REPORT_KEY + "=" + result.usesRealProvider());
         out.println("usesExternalHttp=" + result.usesExternalHttp());
         out.println("jsonReport=" + artifactPath(result, "JSON_REPORT"));
         out.println("markdownReport=" + artifactPath(result, "MARKDOWN_REPORT"));
@@ -52,7 +52,7 @@ public final class ManualSuiteAgentHarnessCli {
         String fixtureId,
         Path outputDirectory,
         String providerMode,
-        boolean allowManualRealLlm,
+        boolean allowManualProvider,
         String runProfile
     ) {
 
@@ -60,7 +60,7 @@ public final class ManualSuiteAgentHarnessCli {
             var fixtureId = "order-suite-demo";
             var outputDirectory = Path.of("target", "v3-manual-suite-agent");
             var providerMode = ManualSuiteAgentProviderMode.DETERMINISTIC_FAKE.name();
-            var allowManualRealLlm = false;
+            var allowManualProvider = false;
             var runProfile = "local-demo";
 
             for (var arg : args == null ? new String[0] : args) {
@@ -75,10 +75,10 @@ public final class ManualSuiteAgentHarnessCli {
                 } else if (arg.startsWith("--run-profile=")) {
                     runProfile = arg.substring("--run-profile=".length());
                 } else if ("--allow-manual-real-llm".equals(arg)) {
-                    allowManualRealLlm = true;
+                    allowManualProvider = true;
                 }
             }
-            return new CliOptions(fixtureId, outputDirectory, providerMode, allowManualRealLlm, runProfile);
+            return new CliOptions(fixtureId, outputDirectory, providerMode, allowManualProvider, runProfile);
         }
 
         ManualSuiteAgentRunRequest toRequest() {
@@ -90,7 +90,7 @@ public final class ManualSuiteAgentHarnessCli {
                     fixtureId,
                     ManualSuiteAgentProviderMode.MANUAL_REAL_LLM,
                     outputDirectory,
-                    allowManualRealLlm,
+                    allowManualProvider,
                     false,
                     runProfile,
                     ManualSuiteAgentProviderMode.MANUAL_REAL_LLM.name()
@@ -101,7 +101,7 @@ public final class ManualSuiteAgentHarnessCli {
                 provider.fixtureId(),
                 provider.providerMode(),
                 provider.outputDirectory(),
-                provider.allowManualRealLlm(),
+                provider.allowManualProvider(),
                 provider.allowExternalHttp(),
                 runProfile,
                 provider.requestedProviderMode()

@@ -14,17 +14,17 @@ class ManualSuiteAgentHarnessIssue04Tests {
     private Path outputDir;
 
     @Test
-    void defaultRunUsesFakeProviderAndBlocksManualRealLlmUnlessExplicitlyAllowed() throws Exception {
+    void defaultRunUsesFakeProviderAndBlocksManualLlmProviderUnlessExplicitlyAllowed() throws Exception {
         var harness = ManualSuiteAgentHarness.defaults();
 
         var defaultRun = harness.run(ManualSuiteAgentRunRequest.fake("order-suite-demo", outputDir));
         assertThat(defaultRun.providerMode()).isEqualTo(ManualSuiteAgentProviderMode.DETERMINISTIC_FAKE);
-        assertThat(defaultRun.usesRealLlm()).isFalse();
+        assertThat(defaultRun.usesRealProvider()).isFalse();
         assertThat(defaultRun.usesExternalHttp()).isFalse();
 
-        var blocked = harness.run(ManualSuiteAgentRunRequest.manualRealLlm("order-suite-demo", outputDir, false));
+        var blocked = harness.run(ManualSuiteAgentRunRequest.manualLlmProvider("order-suite-demo", outputDir, false));
         assertThat(blocked.status()).isEqualTo(ManualSuiteAgentRunStatus.BLOCKED);
-        assertThat(blocked.usesRealLlm()).isFalse();
+        assertThat(blocked.usesRealProvider()).isFalse();
         assertThat(blocked.diagnostics())
             .extracting(ManualSuiteAgentDiagnostic::code)
             .containsExactly("PROVIDER_BLOCKED");

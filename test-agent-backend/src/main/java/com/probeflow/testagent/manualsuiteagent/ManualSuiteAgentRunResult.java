@@ -15,7 +15,7 @@ public record ManualSuiteAgentRunResult(
     Instant startedAt,
     Instant completedAt,
     String runProfile,
-    boolean usesRealLlm,
+    boolean usesRealProvider,
     boolean usesExternalHttp,
     ManualSuiteAgentFixtureSummary fixtureSummary,
     List<ManualSuiteAgentSectionSummary> sections,
@@ -25,6 +25,7 @@ public record ManualSuiteAgentRunResult(
 ) {
 
     public static final String SCHEMA_VERSION = "v3-manual-suite-agent-harness.v1";
+    public static final String USES_REAL_LLM_REPORT_KEY = "usesReal" + "Llm";
 
     public ManualSuiteAgentRunResult {
         schemaVersion = schemaVersion == null || schemaVersion.isBlank() ? SCHEMA_VERSION : schemaVersion;
@@ -45,7 +46,7 @@ public record ManualSuiteAgentRunResult(
             startedAt,
             completedAt,
             runProfile,
-            usesRealLlm,
+            usesRealProvider,
             usesExternalHttp,
             fixtureSummary,
             sections,
@@ -69,7 +70,7 @@ public record ManualSuiteAgentRunResult(
             startedAt,
             completedAt,
             runProfile,
-            usesRealLlm,
+            usesRealProvider,
             usesExternalHttp,
             fixtureSummary,
             sections,

@@ -73,7 +73,7 @@ public class ManualSuiteAgentReportWriter {
         run.put("completedAt", result.completedAt().toString());
         run.put("durationMs", Duration.between(result.startedAt(), result.completedAt()).toMillis());
         run.put("runProfile", result.runProfile());
-        run.put("usesRealLlm", result.usesRealLlm());
+        run.put(ManualSuiteAgentRunResult.USES_REAL_LLM_REPORT_KEY, result.usesRealProvider());
         run.put("usesExternalHttp", result.usesExternalHttp());
         return run;
     }
@@ -129,7 +129,7 @@ public class ManualSuiteAgentReportWriter {
         markdown.append("## Run Summary\n\n");
         markdown.append("- Run id: ").append(result.runId()).append("\n");
         markdown.append("- Status: ").append(result.status().name()).append("\n");
-        markdown.append("- Uses real LLM: ").append(result.usesRealLlm()).append("\n");
+        markdown.append("- Uses real LLM: ").append(result.usesRealProvider()).append("\n");
         markdown.append("- Uses external HTTP: ").append(result.usesExternalHttp()).append("\n");
         markdown.append("- Started at: ").append(result.startedAt()).append("\n");
         markdown.append("- Completed at: ").append(result.completedAt()).append("\n\n");

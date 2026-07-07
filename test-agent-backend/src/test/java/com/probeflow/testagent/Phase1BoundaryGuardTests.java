@@ -53,6 +53,7 @@ class Phase1BoundaryGuardTests {
             "httpexecution",
             "knowledge",
             "llm",
+            "manualsuiteagent",
             "memory",
             "observation",
             "orchestration",

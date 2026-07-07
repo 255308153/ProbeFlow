@@ -7,7 +7,7 @@ public record ManualSuiteAgentRunRequest(
     String fixtureId,
     ManualSuiteAgentProviderMode providerMode,
     Path outputDirectory,
-    boolean allowManualRealLlm,
+    boolean allowManualProvider,
     boolean allowExternalHttp,
     String runProfile,
     String requestedProviderMode
@@ -35,12 +35,16 @@ public record ManualSuiteAgentRunRequest(
         );
     }
 
-    public static ManualSuiteAgentRunRequest manualRealLlm(String fixtureId, Path outputDirectory, boolean allowManualRealLlm) {
+    public static ManualSuiteAgentRunRequest manualLlmProvider(
+        String fixtureId,
+        Path outputDirectory,
+        boolean allowManualProvider
+    ) {
         return new ManualSuiteAgentRunRequest(
             fixtureId,
             ManualSuiteAgentProviderMode.MANUAL_REAL_LLM,
             outputDirectory,
-            allowManualRealLlm,
+            allowManualProvider,
             false,
             "local-demo",
             ManualSuiteAgentProviderMode.MANUAL_REAL_LLM.name()
