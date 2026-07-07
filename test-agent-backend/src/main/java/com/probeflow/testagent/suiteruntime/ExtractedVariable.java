@@ -11,6 +11,9 @@ public record ExtractedVariable(
     String targetScope,
     String targetKey,
     Object value,
+    boolean required,
+    String failureStrategy,
+    boolean fallbackApplied,
     Map<String, Object> diagnostic
 ) {
 
@@ -22,7 +25,34 @@ public record ExtractedVariable(
         String targetKey,
         Object value
     ) {
-        return new ExtractedVariable(true, false, stepId, sourceType, sourcePath, targetScope, targetKey, value, Map.of());
+        return success(stepId, sourceType, sourcePath, targetScope, targetKey, value, true, "FAIL_FAST", false);
+    }
+
+    public static ExtractedVariable success(
+        String stepId,
+        String sourceType,
+        String sourcePath,
+        String targetScope,
+        String targetKey,
+        Object value,
+        boolean required,
+        String failureStrategy,
+        boolean fallbackApplied
+    ) {
+        return new ExtractedVariable(
+            true,
+            false,
+            stepId,
+            sourceType,
+            sourcePath,
+            targetScope,
+            targetKey,
+            value,
+            required,
+            failureStrategy,
+            fallbackApplied,
+            Map.of()
+        );
     }
 
     public static ExtractedVariable failure(
@@ -32,8 +62,23 @@ public record ExtractedVariable(
         String sourcePath,
         String targetScope,
         String targetKey,
+        boolean required,
+        String failureStrategy,
         Map<String, Object> diagnostic
     ) {
-        return new ExtractedVariable(false, blockingFailure, stepId, sourceType, sourcePath, targetScope, targetKey, null, diagnostic);
+        return new ExtractedVariable(
+            false,
+            blockingFailure,
+            stepId,
+            sourceType,
+            sourcePath,
+            targetScope,
+            targetKey,
+            null,
+            required,
+            failureStrategy,
+            false,
+            diagnostic
+        );
     }
 }
