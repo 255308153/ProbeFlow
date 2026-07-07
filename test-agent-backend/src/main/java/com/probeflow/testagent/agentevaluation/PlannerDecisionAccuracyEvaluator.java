@@ -47,7 +47,7 @@ public class PlannerDecisionAccuracyEvaluator implements AgentEvaluationEvaluato
     ) {
         PlanDecision decision;
         try {
-            decision = planner.plan(plannerInput(fixture, context));
+            decision = plannerFor(context).plan(plannerInput(fixture, context));
         } catch (ControlledPlannerException exception) {
             decision = PlanDecision.failed("Planner threw exception: " + exception.getMessage(), List.of(exception.getMessage()));
         }
@@ -87,6 +87,17 @@ public class PlannerDecisionAccuracyEvaluator implements AgentEvaluationEvaluato
             mismatches,
             List.of(metric)
         );
+    }
+
+    private ControlledPlanner plannerFor(EvaluationRunContext context) {
+        if (
+            context != null
+                && context.providerMode() == EvaluationProviderMode.DETERMINISTIC_FAKE
+                && !(planner instanceof FakeControlledPlanner)
+        ) {
+            return new FakeControlledPlanner();
+        }
+        return planner;
     }
 
     private PlannerInput plannerInput(GoldenTaskFixture fixture, EvaluationRunContext context) {

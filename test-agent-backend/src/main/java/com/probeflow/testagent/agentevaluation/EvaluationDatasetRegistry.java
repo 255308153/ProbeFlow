@@ -15,6 +15,7 @@ public class EvaluationDatasetRegistry {
     public static final String CASE_COVERAGE_DATASET = "v2-phase-8-case-coverage";
     public static final String REPORT_USEFULNESS_DATASET = "v2-phase-8-report-usefulness";
     public static final String MEMORY_REUSE_DATASET = "v2-phase-8-memory-reuse";
+    public static final String REGRESSION_SUITE_DATASET = "v2-phase-8-regression-suite";
 
     public EvaluationDataset load(String datasetName) {
         var effectiveName = datasetName == null || datasetName.isBlank() ? SMOKE_DATASET : datasetName.trim();
@@ -27,6 +28,7 @@ public class EvaluationDatasetRegistry {
             case CASE_COVERAGE_DATASET -> caseCoverageDataset();
             case REPORT_USEFULNESS_DATASET -> reportUsefulnessDataset();
             case MEMORY_REUSE_DATASET -> memoryReuseDataset();
+            case REGRESSION_SUITE_DATASET -> regressionSuiteDataset();
             default -> throw new IllegalArgumentException("Unknown evaluation dataset: " + effectiveName);
         };
     }
@@ -500,6 +502,194 @@ public class EvaluationDatasetRegistry {
             List.of("report-usefulness"),
             "Evaluate generated report usefulness and no-secret safety for " + fixtureId + ".",
             EvaluationFixtureType.REPORT_USEFULNESS,
+            expected,
+            setup
+        );
+    }
+
+    private EvaluationDataset regressionSuiteDataset() {
+        return new EvaluationDataset(
+            REGRESSION_SUITE_DATASET,
+            "2026-07-07",
+            List.of(
+                plannerFixture("regression-planner-continue", "CONTINUE", Map.of(
+                    "plannerStatus", "PROPOSED",
+                    "plannerAction", "CONTINUE",
+                    "confidenceMin", 0.9d,
+                    "confidenceMax", 1.0d,
+                    "riskLevel", "LOW"
+                )),
+                toolPolicyFixture(
+                    "regression-policy-validation-allowed",
+                    Map.of(
+                        "toolName", "knowledge.retrieve-context",
+                        "taskPhase", "CONTEXT_BUILDING",
+                        "toolInput", Map.of("taskId", "task-regression", "query", "payment auth"),
+                        "satisfiedPreconditions", List.of("TASK_EXISTS")
+                    ),
+                    Map.of(
+                        "toolName", "knowledge.retrieve-context",
+                        "policyStatus", "ALLOWED",
+                        "policyReason", "TOOL_ALLOWED_BY_POLICY"
+                    )
+                ),
+                contextCitationFixture(
+                    "regression-context-citation-payment-auth",
+                    Map.ofEntries(
+                        Map.entry("seedDeterministicContext", true),
+                        Map.entry("taskId", "p8-reg-context-task-pay"),
+                        Map.entry("apiSpecId", "p8-reg-context-api-pay"),
+                        Map.entry("stageProfile", "failure_analysis"),
+                        Map.entry("rawQuery", "payment auth PAY_REG_401 tenant bootstrap"),
+                        Map.entry("systemName", "order-platform"),
+                        Map.entry("moduleName", "payment-regression"),
+                        Map.entry("apiPath", "/api/phase8/regression/orders/pay"),
+                        Map.entry("errorCode", "PAY_REG_401"),
+                        Map.entry("tags", List.of("payment", "auth", "tenant", "PAY_REG_401", "phase8-regression")),
+                        Map.entry("tokenBudget", 500),
+                        Map.entry("seedKnowledgeSourceRef", "phase8/regression/wiki/payment-auth-note.md"),
+                        Map.entry("seedMemorySourceRef", "phase8-regression-ltm-payment-auth")
+                    ),
+                    Map.of(
+                        "expectedKnowledgeCitations", List.of("phase8/regression/wiki/payment-auth-note.md"),
+                        "expectedMemoryCitations", List.of("phase8-regression-ltm-payment-auth"),
+                        "expectedCoverage", List.of("api", "task-state", "knowledge", "memory"),
+                        "allowedIrrelevantCitationCount", 0,
+                        "tokenBudget", 500,
+                        "expectedLowConfidence", false
+                    )
+                ),
+                failureFixture(
+                    "regression-failure-auth-401",
+                    Map.of(
+                        "overallStatus", "FAILED",
+                        "statusCode", 401,
+                        "requestPath", "/api/orders/pay",
+                        "criticalFailed", false
+                    ),
+                    Map.of(
+                        "classification", "AUTH_ISSUE",
+                        "failureReasonContains", "AUTH_ISSUE",
+                        "riskLevel", "MEDIUM",
+                        "nextSuggestionContains", "Inspect auth variables",
+                        "memoryCandidatePresent", true
+                    )
+                ),
+                caseCoverageFixture(
+                    "regression-case-coverage-single-order",
+                    Map.of(
+                        "generationMode", "SINGLE",
+                        "scenarioCategories", List.of(
+                            "HAPPY_PATH",
+                            "MISSING_REQUIRED",
+                            "INVALID_VALUE",
+                            "BOUNDARY_VALUE",
+                            "AUTHENTICATION_FAILURE",
+                            "BUSINESS_RULE"
+                        ),
+                        "includeKnowledge", true
+                    ),
+                    Map.of(
+                        "expectedCoverageCategories", List.of(
+                            "happy-path",
+                            "validation-negative",
+                            "auth-negative",
+                            "boundary-value",
+                            "business-rule"
+                        ),
+                        "requiredHappyPathScenario", "HAPPY_PATH",
+                        "requiredValidationNegativeCases", List.of("MISSING_REQUIRED", "INVALID_VALUE"),
+                        "requiredAuthNegativeCases", List.of("AUTHENTICATION_FAILURE"),
+                        "requiredBoundaryValueCases", List.of("BOUNDARY_VALUE"),
+                        "requiredBusinessRuleCases", List.of("BUSINESS_RULE"),
+                        "requireRequestVariationEvidence", true,
+                        "requireAssertionEvidence", true,
+                        "requireScenarioMetadata", true,
+                        "allowedDuplicateCount", 0
+                    )
+                ),
+                reportUsefulnessFixture(
+                    "regression-report-usefulness-auth-failure",
+                    Map.of(
+                        "statusCode", 401,
+                        "overallStatus", "FAILED",
+                        "requestPath", "/api/orders/pay",
+                        "environment", "qa",
+                        "criticalFailed", false
+                    ),
+                    Map.of(
+                        "expectedReportSections", List.of(
+                            "summary",
+                            "execution-stats",
+                            "failure-evidence",
+                            "recommendations",
+                            "source-references",
+                            "memory-learning-summary"
+                        ),
+                        "expectedEvidenceTypes", List.of("execution", "observation", "citation", "memory-feedback"),
+                        "expectedRecommendationContains", "Inspect credentials",
+                        "forbidSecretLeakage", true
+                    )
+                ),
+                memoryReuseFixture(
+                    "regression-memory-reuse-payment-auth-loop",
+                    Map.of(
+                        "systemName", "order-platform",
+                        "moduleName", "payment-regression-memory"
+                    ),
+                    Map.of(
+                        "expectedFirstStageLearning", true,
+                        "expectedRepeatedFailureMerge", true,
+                        "expectedRecall", true,
+                        "expectedCitation", true,
+                        "expectedUsageRecord", true,
+                        "expectedPositiveFeedbackIncrease", true,
+                        "expectedNegativeFeedbackDecrease", true,
+                        "expectedConsumer", "AGENT_EVALUATION"
+                    )
+                )
+            ),
+            0.8d,
+            Map.of(
+                PlannerDecisionAccuracyEvaluator.METRIC_NAME, 0.8d,
+                ToolSelectionPolicyValidityEvaluator.METRIC_NAME, 0.8d,
+                ContextCitationUsefulnessEvaluator.METRIC_NAME, 0.8d,
+                FailureClassificationAccuracyEvaluator.METRIC_NAME, 0.8d,
+                TestCaseCoverageEvaluator.METRIC_NAME, 0.8d,
+                ReportUsefulnessNoSecretEvaluator.METRIC_NAME, 0.8d,
+                MemoryReuseClosedLoopEvaluator.METRIC_NAME, 0.8d
+            ),
+            Map.of(
+                PlannerDecisionAccuracyEvaluator.METRIC_NAME, 1.0d,
+                ToolSelectionPolicyValidityEvaluator.METRIC_NAME, 1.5d,
+                ContextCitationUsefulnessEvaluator.METRIC_NAME, 1.5d,
+                FailureClassificationAccuracyEvaluator.METRIC_NAME, 1.5d,
+                TestCaseCoverageEvaluator.METRIC_NAME, 1.5d,
+                ReportUsefulnessNoSecretEvaluator.METRIC_NAME, 1.0d,
+                MemoryReuseClosedLoopEvaluator.METRIC_NAME, 2.0d
+            ),
+            Map.of(
+                "regression-planner-continue", 0.8d,
+                "regression-policy-validation-allowed", 0.8d,
+                "regression-context-citation-payment-auth", 0.8d,
+                "regression-failure-auth-401", 0.8d,
+                "regression-case-coverage-single-order", 0.8d,
+                "regression-report-usefulness-auth-failure", 0.8d,
+                "regression-memory-reuse-payment-auth-loop", 0.8d
+            )
+        );
+    }
+
+    private GoldenTaskFixture contextCitationFixture(
+        String fixtureId,
+        Map<String, Object> setup,
+        Map<String, Object> expected
+    ) {
+        return new GoldenTaskFixture(
+            fixtureId,
+            List.of("context-citation"),
+            "Evaluate ContextBundle citation quality for " + fixtureId + ".",
+            EvaluationFixtureType.CONTEXT_CITATION,
             expected,
             setup
         );

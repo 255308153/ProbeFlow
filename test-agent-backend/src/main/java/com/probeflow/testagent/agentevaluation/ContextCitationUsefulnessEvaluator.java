@@ -1,10 +1,31 @@
 package com.probeflow.testagent.agentevaluation;
 
+import com.probeflow.testagent.apispec.ApiSpec;
+import com.probeflow.testagent.apispec.ApiSpecRepository;
+import com.probeflow.testagent.apispec.ApiSpecSourceType;
+import com.probeflow.testagent.apispec.HttpMethod;
+import com.probeflow.testagent.knowledge.DocumentAuthority;
+import com.probeflow.testagent.knowledge.DocumentSourceType;
+import com.probeflow.testagent.knowledge.DocumentType;
+import com.probeflow.testagent.knowledge.KnowledgeContentFormat;
+import com.probeflow.testagent.knowledge.KnowledgeIngestApplicationService;
+import com.probeflow.testagent.knowledge.KnowledgeIngestRequest;
 import com.probeflow.testagent.memory.ContextBundle;
 import com.probeflow.testagent.memory.ContextCitation;
+import com.probeflow.testagent.memory.MemoryCandidateRequest;
+import com.probeflow.testagent.memory.MemoryRefineryService;
+import com.probeflow.testagent.memory.MemorySourceType;
 import com.probeflow.testagent.memory.MemoryUsageConsumer;
 import com.probeflow.testagent.memory.UnifiedContextBuilder;
 import com.probeflow.testagent.memory.UnifiedContextQuery;
+import com.probeflow.testagent.task.MemoryRefinementStatus;
+import com.probeflow.testagent.task.Task;
+import com.probeflow.testagent.task.TaskPriority;
+import com.probeflow.testagent.task.TaskRepository;
+import com.probeflow.testagent.task.TaskSourceType;
+import com.probeflow.testagent.task.TaskStatus;
+import com.probeflow.testagent.task.TaskType;
+import com.probeflow.testagent.testcasedraft.PromotionMode;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -19,9 +40,23 @@ public class ContextCitationUsefulnessEvaluator implements AgentEvaluationEvalua
     public static final String METRIC_NAME = "context-citation";
 
     private final UnifiedContextBuilder contextBuilder;
+    private final ApiSpecRepository apiSpecs;
+    private final TaskRepository tasks;
+    private final KnowledgeIngestApplicationService knowledgeIngest;
+    private final MemoryRefineryService memoryRefinery;
 
-    public ContextCitationUsefulnessEvaluator(UnifiedContextBuilder contextBuilder) {
+    public ContextCitationUsefulnessEvaluator(
+        UnifiedContextBuilder contextBuilder,
+        ApiSpecRepository apiSpecs,
+        TaskRepository tasks,
+        KnowledgeIngestApplicationService knowledgeIngest,
+        MemoryRefineryService memoryRefinery
+    ) {
         this.contextBuilder = contextBuilder;
+        this.apiSpecs = apiSpecs;
+        this.tasks = tasks;
+        this.knowledgeIngest = knowledgeIngest;
+        this.memoryRefinery = memoryRefinery;
     }
 
     @Override
@@ -40,6 +75,7 @@ public class ContextCitationUsefulnessEvaluator implements AgentEvaluationEvalua
         GoldenTaskFixture fixture,
         EvaluationRunContext context
     ) {
+        seedDeterministicContextIfRequested(fixture);
         var bundle = contextBuilder.build(query(fixture, context));
         var expected = fixture.expectedResults();
         var actual = actual(bundle);
@@ -93,6 +129,111 @@ public class ContextCitationUsefulnessEvaluator implements AgentEvaluationEvalua
             MemoryUsageConsumer.AGENT_EVALUATION,
             fixture.fixtureId() + ":" + context.runId()
         );
+    }
+
+    private void seedDeterministicContextIfRequested(GoldenTaskFixture fixture) {
+        var setup = fixture.setupMetadata();
+        if (!bool(setup.get("seedDeterministicContext"), false)) {
+            return;
+        }
+
+        var apiSpecId = text(setup, "apiSpecId", "phase8-regression-context-api");
+        var taskId = text(setup, "taskId", "phase8-regression-context-task");
+        var systemName = text(setup, "systemName", "order-platform");
+        var moduleName = text(setup, "moduleName", "payment");
+        var apiPath = text(setup, "apiPath", "/api/phase8/regression/pay");
+        var errorCode = text(setup, "errorCode", "PAY_REG_401");
+        var tags = list(setup.get("tags")).stream()
+            .map(value -> value.toLowerCase(java.util.Locale.ROOT))
+            .distinct()
+            .sorted()
+            .toList();
+        var effectiveTags = tags.isEmpty() ? List.of("payment", "auth", "tenant", errorCode.toLowerCase()) : tags;
+
+        if (!apiSpecs.existsById(apiSpecId)) {
+            apiSpecs.save(newSeedApiSpec(apiSpecId, systemName, moduleName, apiPath));
+        }
+        if (!tasks.existsById(taskId)) {
+            tasks.save(newSeedTask(taskId, apiSpecId, fixture));
+        }
+        knowledgeIngest.ingest(new KnowledgeIngestRequest(
+            text(setup, "seedKnowledgeTitle", "Phase 8 regression payment auth note"),
+            KnowledgeContentFormat.MARKDOWN,
+            "# Phase 8 regression payment auth note\n\nPOST " + apiPath
+                + " returns " + errorCode
+                + " when tenant bootstrap is skipped before auth validation.",
+            DocumentSourceType.WIKI,
+            text(setup, "seedKnowledgeSourceRef", "phase8/regression/wiki/payment-auth-note.md"),
+            DocumentType.API_NOTE,
+            DocumentAuthority.HIGH,
+            systemName,
+            moduleName,
+            "payment",
+            effectiveTags,
+            List.of(text(setup, "stageProfile", "failure_analysis")),
+            Map.of("fixtureId", fixture.fixtureId(), "capability", METRIC_NAME)
+        ));
+        memoryRefinery.refine(new MemoryCandidateRequest(
+            errorCode + " tenant bootstrap memory",
+            "Failure analysis learned that " + errorCode
+                + " on payment execution means tenant bootstrap was skipped before auth.",
+            MemorySourceType.EXECUTION_RESULT,
+            text(setup, "seedMemorySourceRef", "phase8-regression-ltm-payment-auth"),
+            taskId,
+            effectiveTags,
+            0.92f,
+            "ExecutionRecord showed " + errorCode + " disappears after tenant bootstrap is restored.",
+            Map.of(
+                "systemName", systemName,
+                "module", moduleName,
+                "apiPath", apiPath,
+                "errorCode", errorCode,
+                "fixtureId", fixture.fixtureId()
+            )
+        ));
+    }
+
+    private ApiSpec newSeedApiSpec(String apiSpecId, String systemName, String moduleName, String apiPath) {
+        var apiSpec = new ApiSpec();
+        apiSpec.setApiSpecId(apiSpecId);
+        apiSpec.setSystemName(systemName);
+        apiSpec.setModuleName(moduleName);
+        apiSpec.setHttpMethod(HttpMethod.POST);
+        apiSpec.setPath(apiPath);
+        apiSpec.setSummary("Phase 8 regression payment auth API");
+        apiSpec.setDescription("Payment API used by deterministic context-citation evaluation.");
+        apiSpec.setOperationId("phase8RegressionPay");
+        apiSpec.setParameters(Map.of("body", Map.of("orderId", Map.of("type", "string", "required", true))));
+        apiSpec.setConstraints(Map.of("requiresTenantBootstrap", true));
+        apiSpec.setAuth(Map.of("required", true, "type", "bearer"));
+        apiSpec.setSourceType(ApiSpecSourceType.OPENAPI);
+        apiSpec.setSourceRef("phase8-agent-evaluation-regression-context");
+        apiSpec.setSourceLocation(Map.of("fixture", METRIC_NAME));
+        apiSpec.setRouteReady(true);
+        apiSpec.setBasicParamReady(true);
+        apiSpec.setDtoExpanded(true);
+        apiSpec.setValidationReady(true);
+        apiSpec.setAuthReady(true);
+        apiSpec.setKnowledgeContextReady(false);
+        apiSpec.setPresentInLatestAnalysis(true);
+        return apiSpec;
+    }
+
+    private Task newSeedTask(String taskId, String apiSpecId, GoldenTaskFixture fixture) {
+        var task = new Task();
+        task.setTaskId(taskId);
+        task.setTaskType(TaskType.API_TEST);
+        task.setTaskName("Phase 8 context citation evaluation " + fixture.fixtureId());
+        task.setStatus(TaskStatus.ANALYZING_RESULTS);
+        task.setSourceType(TaskSourceType.MANUAL);
+        task.setSourceRef("phase8-agent-evaluation");
+        task.setTargetApiSpecIds(List.of(apiSpecId));
+        task.setPromotionMode(PromotionMode.MANUAL);
+        task.setMemoryRefinementStatus(MemoryRefinementStatus.PENDING);
+        task.setPriority(TaskPriority.HIGH);
+        task.setCreator("phase8-agent-evaluation");
+        task.setMetadata(Map.of("fixtureId", fixture.fixtureId(), "capability", METRIC_NAME));
+        return task;
     }
 
     private Map<String, Object> actual(ContextBundle bundle) {
@@ -269,6 +410,16 @@ public class ContextCitationUsefulnessEvaluator implements AgentEvaluationEvalua
             return fallback;
         }
         return Integer.parseInt(String.valueOf(value));
+    }
+
+    private boolean bool(Object value, boolean fallback) {
+        if (value == null) {
+            return fallback;
+        }
+        if (value instanceof Boolean bool) {
+            return bool;
+        }
+        return Boolean.parseBoolean(String.valueOf(value));
     }
 
     private List<String> list(Object value) {

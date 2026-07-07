@@ -11,6 +11,7 @@ public record EvaluationReport(
     Map<String, Object> runSummary,
     List<Map<String, Object>> caseSummary,
     Map<String, Map<String, Object>> metricSummary,
+    List<String> failedMetrics,
     List<String> recommendedFixes,
     String humanReadableSummary
 ) {
@@ -19,6 +20,7 @@ public record EvaluationReport(
         runSummary = runSummary == null ? Map.of() : Map.copyOf(runSummary);
         caseSummary = caseSummary == null ? List.of() : List.copyOf(caseSummary);
         metricSummary = metricSummary == null ? Map.of() : Map.copyOf(metricSummary);
+        failedMetrics = failedMetrics == null ? List.of() : List.copyOf(failedMetrics);
         recommendedFixes = recommendedFixes == null ? List.of() : List.copyOf(recommendedFixes);
         humanReadableSummary = humanReadableSummary == null ? "" : humanReadableSummary.trim();
     }
@@ -46,17 +48,24 @@ public record EvaluationReport(
             .map(metric -> metric.metricName() + ": " + metric.diagnosticMessage())
             .distinct()
             .toList();
+        var failedMetrics = cases.stream()
+            .flatMap(result -> result.metricResults().stream())
+            .filter(metric -> !metric.passed())
+            .map(EvaluationMetricResult::metricName)
+            .distinct()
+            .sorted()
+            .toList();
         var human = "Evaluation " + run.runId()
             + " for " + run.datasetName() + " " + run.datasetVersion()
             + " completed with " + run.status()
             + " at score " + run.overallScore() + ".";
-        return new EvaluationReport(run.runId(), runSummary, caseSummary, metricSummary, fixes, human);
+        return new EvaluationReport(run.runId(), runSummary, caseSummary, metricSummary, failedMetrics, fixes, human);
     }
 
     public EvaluationReport withRecommendedFix(String capability, String message) {
         var fixes = new ArrayList<>(recommendedFixes);
         fixes.add(capability + ": " + message);
-        return new EvaluationReport(runId, runSummary, caseSummary, metricSummary, fixes, humanReadableSummary);
+        return new EvaluationReport(runId, runSummary, caseSummary, metricSummary, failedMetrics, fixes, humanReadableSummary);
     }
 
     private static Map<String, Object> caseSummary(EvaluationCaseResult result) {
