@@ -13,6 +13,7 @@ public class EvaluationDatasetRegistry {
     public static final String CONTEXT_CITATION_DATASET = "v2-phase-8-context-citation";
     public static final String FAILURE_CLASSIFICATION_DATASET = "v2-phase-8-failure-classification";
     public static final String CASE_COVERAGE_DATASET = "v2-phase-8-case-coverage";
+    public static final String REPORT_USEFULNESS_DATASET = "v2-phase-8-report-usefulness";
 
     public EvaluationDataset load(String datasetName) {
         var effectiveName = datasetName == null || datasetName.isBlank() ? SMOKE_DATASET : datasetName.trim();
@@ -23,6 +24,7 @@ public class EvaluationDatasetRegistry {
             case CONTEXT_CITATION_DATASET -> contextCitationDataset();
             case FAILURE_CLASSIFICATION_DATASET -> failureClassificationDataset();
             case CASE_COVERAGE_DATASET -> caseCoverageDataset();
+            case REPORT_USEFULNESS_DATASET -> reportUsefulnessDataset();
             default -> throw new IllegalArgumentException("Unknown evaluation dataset: " + effectiveName);
         };
     }
@@ -447,6 +449,55 @@ public class EvaluationDatasetRegistry {
             List.of("case-coverage"),
             "Evaluate generated TestCaseDraft coverage for " + fixtureId + ".",
             EvaluationFixtureType.TEST_CASE_COVERAGE,
+            expected,
+            setup
+        );
+    }
+
+    private EvaluationDataset reportUsefulnessDataset() {
+        return new EvaluationDataset(
+            REPORT_USEFULNESS_DATASET,
+            "2026-07-07",
+            List.of(reportUsefulnessFixture(
+                "report-usefulness-auth-failure",
+                Map.of(
+                    "statusCode", 401,
+                    "overallStatus", "FAILED",
+                    "requestPath", "/api/orders/pay",
+                    "environment", "qa",
+                    "criticalFailed", false
+                ),
+                Map.of(
+                    "expectedReportSections", List.of(
+                        "summary",
+                        "execution-stats",
+                        "failure-evidence",
+                        "recommendations",
+                        "source-references",
+                        "memory-learning-summary"
+                    ),
+                    "expectedEvidenceTypes", List.of("execution", "observation", "citation", "memory-feedback"),
+                    "expectedRecommendationContains", "Inspect credentials",
+                    "forbidSecretLeakage", true
+                )
+            )),
+            0.8d,
+            Map.of(ReportUsefulnessNoSecretEvaluator.METRIC_NAME, 0.8d),
+            Map.of(ReportUsefulnessNoSecretEvaluator.METRIC_NAME, 1.5d),
+            Map.of()
+        );
+    }
+
+    private GoldenTaskFixture reportUsefulnessFixture(
+        String fixtureId,
+        Map<String, Object> setup,
+        Map<String, Object> expected
+    ) {
+        return new GoldenTaskFixture(
+            fixtureId,
+            List.of("report-usefulness"),
+            "Evaluate generated report usefulness and no-secret safety for " + fixtureId + ".",
+            EvaluationFixtureType.REPORT_USEFULNESS,
             expected,
             setup
         );
