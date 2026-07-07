@@ -10,6 +10,7 @@ public class EvaluationDatasetRegistry {
     public static final String SMOKE_DATASET = "v2-phase-8-smoke";
     public static final String PLANNER_DATASET = "v2-phase-8-planner";
     public static final String TOOL_POLICY_DATASET = "v2-phase-8-tool-policy";
+    public static final String CONTEXT_CITATION_DATASET = "v2-phase-8-context-citation";
 
     public EvaluationDataset load(String datasetName) {
         var effectiveName = datasetName == null || datasetName.isBlank() ? SMOKE_DATASET : datasetName.trim();
@@ -17,6 +18,7 @@ public class EvaluationDatasetRegistry {
             case SMOKE_DATASET -> smokeDataset();
             case PLANNER_DATASET -> plannerDataset();
             case TOOL_POLICY_DATASET -> toolPolicyDataset();
+            case CONTEXT_CITATION_DATASET -> contextCitationDataset();
             default -> throw new IllegalArgumentException("Unknown evaluation dataset: " + effectiveName);
         };
     }
@@ -224,6 +226,40 @@ public class EvaluationDatasetRegistry {
             EvaluationFixtureType.TOOL_POLICY,
             expected,
             setup
+        );
+    }
+
+    private EvaluationDataset contextCitationDataset() {
+        return new EvaluationDataset(
+            CONTEXT_CITATION_DATASET,
+            "2026-07-07",
+            List.of(new GoldenTaskFixture(
+                "context-citation-payment-auth",
+                List.of("context-citation"),
+                "Evaluate payment auth context retrieval, citations and budget discipline.",
+                EvaluationFixtureType.CONTEXT_CITATION,
+                Map.of(
+                    "expectedKnowledgeCitations", List.of("phase8/wiki/payment-auth-note.md"),
+                    "expectedMemoryCitations", List.of("phase8-ltm-payment-auth"),
+                    "expectedCoverage", List.of("api", "task-state", "knowledge", "memory"),
+                    "allowedIrrelevantCitationCount", 0,
+                    "tokenBudget", 500,
+                    "expectedLowConfidence", false
+                ),
+                Map.of(
+                    "taskId", "phase8-context-task-payment",
+                    "apiSpecId", "phase8-context-api-payment",
+                    "stageProfile", "failure_analysis",
+                    "rawQuery", "payment auth PAY_401 tenant bootstrap",
+                    "errorCode", "PAY_401",
+                    "tags", List.of("payment", "auth", "tenant", "PAY_401"),
+                    "tokenBudget", 500
+                )
+            )),
+            0.8d,
+            Map.of(ContextCitationUsefulnessEvaluator.METRIC_NAME, 0.8d),
+            Map.of(ContextCitationUsefulnessEvaluator.METRIC_NAME, 2.0d),
+            Map.of()
         );
     }
 }
