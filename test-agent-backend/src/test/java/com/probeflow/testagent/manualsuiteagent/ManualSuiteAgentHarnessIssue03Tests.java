@@ -77,7 +77,7 @@ class ManualSuiteAgentHarnessIssue03Tests {
             .contains("failure-analysis")
             .contains("memory-feedback")
             .contains("evaluation-comparison")
-            .contains("awaits V3-2/V3-3")
+            .contains("V3-3 DependencyLinker")
             .contains("awaits V3-4")
             .contains("awaits V3-5")
             .contains("awaits V3-6");

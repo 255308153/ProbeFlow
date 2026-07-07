@@ -31,6 +31,7 @@ class ManualSuiteAgentHarnessIssue06Tests {
         assertThat(result.metadata().get("executionSummary").toString()).contains("FAKE_HTTP");
 
         assertThat(section(result, "generated-suite-draft").source()).isEqualTo(ManualSuiteAgentSectionSource.FIXTURE);
+        assertThat(section(result, "business-flow-discovery").source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
         assertThat(section(result, "variable-audit").source()).isEqualTo(ManualSuiteAgentSectionSource.PENDING_RUNTIME);
         assertThat(section(result, "failure-analysis").source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
         assertThat(section(result, "memory-feedback").source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
@@ -38,7 +39,6 @@ class ManualSuiteAgentHarnessIssue06Tests {
         assertThat(result.sections())
             .extracting(ManualSuiteAgentSectionSummary::sectionId)
             .doesNotContain(
-                "business-flow-discovery",
                 "dependency-linker",
                 "execution-context",
                 "variable-resolver",

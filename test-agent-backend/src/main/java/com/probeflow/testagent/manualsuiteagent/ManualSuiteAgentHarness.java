@@ -3,6 +3,19 @@ package com.probeflow.testagent.manualsuiteagent;
 import com.probeflow.testagent.apispec.ApiSpec;
 import com.probeflow.testagent.apispec.ApiSpecSourceType;
 import com.probeflow.testagent.apispec.HttpMethod;
+import com.probeflow.testagent.businessflowdiscovery.BusinessFlowCandidate;
+import com.probeflow.testagent.businessflowdiscovery.BusinessFlowDiscoveryBlocker;
+import com.probeflow.testagent.businessflowdiscovery.BusinessFlowDiscoveryEvidence;
+import com.probeflow.testagent.businessflowdiscovery.BusinessFlowDiscoveryProviderMode;
+import com.probeflow.testagent.businessflowdiscovery.BusinessFlowDiscoveryRequest;
+import com.probeflow.testagent.businessflowdiscovery.BusinessFlowDiscoveryResult;
+import com.probeflow.testagent.businessflowdiscovery.BusinessFlowDiscoveryService;
+import com.probeflow.testagent.businessflowdiscovery.BusinessFlowDiscoveryStep;
+import com.probeflow.testagent.businessflowdiscovery.BusinessFlowSourceCoverage;
+import com.probeflow.testagent.knowledge.KnowledgeContextEntry;
+import com.probeflow.testagent.memory.LongTermMemoryRetrievalHit;
+import com.probeflow.testagent.memory.MemoryScopeType;
+import com.probeflow.testagent.memory.MemorySourceType;
 import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskPriority;
 import com.probeflow.testagent.task.TaskSourceType;
@@ -30,6 +43,7 @@ public class ManualSuiteAgentHarness {
     private final ManualSuiteAgentFixtureRegistry fixtureRegistry;
     private final ManualSuiteAgentReportWriter reportWriter;
     private final ManualSuiteAgentFakeHttpGateway fakeHttpGateway = new ManualSuiteAgentFakeHttpGateway();
+    private final BusinessFlowDiscoveryService businessFlowDiscoveryService = new BusinessFlowDiscoveryService();
 
     public ManualSuiteAgentHarness(
         ManualSuiteAgentFixtureRegistry fixtureRegistry,
@@ -173,6 +187,18 @@ public class ManualSuiteAgentHarness {
 
     private OrderFixtureRun runOrderSuiteFixture(ManualSuiteAgentRunRequest request, ManualSuiteAgentFixture fixture) {
         var apiSpecs = orderApiSpecs();
+        var discoveryResult = businessFlowDiscoveryService.discover(new BusinessFlowDiscoveryRequest(
+            fixture.fixtureId(),
+            apiSpecs,
+            orderKnowledgeEntries(),
+            orderMemoryHits(),
+            List.of(),
+            BusinessFlowDiscoveryProviderMode.DETERMINISTIC_FAKE,
+            false,
+            List.of(),
+            request.runProfile(),
+            Map.of("harnessFixture", fixture.fixtureId())
+        ));
         var task = orderTask(apiSpecs.stream().map(ApiSpec::getApiSpecId).toList());
         var testCase = orderSuiteTestCase(apiSpecs);
         var executionSummary = executeOrderSuite(testCase);
@@ -181,6 +207,7 @@ public class ManualSuiteAgentHarness {
         metadata.put("task", taskSummary(task));
         metadata.put("apiSpecs", apiSpecs.stream().map(this::apiSpecSummary).toList());
         metadata.put("testCases", List.of(testCaseSummary(testCase)));
+        metadata.put("businessFlowDiscovery", businessFlowDiscoverySummary(discoveryResult));
         metadata.put("executionSummary", executionSummary);
 
         var sections = new ArrayList<>(baseSections(request, fixture));
@@ -197,6 +224,13 @@ public class ManualSuiteAgentHarness {
             ManualSuiteAgentSectionSource.REAL,
             "READY",
             orderedMap("count", apiSpecs.size(), "apiSpecIds", apiSpecs.stream().map(ApiSpec::getApiSpecId).toList())
+        ));
+        sections.add(new ManualSuiteAgentSectionSummary(
+            "business-flow-discovery",
+            "Business Flow Discovery candidate flows",
+            ManualSuiteAgentSectionSource.REAL,
+            discoveryResult.status().name(),
+            businessFlowDiscoverySummary(discoveryResult)
         ));
         sections.add(new ManualSuiteAgentSectionSummary(
             "test-case-input",
@@ -229,7 +263,7 @@ public class ManualSuiteAgentHarness {
                 "READY",
                 orderedMap(
                     "sourceMarker", "fixture",
-                    "phaseNote", "Fixture-provided suite draft awaits V3-2/V3-3 Business Flow Discovery and DependencyLinker.",
+                    "phaseNote", "Business Flow Discovery is real in V3-2; this suite draft remains fixture-provided until V3-3 DependencyLinker.",
                     "scenarioName", testCase.getScenarioName(),
                     "steps", testCase.getSteps().stream()
                         .map(step -> orderedMap(
@@ -325,6 +359,45 @@ public class ManualSuiteAgentHarness {
             apiSpec("api-order-pay", HttpMethod.POST, "/api/orders/{orderId}/payments", "Pay order"),
             apiSpec("api-order-query", HttpMethod.GET, "/api/orders/{orderId}", "Query order")
         );
+    }
+
+    private List<KnowledgeContextEntry> orderKnowledgeEntries() {
+        return List.of(new KnowledgeContextEntry(
+            "chunk-order-flow-001",
+            "doc-order-flow",
+            "rev-order-flow-v1",
+            "Business flow: create order, pay order, query order",
+            0.92,
+            "business_flow",
+            "fixture://order-suite-demo/business-flow.md",
+            orderedMap("docType", "business_flow", "module", "order"),
+            List.of("explicit step order", "mentions create/pay/query"),
+            false
+        ));
+    }
+
+    private List<LongTermMemoryRetrievalHit> orderMemoryHits() {
+        return List.of(new LongTermMemoryRetrievalHit(
+            "mem-order-flow",
+            MemoryScopeType.TESTING_PATTERN,
+            "Successful order payment chains should verify final order status.",
+            "Create order before payment, then query the final order status by orderId.",
+            "Create order before payment, then query the final order status by orderId.",
+            List.of("order", "payment", "business-flow"),
+            MemorySourceType.USER_FEEDBACK,
+            "fixture-memory://order-suite-demo",
+            0.88f,
+            0.70f,
+            0.65f,
+            3,
+            Instant.parse("2026-07-01T00:00:00Z"),
+            orderedMap("module", "order"),
+            42,
+            0.91,
+            Map.of("tag", 0.5),
+            List.of("same order module", "mentions final query"),
+            false
+        ));
     }
 
     private ApiSpec apiSpec(String apiSpecId, HttpMethod method, String path, String summary) {
@@ -514,6 +587,83 @@ public class ManualSuiteAgentHarness {
                     "critical", step.get("critical")
                 ))
                 .toList()
+        );
+    }
+
+    private Map<String, Object> businessFlowDiscoverySummary(BusinessFlowDiscoveryResult result) {
+        return orderedMap(
+            "schemaVersion", result.schemaVersion(),
+            "status", result.status().name(),
+            "providerMode", result.providerMode().name(),
+            "usesRealLlm", result.usesRealLlm(),
+            "usesExternalHttp", result.usesExternalHttp(),
+            "candidateCount", result.candidates().size(),
+            "sourceCoverage", sourceCoverageSummary(result.sourceCoverage()),
+            "blockers", result.blockers().stream().map(this::blockerSummary).toList(),
+            "candidates", result.candidates().stream().map(this::candidateSummary).toList(),
+            "metadata", result.metadata()
+        );
+    }
+
+    private Map<String, Object> candidateSummary(BusinessFlowCandidate candidate) {
+        return orderedMap(
+            "candidateId", candidate.candidateId(),
+            "scenarioName", candidate.scenarioName(),
+            "primary", candidate.primary(),
+            "confidence", candidate.confidence(),
+            "requiresHumanReview", candidate.requiresHumanReview(),
+            "steps", candidate.steps().stream().map(this::flowStepSummary).toList(),
+            "evidence", candidate.evidence().stream().map(this::evidenceSummary).toList(),
+            "blockers", candidate.blockers().stream().map(this::blockerSummary).toList(),
+            "sourceCoverage", sourceCoverageSummary(candidate.sourceCoverage()),
+            "tags", candidate.tags(),
+            "metadata", candidate.metadata()
+        );
+    }
+
+    private Map<String, Object> flowStepSummary(BusinessFlowDiscoveryStep step) {
+        return orderedMap(
+            "stepId", step.stepId(),
+            "order", step.order(),
+            "apiSpecId", step.apiSpecId(),
+            "stepName", step.stepName(),
+            "operationKind", step.operationKind().name(),
+            "httpMethod", step.httpMethod().name(),
+            "path", step.path(),
+            "critical", step.critical(),
+            "sourceRefs", step.sourceRefs(),
+            "metadata", step.metadata()
+        );
+    }
+
+    private Map<String, Object> evidenceSummary(BusinessFlowDiscoveryEvidence evidence) {
+        return orderedMap(
+            "evidenceId", evidence.evidenceId(),
+            "source", evidence.source().name(),
+            "summary", evidence.summary(),
+            "confidenceContribution", evidence.confidenceContribution(),
+            "refs", evidence.refs(),
+            "metadata", evidence.metadata()
+        );
+    }
+
+    private Map<String, Object> blockerSummary(BusinessFlowDiscoveryBlocker blocker) {
+        return orderedMap(
+            "code", blocker.code(),
+            "severity", blocker.severity(),
+            "message", blocker.message(),
+            "metadata", blocker.metadata()
+        );
+    }
+
+    private Map<String, Object> sourceCoverageSummary(BusinessFlowSourceCoverage coverage) {
+        return orderedMap(
+            "apiSpecEvidenceCount", coverage.apiSpecEvidenceCount(),
+            "knowledgeEvidenceCount", coverage.knowledgeEvidenceCount(),
+            "memoryEvidenceCount", coverage.memoryEvidenceCount(),
+            "userSelectionEvidenceCount", coverage.userSelectionEvidenceCount(),
+            "llmSuggestionEvidenceCount", coverage.llmSuggestionEvidenceCount(),
+            "metadata", coverage.metadata()
         );
     }
 
