@@ -9,12 +9,14 @@ public class EvaluationDatasetRegistry {
 
     public static final String SMOKE_DATASET = "v2-phase-8-smoke";
     public static final String PLANNER_DATASET = "v2-phase-8-planner";
+    public static final String TOOL_POLICY_DATASET = "v2-phase-8-tool-policy";
 
     public EvaluationDataset load(String datasetName) {
         var effectiveName = datasetName == null || datasetName.isBlank() ? SMOKE_DATASET : datasetName.trim();
         return switch (effectiveName) {
             case SMOKE_DATASET -> smokeDataset();
             case PLANNER_DATASET -> plannerDataset();
+            case TOOL_POLICY_DATASET -> toolPolicyDataset();
             default -> throw new IllegalArgumentException("Unknown evaluation dataset: " + effectiveName);
         };
     }
@@ -99,6 +101,129 @@ public class EvaluationDatasetRegistry {
             EvaluationFixtureType.PLANNER_DECISION,
             expected,
             Map.of("fakePlannerScenario", scenario, "isolated", true, "usesRealLlm", false)
+        );
+    }
+
+    private EvaluationDataset toolPolicyDataset() {
+        return new EvaluationDataset(
+            TOOL_POLICY_DATASET,
+            "2026-07-07",
+            List.of(
+                toolPolicyFixture(
+                    "tool-policy-allowed",
+                    Map.of(
+                        "toolName", "knowledge.retrieve-context",
+                        "taskPhase", "CONTEXT_BUILDING",
+                        "toolInput", Map.of("taskId", "task-1", "query", "auth boundary"),
+                        "satisfiedPreconditions", List.of("TASK_EXISTS")
+                    ),
+                    Map.of(
+                        "toolName", "knowledge.retrieve-context",
+                        "policyStatus", "ALLOWED",
+                        "policyReason", "TOOL_ALLOWED_BY_POLICY"
+                    )
+                ),
+                toolPolicyFixture(
+                    "tool-policy-human-confirmation",
+                    Map.of(
+                        "toolName", "testcase.review-draft",
+                        "taskPhase", "TEST_DESIGN",
+                        "toolInput", Map.of("taskId", "task-1", "draftId", "draft-1", "decision", "APPROVE"),
+                        "satisfiedPreconditions", List.of("TASK_EXISTS", "TEST_CASE_DRAFT_EXISTS")
+                    ),
+                    Map.of(
+                        "toolName", "testcase.review-draft",
+                        "policyStatus", "REQUIRES_HUMAN_CONFIRMATION",
+                        "policyReason", "HUMAN_CONFIRMATION_REQUIRED"
+                    )
+                ),
+                toolPolicyFixture(
+                    "tool-policy-unknown",
+                    Map.of("toolName", "imaginary.make-cases", "taskPhase", "TEST_DESIGN"),
+                    Map.of(
+                        "toolName", "imaginary.make-cases",
+                        "policyStatus", "BLOCKED",
+                        "policyReason", "UNKNOWN_TOOL"
+                    )
+                ),
+                toolPolicyFixture(
+                    "tool-policy-not-visible",
+                    Map.of(
+                        "toolName", "knowledge.retrieve-context",
+                        "taskPhase", "CONTEXT_BUILDING",
+                        "visibleToolNames", List.of("memory.build-context"),
+                        "toolInput", Map.of("taskId", "task-1", "query", "auth boundary"),
+                        "satisfiedPreconditions", List.of("TASK_EXISTS")
+                    ),
+                    Map.of(
+                        "toolName", "knowledge.retrieve-context",
+                        "policyStatus", "BLOCKED",
+                        "policyReason", "TOOL_NOT_VISIBLE"
+                    )
+                ),
+                toolPolicyFixture(
+                    "tool-policy-not-whitelisted",
+                    Map.of(
+                        "toolName", "knowledge.retrieve-context",
+                        "taskPhase", "CONTEXT_BUILDING",
+                        "whitelistedTools", List.of("memory.build-context"),
+                        "toolInput", Map.of("taskId", "task-1", "query", "auth boundary"),
+                        "satisfiedPreconditions", List.of("TASK_EXISTS")
+                    ),
+                    Map.of(
+                        "toolName", "knowledge.retrieve-context",
+                        "policyStatus", "BLOCKED",
+                        "policyReason", "TOOL_NOT_WHITELISTED"
+                    )
+                ),
+                toolPolicyFixture(
+                    "tool-policy-missing-precondition",
+                    Map.of(
+                        "toolName", "testcase.generate-drafts",
+                        "taskPhase", "TEST_DESIGN",
+                        "toolInput", Map.of("taskId", "task-1", "apiSpecId", "api-1", "generationMode", "SINGLE"),
+                        "satisfiedPreconditions", List.of("TASK_EXISTS", "API_SPEC_AVAILABLE")
+                    ),
+                    Map.of(
+                        "toolName", "testcase.generate-drafts",
+                        "policyStatus", "BLOCKED",
+                        "policyReason", "MISSING_PRECONDITION"
+                    )
+                ),
+                toolPolicyFixture(
+                    "tool-policy-v1-boundary",
+                    Map.of(
+                        "toolName", "ui.run-automation",
+                        "taskPhase", "EXECUTION",
+                        "toolInput", Map.of("taskId", "task-1"),
+                        "satisfiedPreconditions", List.of("TASK_EXISTS")
+                    ),
+                    Map.of(
+                        "toolName", "ui.run-automation",
+                        "policyStatus", "BLOCKED",
+                        "policyReason", "V1_BOUNDARY_BLOCKED"
+                    )
+                )
+            ),
+            0.8d,
+            Map.of("policy-validation", 0.8d),
+            Map.of("policy-validation", 2.0d),
+            Map.of()
+        );
+    }
+
+    private GoldenTaskFixture toolPolicyFixture(
+        String fixtureId,
+        Map<String, Object> setup,
+        Map<String, Object> expected
+    ) {
+        return new GoldenTaskFixture(
+            fixtureId,
+            List.of("policy-validation"),
+            "Evaluate PolicyValidator outcome for " + setup.get("toolName") + ".",
+            EvaluationFixtureType.TOOL_POLICY,
+            expected,
+            setup
         );
     }
 }
