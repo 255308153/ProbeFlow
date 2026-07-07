@@ -14,6 +14,7 @@ import java.util.stream.Collectors;
 public class SuiteDraftGenerationService {
 
     private final DependencyLinker dependencyLinker = new DependencyLinker();
+    private final SuiteReadinessValidator readinessValidator = new SuiteReadinessValidator();
 
     public SuiteDraftGenerationResult generate(SuiteDraftGenerationRequest request) {
         if (request.providerMode() == SuiteDraftProviderMode.MANUAL_REAL_LLM && !request.allowManualProvider()) {
@@ -51,32 +52,29 @@ public class SuiteDraftGenerationService {
         }
 
         var dependencies = dependencyLinker.link(request);
-        var diagnostics = dependencyDiagnostics(dependencies);
+        var dependencyDiagnostics = dependencyDiagnostics(dependencies);
         var artifacts = dependencyArtifacts(dependencies);
         var steps = draftSteps(request, dependencies, artifacts);
-        var readinessStatus = !diagnostics.isEmpty()
-            ? SuiteReadinessStatus.REVIEW_REQUIRED
-            : request.candidate().requiresHumanReview()
-            ? SuiteReadinessStatus.REVIEW_REQUIRED
-            : SuiteReadinessStatus.READY;
+        var validation = readinessValidator.validate(request, steps, dependencies, dependencyDiagnostics);
+        var validatedSteps = stepsWithReadiness(steps, validation);
         var draft = new SuiteDraft(
             request.candidate().candidateId(),
             request.candidate().scenarioName(),
-            steps,
-            draftMetadata(request, dependencies, readinessStatus, diagnostics)
+            validatedSteps,
+            draftMetadata(request, dependencies, validation.status(), validation.diagnostics())
         );
         return new SuiteDraftGenerationResult(
             SuiteDraftGenerationResult.SCHEMA_VERSION,
             SuiteDraftGenerationStatus.COMPLETED,
-            readinessStatus,
+            validation.status(),
             request.fixtureId(),
             request.providerMode(),
             request.providerMode() == SuiteDraftProviderMode.MANUAL_REAL_LLM && request.allowManualProvider(),
             false,
             draft,
             dependencies,
-            diagnostics,
-            List.of(),
+            validation.diagnostics(),
+            validation.blockers(),
             resultMetadata(request, dependencies)
         );
     }
@@ -99,6 +97,66 @@ public class SuiteDraftGenerationService {
             blockers,
             Map.of("runProfile", request.runProfile())
         );
+    }
+
+    private List<SuiteDraftStep> stepsWithReadiness(
+        List<SuiteDraftStep> steps,
+        SuiteReadinessValidationResult validation
+    ) {
+        if (validation.status() == SuiteReadinessStatus.READY) {
+            return steps;
+        }
+        var statuses = new LinkedHashMap<String, SuiteReadinessStatus>();
+        for (var step : steps) {
+            statuses.put(step.stepId(), SuiteReadinessStatus.READY);
+        }
+        for (var diagnostic : validation.diagnostics()) {
+            var affectedStatus = "ERROR".equals(diagnostic.severity())
+                ? SuiteReadinessStatus.BLOCKED
+                : SuiteReadinessStatus.REVIEW_REQUIRED;
+            var affectedSteps = diagnostic.affectedSteps().stream()
+                .filter(stepId -> stepId != null && !stepId.isBlank())
+                .toList();
+            if (affectedSteps.isEmpty()) {
+                for (var step : steps) {
+                    statuses.put(step.stepId(), worst(statuses.get(step.stepId()), affectedStatus));
+                }
+                continue;
+            }
+            for (var stepId : affectedSteps) {
+                if (statuses.containsKey(stepId)) {
+                    statuses.put(stepId, worst(statuses.get(stepId), affectedStatus));
+                }
+            }
+        }
+        return steps.stream()
+            .map(step -> new SuiteDraftStep(
+                step.stepId(),
+                step.stepName(),
+                step.order(),
+                step.apiSpecId(),
+                step.critical(),
+                step.requestTemplate(),
+                step.expectedStatus(),
+                step.assertionHints(),
+                step.extractRules(),
+                step.variableReferences(),
+                step.sourceRefs(),
+                step.dependencyRefs(),
+                statuses.getOrDefault(step.stepId(), SuiteReadinessStatus.READY),
+                step.metadata()
+            ))
+            .toList();
+    }
+
+    private SuiteReadinessStatus worst(SuiteReadinessStatus current, SuiteReadinessStatus candidate) {
+        if (current == SuiteReadinessStatus.BLOCKED || candidate == SuiteReadinessStatus.BLOCKED) {
+            return SuiteReadinessStatus.BLOCKED;
+        }
+        if (current == SuiteReadinessStatus.REVIEW_REQUIRED || candidate == SuiteReadinessStatus.REVIEW_REQUIRED) {
+            return SuiteReadinessStatus.REVIEW_REQUIRED;
+        }
+        return SuiteReadinessStatus.READY;
     }
 
     private List<SuiteDraftStep> draftSteps(

@@ -47,6 +47,13 @@ public class DependencyLinker {
             var dependencyId = "dep-" + producer.stepId() + "-to-"
                 + (consumerStepId.isBlank() ? "suite" : consumerStepId)
                 + "-" + targetKey;
+            var generatedReference = hint.consumerLocation() == SuiteConsumerLocation.NONE
+                ? ""
+                : referenceExpression(effectiveScope, producer.stepId(), targetKey);
+            var suggestedReference = hint.metadata().get("referenceExpressionOverride");
+            var variableReference = suggestedReference instanceof String value && !value.isBlank()
+                ? value
+                : generatedReference;
             result.add(new SuiteVariableDependency(
                 dependencyId,
                 producer.stepId(),
@@ -58,9 +65,7 @@ public class DependencyLinker {
                 blankToDefault(hint.consumerField(), targetKey),
                 effectiveScope,
                 targetKey,
-                hint.consumerLocation() == SuiteConsumerLocation.NONE
-                    ? ""
-                    : referenceExpression(effectiveScope, producer.stepId(), targetKey),
+                variableReference,
                 hint.confidence() <= 0 ? 0.85 : hint.confidence(),
                 hint.evidenceRefs(),
                 hint.conflict(),
