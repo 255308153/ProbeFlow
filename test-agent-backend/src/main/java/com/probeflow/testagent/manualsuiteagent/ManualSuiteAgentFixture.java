@@ -58,6 +58,28 @@ public record ManualSuiteAgentFixture(
         );
     }
 
+    static ManualSuiteAgentFixture invalidFixture() {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("fixtureType", "invalid");
+        metadata.put("token", "invalid-fixture-token");
+        metadata.put("headers", Map.of(
+            "Authorization", "Bearer invalid-fixture-token",
+            "Cookie", "secret-cookie"
+        ));
+        metadata.put("body", Map.of(
+            "password", "invalid-password",
+            "apiKey", "api-key-123"
+        ));
+        return new ManualSuiteAgentFixture(
+            "v3-invalid-fixture",
+            "",
+            "",
+            "Invalid fixture used to exercise structured diagnostics.",
+            List.of("invalid"),
+            metadata
+        );
+    }
+
     ManualSuiteAgentFixtureSummary summary() {
         return new ManualSuiteAgentFixtureSummary(
             fixtureId,

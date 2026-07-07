@@ -103,7 +103,7 @@ public class ManualSuiteAgentReportWriter {
         var summary = new LinkedHashMap<String, Object>();
         summary.put("code", diagnostic.code());
         summary.put("severity", diagnostic.severity());
-        summary.put("message", diagnostic.message());
+        summary.put("message", redactor.redact(diagnostic.message()).toString());
         summary.put("metadata", redactor.redactMap(diagnostic.metadata()));
         return summary;
     }

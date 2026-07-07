@@ -48,6 +48,24 @@ public class ManualSuiteAgentHarness {
 
     public ManualSuiteAgentRunResult run(ManualSuiteAgentRunRequest request) {
         var startedAt = Instant.now();
+        if (request.providerMode() == ManualSuiteAgentProviderMode.UNSUPPORTED) {
+            var completedAt = Instant.now();
+            return writeBestEffort(baseResult(
+                request,
+                null,
+                ManualSuiteAgentRunStatus.FAILED,
+                startedAt,
+                completedAt,
+                List.of(),
+                List.of(ManualSuiteAgentDiagnostic.error(
+                    "INVALID_PROVIDER_MODE",
+                    "Provider mode is not supported: " + request.requestedProviderMode(),
+                    Map.of("requestedProviderMode", request.requestedProviderMode())
+                )),
+                Map.of()
+            ), request);
+        }
+
         var fixture = fixtureRegistry.findById(request.fixtureId());
         if (fixture.isEmpty()) {
             var completedAt = Instant.now();
@@ -68,6 +86,44 @@ public class ManualSuiteAgentHarness {
         }
 
         var fixtureValue = fixture.get();
+        var invalidFixtureDiagnostic = validateFixture(fixtureValue);
+        if (invalidFixtureDiagnostic != null) {
+            var completedAt = Instant.now();
+            return writeBestEffort(baseResult(
+                request,
+                fixtureValue,
+                ManualSuiteAgentRunStatus.FAILED,
+                startedAt,
+                completedAt,
+                List.of(),
+                List.of(invalidFixtureDiagnostic),
+                Map.of()
+            ), request);
+        }
+
+        if (request.providerMode() == ManualSuiteAgentProviderMode.MANUAL_REAL_LLM
+            && !request.allowManualRealLlm()) {
+            var completedAt = Instant.now();
+            return writeBestEffort(baseResult(
+                request,
+                fixtureValue,
+                ManualSuiteAgentRunStatus.BLOCKED,
+                startedAt,
+                completedAt,
+                List.of(),
+                List.of(ManualSuiteAgentDiagnostic.error(
+                    "PROVIDER_BLOCKED",
+                    "Manual real LLM mode requires explicit allowManualRealLlm=true.",
+                    Map.of(
+                        "fixtureId", request.fixtureId(),
+                        "providerMode", request.providerMode().name(),
+                        "allowManualRealLlm", request.allowManualRealLlm()
+                    )
+                )),
+                Map.of()
+            ), request);
+        }
+
         var metadata = new LinkedHashMap<String, Object>();
         metadata.put("harnessScope", "v3-1-manual-suite-agent-harness");
         var sections = baseSections(request, fixtureValue);
@@ -88,6 +144,31 @@ public class ManualSuiteAgentHarness {
             metadata
         );
         return writeBestEffort(result, request);
+    }
+
+    private ManualSuiteAgentDiagnostic validateFixture(ManualSuiteAgentFixture fixture) {
+        var missingFields = new ArrayList<String>();
+        if (fixture.fixtureId() == null || fixture.fixtureId().isBlank()) {
+            missingFields.add("fixtureId");
+        }
+        if (fixture.fixtureVersion() == null || fixture.fixtureVersion().isBlank()) {
+            missingFields.add("fixtureVersion");
+        }
+        if (fixture.displayName() == null || fixture.displayName().isBlank()) {
+            missingFields.add("displayName");
+        }
+        if (missingFields.isEmpty()) {
+            return null;
+        }
+        return ManualSuiteAgentDiagnostic.error(
+            "FIXTURE_INVALID",
+            "Fixture is invalid: missing required fields " + missingFields,
+            Map.of(
+                "fixtureId", fixture.fixtureId(),
+                "missingFields", missingFields,
+                "fixtureMetadata", fixture.metadata()
+            )
+        );
     }
 
     private OrderFixtureRun runOrderSuiteFixture(ManualSuiteAgentRunRequest request, ManualSuiteAgentFixture fixture) {
