@@ -328,6 +328,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             "ReplanningApplicationService",
             "ReportGenerationApplicationService",
             "SessionMemoryService",
+            "SuiteDraftGenerationService",
             "TaskInitializationService",
             "TaskMemoryService",
             "TaskOrchestrationApplicationService",

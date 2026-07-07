@@ -62,6 +62,7 @@ class Phase1BoundaryGuardTests {
             "replanning",
             "report",
             "sourcematerial",
+            "suitedraft",
             "task",
             "taskcaseexecution",
             "testcase",
