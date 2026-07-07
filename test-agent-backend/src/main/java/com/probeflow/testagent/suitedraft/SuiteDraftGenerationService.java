@@ -425,7 +425,13 @@ public class SuiteDraftGenerationService {
             ),
             "requiresHumanReview", readinessStatus != SuiteReadinessStatus.READY,
             "generationMode", request.options().generationMode(),
-            "policyGate", "generation-side Java DependencyLinker result; no PlannerDecision or plan mutation is performed"
+            "policyGate", orderedMap(
+                "type", "GENERATION_SIDE_SAFETY_GATE",
+                "linker", "DependencyLinker",
+                "validator", "SuiteReadinessValidator",
+                "policyValidatorBoundary", "No PlannerDecision is accepted and no plan mutation is performed in V3-3.",
+                "plannerDecisionValidated", false
+            )
         );
     }
 

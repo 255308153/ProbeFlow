@@ -13,6 +13,7 @@ public class SuiteReadinessValidator {
 
     private static final Pattern SUITE_REFERENCE = Pattern.compile("^\\$\\{suite\\.[A-Za-z][A-Za-z0-9_.-]*}$");
     private static final Pattern STEP_REFERENCE = Pattern.compile("^\\$\\{step\\.[A-Za-z0-9_-]+\\.[A-Za-z][A-Za-z0-9_.-]*}$");
+    private static final Pattern UNRESOLVED_PATH_VARIABLE = Pattern.compile("(?<!\\$)\\{[^}]+}");
 
     public SuiteReadinessValidationResult validate(
         SuiteDraftGenerationRequest request,
@@ -26,9 +27,11 @@ public class SuiteReadinessValidator {
         var stepOrders = validateStepOrder(steps, diagnostics);
         var rules = steps.stream().flatMap(step -> step.extractRules().stream()).toList();
         validateCandidateRisk(request, steps, diagnostics);
+        validateProviderRisk(request, steps, diagnostics);
         validateDependencies(request, stepOrders, dependencies, diagnostics);
         validateExtractRules(rules, dependencies, diagnostics);
         validateVariableReferences(steps, rules, diagnostics);
+        validateHighRiskDependencyCompleteness(steps, diagnostics);
         validateDuplicateTargetKeys(rules, diagnostics);
 
         var blockers = diagnostics.stream()
@@ -131,6 +134,28 @@ public class SuiteReadinessValidator {
         for (var blocker : request.candidate().blockers()) {
             diagnostics.add(candidateBlockerDiagnostic(blocker, steps));
         }
+    }
+
+    private void validateProviderRisk(
+        SuiteDraftGenerationRequest request,
+        List<SuiteDraftStep> steps,
+        List<SuiteReadinessDiagnostic> diagnostics
+    ) {
+        if (request.providerMode() != SuiteDraftProviderMode.MANUAL_REAL_LLM || !request.allowManualProvider()) {
+            return;
+        }
+        diagnostics.add(warn(
+            "MANUAL_LLM_SUGGESTION_REQUIRES_REVIEW",
+            steps.stream().map(SuiteDraftStep::stepId).toList(),
+            null,
+            "Manual real LLM suggestions are treated only as dependency evidence.",
+            "Keep the SUITE draft review-gated and require Java DependencyLinker plus readiness validation before use.",
+            orderedMap(
+                "providerMode", request.providerMode().name(),
+                "usesExternalHttp", false,
+                "policyGate", "SuiteReadinessValidator"
+            )
+        ));
     }
 
     private SuiteReadinessDiagnostic candidateBlockerDiagnostic(
@@ -398,6 +423,48 @@ public class SuiteReadinessValidator {
                 }
             }
         }
+    }
+
+    private void validateHighRiskDependencyCompleteness(
+        List<SuiteDraftStep> steps,
+        List<SuiteReadinessDiagnostic> diagnostics
+    ) {
+        for (var step : steps) {
+            if (!highRiskStep(step)) {
+                continue;
+            }
+            var unresolvedPathVariables = UNRESOLVED_PATH_VARIABLE
+                .matcher(String.valueOf(step.requestTemplate().getOrDefault("path", "")))
+                .find();
+            var missingIncomingReference = step.variableReferences().isEmpty();
+            if (!unresolvedPathVariables && !missingIncomingReference) {
+                continue;
+            }
+            diagnostics.add(error(
+                "HIGH_RISK_STEP_DEPENDENCY_INCOMPLETE",
+                List.of(step.stepId()),
+                null,
+                "High-risk step has incomplete producer/consumer dependency coverage.",
+                "Add explicit dependency hints or send the SUITE draft to human review before execution.",
+                orderedMap(
+                    "operationKind", step.metadata().get("sourceOperationKind"),
+                    "path", step.requestTemplate().get("path"),
+                    "variableReferenceCount", step.variableReferences().size()
+                )
+            ));
+        }
+    }
+
+    private boolean highRiskStep(SuiteDraftStep step) {
+        var operationKind = String.valueOf(step.metadata().getOrDefault("sourceOperationKind", ""));
+        var name = (step.stepId() + " " + step.stepName() + " " + step.requestTemplate().getOrDefault("path", ""))
+            .toLowerCase();
+        return "PAY".equals(operationKind)
+            || "CANCEL".equals(operationKind)
+            || name.contains("pay")
+            || name.contains("cancel")
+            || name.contains("delete")
+            || name.contains("fund");
     }
 
     private void validateDuplicateTargetKeys(
