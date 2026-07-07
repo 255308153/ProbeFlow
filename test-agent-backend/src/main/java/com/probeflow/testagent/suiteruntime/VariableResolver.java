@@ -13,6 +13,13 @@ public class VariableResolver {
 
     private static final Pattern VARIABLE_EXPRESSION = Pattern.compile("\\$\\{([^}]+)}");
     private static final Pattern SIMPLE_REFERENCE = Pattern.compile("([A-Za-z][A-Za-z0-9_-]*)\\.([A-Za-z0-9_.\\[\\]-]+)");
+    private static final Pattern FUNCTION_CALL = Pattern.compile("([A-Za-z][A-Za-z0-9_-]*)\\.([A-Za-z][A-Za-z0-9_-]*)\\((.*)\\)");
+
+    private final DynamicValueProvider dynamicValueProvider;
+
+    public VariableResolver(DynamicValueProvider dynamicValueProvider) {
+        this.dynamicValueProvider = dynamicValueProvider;
+    }
 
     public VariableResolutionResult resolveRequestTemplate(
         ExecutionContext context,
@@ -94,6 +101,10 @@ public class VariableResolver {
         String body,
         List<Map<String, Object>> diagnostics
     ) {
+        var functionMatcher = FUNCTION_CALL.matcher(body);
+        if (functionMatcher.matches()) {
+            return resolveFunction(context, stepId, location, expression, functionMatcher, diagnostics);
+        }
         var matcher = SIMPLE_REFERENCE.matcher(body);
         if (!matcher.matches()) {
             var diagnostic = diagnostic("INVALID_VARIABLE_EXPRESSION", "Unsupported variable expression: " + expression,
@@ -123,6 +134,35 @@ public class VariableResolver {
         return resolved.value();
     }
 
+    private Object resolveFunction(
+        ExecutionContext context,
+        String stepId,
+        String location,
+        String expression,
+        java.util.regex.Matcher functionMatcher,
+        List<Map<String, Object>> diagnostics
+    ) {
+        var scope = functionMatcher.group(1);
+        var functionName = functionMatcher.group(2);
+        var args = functionMatcher.group(3);
+        if (!"fn".equals(scope) && !"data".equals(scope)) {
+            var diagnostic = diagnostic("UNSUPPORTED_VARIABLE_SCOPE", "Unsupported variable scope: " + scope,
+                stepId, location, scope, functionName, expression);
+            diagnostics.add(diagnostic);
+            auditConsumption(context, stepId, location, expression, scope, functionName, false, null, "UNSUPPORTED_VARIABLE_SCOPE");
+            return expression;
+        }
+        var provided = dynamicValueProvider.provide(scope, functionName, args);
+        if (!provided.success()) {
+            var diagnostic = diagnostic(provided.failureCode(), provided.message(), stepId, location, scope, functionName, expression);
+            diagnostics.add(diagnostic);
+            auditConsumption(context, stepId, location, expression, scope, functionName, false, null, provided.failureCode());
+            return expression;
+        }
+        auditConsumption(context, stepId, location, expression, scope, functionName, true, provided.value(), null, "DYNAMIC_VALUE_PROVIDER");
+        return provided.value();
+    }
+
     private void auditConsumption(
         ExecutionContext context,
         String stepId,
@@ -134,6 +174,21 @@ public class VariableResolver {
         Object value,
         String failureReason
     ) {
+        auditConsumption(context, stepId, location, expression, scope, path, resolved, value, failureReason, "EXECUTION_CONTEXT");
+    }
+
+    private void auditConsumption(
+        ExecutionContext context,
+        String stepId,
+        String location,
+        String expression,
+        String scope,
+        String path,
+        boolean resolved,
+        Object value,
+        String failureReason,
+        String valueSource
+    ) {
         var event = new LinkedHashMap<String, Object>();
         event.put("eventType", "CONSUMPTION");
         event.put("stepId", stepId);
@@ -142,6 +197,7 @@ public class VariableResolver {
         event.put("scope", scope);
         event.put("path", path);
         event.put("resolved", resolved);
+        event.put("valueSource", valueSource);
         event.put("redactedValueSummary", RuntimeRedactor.valueSummary(path, value));
         if (failureReason != null) {
             event.put("failureReason", failureReason);

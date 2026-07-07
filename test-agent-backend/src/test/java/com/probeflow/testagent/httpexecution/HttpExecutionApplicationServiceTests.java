@@ -1315,6 +1315,86 @@ class HttpExecutionApplicationServiceTests {
     }
 
     @Test
+    void dynamicValueProviderResolvesDeterministicFunctionsAcrossRequestTemplate() {
+        var apiSpec = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/users", 201));
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var suite = testCases.save(newSuiteTestCase(apiSpec.getApiSpecId(), List.of(
+            suiteStepWithTemplate(1, "create-user", apiSpec.getApiSpecId(), Map.of(
+                "method", "POST",
+                "path", "/api/users/${fn.uuid()}",
+                "query", Map.of("createdAt", "${fn.now()}", "plan", "${data.randomFrom('BASIC','PREMIUM')}"),
+                "headers", Map.of("X-Test-Email", "${data.randomEmail()}"),
+                "body", Map.of(
+                    "userId", "${fn.uuid()}",
+                    "email", "${data.randomEmail()}",
+                    "phone", "${data.randomPhone()}",
+                    "label", "user-${data.randomFrom(alpha,beta)}"
+                )
+            ), 201, List.of())
+        )));
+        fakeHttpClient.respondWith(new HttpClientResponse(201, Map.of(), Map.of("ok", true), 4L));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(suite.getCaseId()),
+            ExecutionMode.SUITE_STEP,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        assertThat(result.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.PASSED);
+        assertThat(fakeHttpClient.requests()).singleElement()
+            .satisfies(request -> {
+                assertThat(request.path()).isEqualTo("/api/users/00000000-0000-4000-8000-000000000001");
+                assertThat(request.queryParams())
+                    .containsEntry("createdAt", "2026-01-02T03:04:05Z")
+                    .containsEntry("plan", "BASIC");
+                assertThat(request.headers()).containsEntry("X-Test-Email", "probe.user@example.test");
+                @SuppressWarnings("unchecked")
+                var body = (Map<String, Object>) request.body();
+                assertThat(body)
+                    .containsEntry("userId", "00000000-0000-4000-8000-000000000001")
+                    .containsEntry("email", "probe.user@example.test")
+                    .containsEntry("phone", "15500000000")
+                    .containsEntry("label", "user-alpha");
+            });
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        @SuppressWarnings("unchecked")
+        var auditSummary = (Map<String, Object>) record.getResponseSnapshot().get("variableAuditSummary");
+        @SuppressWarnings("unchecked")
+        var events = (List<Map<String, Object>>) auditSummary.get("events");
+        assertThat(events)
+            .filteredOn(event -> "DYNAMIC_VALUE_PROVIDER".equals(event.get("valueSource")))
+            .hasSize(8);
+    }
+
+    @Test
+    void unsupportedDynamicFunctionReturnsDiagnosticWithoutSideEffects() {
+        var apiSpec = apiSpecs.save(newApiSpec(HttpMethod.GET, "/api/users", 200));
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var suite = testCases.save(newSuiteTestCase(apiSpec.getApiSpecId(), List.of(
+            suiteStepWithTemplate(1, "unsafe-function", apiSpec.getApiSpecId(), Map.of(
+                "method", "GET",
+                "path", "/api/users/${fn.exec('rm -rf /')}"
+            ), 200, List.of())
+        )));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(suite.getCaseId()),
+            ExecutionMode.SUITE_STEP,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        assertThat(result.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.BLOCKED);
+        assertThat(fakeHttpClient.requests()).isEmpty();
+        assertRuntimeDiagnostic(result.caseResults().getFirst().executionRecordId(), "UNSUPPORTED_DYNAMIC_FUNCTION", "unsafe-function");
+    }
+
+    @Test
     void suiteStopsDependentStepsAfterFailedPrerequisiteWhenConfigured() {
         var createOrder = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/orders", 201));
         var readOrder = apiSpecs.save(newApiSpec(HttpMethod.GET, "/api/orders/order-123", 200));
