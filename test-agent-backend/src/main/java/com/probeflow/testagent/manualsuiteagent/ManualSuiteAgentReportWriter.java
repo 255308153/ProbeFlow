@@ -152,6 +152,9 @@ public class ManualSuiteAgentReportWriter {
             if ("generated-suite-draft".equals(section.sectionId())) {
                 appendGeneratedSuiteDraft(markdown, redactor.redactMap(section.summary()));
             }
+            if ("variable-audit".equals(section.sectionId())) {
+                appendVariableAudit(markdown, redactor.redactMap(section.summary()));
+            }
         }
         markdown.append("\n");
 
@@ -206,6 +209,23 @@ public class ManualSuiteAgentReportWriter {
             List.of("ruleId", "producerStepId", "sourceType", "sourcePath", "targetKey"));
         appendRows(markdown, "Variable references", (List<Object>) summary.getOrDefault("variableReferences", List.of()),
             List.of("consumerStepId", "consumerLocation", "targetKey", "referenceExpression", "sourceDependencyId"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private void appendVariableAudit(StringBuilder markdown, Map<String, Object> summary) {
+        markdown.append("  - Runtime: ")
+            .append(summary.get("runtime"))
+            .append("\n");
+        var contextSummary = summary.get("contextSummary");
+        if (contextSummary != null) {
+            markdown.append("  - Context summary: ").append(contextSummary).append("\n");
+        }
+        appendRows(markdown, "Producer highlights", (List<Object>) summary.getOrDefault("producerHighlights", List.of()),
+            List.of("stepId", "variable", "source", "summary"));
+        appendRows(markdown, "Consumer highlights", (List<Object>) summary.getOrDefault("consumerHighlights", List.of()),
+            List.of("stepId", "expression", "location", "summary"));
+        appendRows(markdown, "Audit events", (List<Object>) summary.getOrDefault("auditEvents", List.of()),
+            List.of("eventType", "stepId", "expression", "targetScope", "targetKey", "success", "resolved"));
     }
 
     @SuppressWarnings("unchecked")

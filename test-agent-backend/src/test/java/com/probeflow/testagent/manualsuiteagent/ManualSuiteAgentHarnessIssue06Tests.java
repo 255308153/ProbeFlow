@@ -32,7 +32,7 @@ class ManualSuiteAgentHarnessIssue06Tests {
 
         assertThat(section(result, "generated-suite-draft").source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
         assertThat(section(result, "business-flow-discovery").source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
-        assertThat(section(result, "variable-audit").source()).isEqualTo(ManualSuiteAgentSectionSource.PENDING_RUNTIME);
+        assertThat(section(result, "variable-audit").source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
         assertThat(section(result, "failure-analysis").source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
         assertThat(section(result, "memory-feedback").source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
         assertThat(section(result, "evaluation-comparison").source()).isEqualTo(ManualSuiteAgentSectionSource.NOT_RUN);
@@ -55,6 +55,8 @@ class ManualSuiteAgentHarnessIssue06Tests {
         assertThat(json.at("/run/usesRealLlm").asBoolean()).isFalse();
         assertThat(json.at("/run/usesExternalHttp").asBoolean()).isFalse();
         assertThat(json.at("/metadata/executionSummary/gateway").asText()).isEqualTo("FAKE_HTTP");
+        assertThat(json.at("/metadata/executionSummary/runtime").asText()).isEqualTo("ExecutionContext");
+        assertThat(json.toString()).doesNotContain("PENDING_RUNTIME");
 
         var testConfig = Files.readString(PROJECT_ROOT.resolve("src/test/resources/application-test.yml"));
         assertThat(testConfig)

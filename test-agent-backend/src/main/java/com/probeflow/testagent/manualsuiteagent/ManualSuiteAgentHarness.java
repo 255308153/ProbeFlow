@@ -1,5 +1,6 @@
 package com.probeflow.testagent.manualsuiteagent;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.probeflow.testagent.apispec.ApiSpec;
 import com.probeflow.testagent.apispec.ApiSpecSourceType;
 import com.probeflow.testagent.apispec.HttpMethod;
@@ -12,14 +13,25 @@ import com.probeflow.testagent.businessflowdiscovery.BusinessFlowDiscoveryResult
 import com.probeflow.testagent.businessflowdiscovery.BusinessFlowDiscoveryService;
 import com.probeflow.testagent.businessflowdiscovery.BusinessFlowDiscoveryStep;
 import com.probeflow.testagent.businessflowdiscovery.BusinessFlowSourceCoverage;
+import com.probeflow.testagent.httpexecution.HttpClientRequest;
+import com.probeflow.testagent.httpexecution.HttpClientResponse;
+import com.probeflow.testagent.httpexecution.HttpExecutionOptions;
+import com.probeflow.testagent.httpexecution.HttpExecutionRequest;
 import com.probeflow.testagent.knowledge.KnowledgeContextEntry;
 import com.probeflow.testagent.memory.LongTermMemoryRetrievalHit;
 import com.probeflow.testagent.memory.MemoryScopeType;
 import com.probeflow.testagent.memory.MemorySourceType;
+import com.probeflow.testagent.suiteruntime.DynamicValueProvider;
+import com.probeflow.testagent.suiteruntime.ExecutionContext;
+import com.probeflow.testagent.suiteruntime.ResponseExtractor;
+import com.probeflow.testagent.suiteruntime.RuntimeRedactor;
+import com.probeflow.testagent.suiteruntime.VariableResolver;
+import com.probeflow.testagent.suiteruntime.VariableWriteBackService;
 import com.probeflow.testagent.suitedraft.SuiteDraftGenerationRequest;
 import com.probeflow.testagent.suitedraft.SuiteDraftGenerationResult;
 import com.probeflow.testagent.suitedraft.SuiteDraftGenerationService;
 import com.probeflow.testagent.suitedraft.SuiteDraftProviderMode;
+import com.probeflow.testagent.suitedraft.SuiteDraftStep;
 import com.probeflow.testagent.suitedraft.SuiteExtractRule;
 import com.probeflow.testagent.suitedraft.SuiteReadinessDiagnostic;
 import com.probeflow.testagent.suitedraft.SuiteVariableDependency;
@@ -29,6 +41,7 @@ import com.probeflow.testagent.task.TaskPriority;
 import com.probeflow.testagent.task.TaskSourceType;
 import com.probeflow.testagent.task.TaskStatus;
 import com.probeflow.testagent.task.TaskType;
+import com.probeflow.testagent.taskcaseexecution.ExecutionMode;
 import com.probeflow.testagent.testcase.CaseCategory;
 import com.probeflow.testagent.testcase.CasePriority;
 import com.probeflow.testagent.testcase.CaseRiskLevel;
@@ -41,6 +54,7 @@ import com.probeflow.testagent.testcasedraft.PromotionMode;
 import java.io.IOException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -53,6 +67,10 @@ public class ManualSuiteAgentHarness {
     private final ManualSuiteAgentFakeHttpGateway fakeHttpGateway = new ManualSuiteAgentFakeHttpGateway();
     private final BusinessFlowDiscoveryService businessFlowDiscoveryService = new BusinessFlowDiscoveryService();
     private final SuiteDraftGenerationService suiteDraftGenerationService = new SuiteDraftGenerationService();
+    private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
+    private final VariableResolver variableResolver = new VariableResolver(new DynamicValueProvider());
+    private final ResponseExtractor responseExtractor = new ResponseExtractor(objectMapper);
+    private final VariableWriteBackService variableWriteBackService = new VariableWriteBackService();
 
     public ManualSuiteAgentHarness(
         ManualSuiteAgentFixtureRegistry fixtureRegistry,
@@ -210,8 +228,8 @@ public class ManualSuiteAgentHarness {
         ));
         var suiteDraftResult = generateSuiteDraft(request, fixture, apiSpecs, discoveryResult);
         var task = orderTask(apiSpecs.stream().map(ApiSpec::getApiSpecId).toList());
-        var testCase = orderSuiteTestCase(apiSpecs);
-        var executionSummary = executeOrderSuite(testCase);
+        var testCase = orderSuiteTestCase(apiSpecs, suiteDraftResult);
+        var executionSummary = executeOrderSuite(task, testCase);
         var suiteDraftSummary = generatedSuiteDraftSummary(suiteDraftResult);
 
         var metadata = new LinkedHashMap<String, Object>();
@@ -258,15 +276,42 @@ public class ManualSuiteAgentHarness {
             suiteDraftResult.readinessStatus().name(),
             suiteDraftSummary
         ));
+        sections.add(variableAuditSection(executionSummary));
         sections.addAll(v3StagedSections(request, fixture, testCase));
         sections.add(new ManualSuiteAgentSectionSummary(
             "execution-result",
-            "Fake HTTP execution summary",
+            "ExecutionContext runtime fake HTTP execution summary",
             ManualSuiteAgentSectionSource.REAL,
-            "PASSED",
+            stringValue(executionSummary.getOrDefault("status", "PASSED")),
             executionSummary
         ));
         return new OrderFixtureRun(sections, metadata);
+    }
+
+    @SuppressWarnings("unchecked")
+    private ManualSuiteAgentSectionSummary variableAuditSection(Map<String, Object> executionSummary) {
+        var auditSummary = objectMap(executionSummary.get("variableAuditSummary"));
+        var auditEvents = (List<Map<String, Object>>) auditSummary.getOrDefault("events", List.of());
+        var diagnostics = (List<Map<String, Object>>) executionSummary.getOrDefault("runtimeDiagnostics", List.of());
+        var summary = orderedMap(
+            "sourceMarker", "real",
+            "runtime", "ExecutionContext",
+            "phaseNote", "V3-4 ExecutionContext runtime produced this variable audit from the V3-3 generated suite draft.",
+            "status", diagnostics.isEmpty() ? "PASSED" : "REVIEW",
+            "auditEvents", auditEvents,
+            "producerHighlights", producerHighlights(auditEvents),
+            "consumerHighlights", consumerHighlights(auditEvents),
+            "variableAuditSummary", auditSummary,
+            "contextSummary", executionSummary.getOrDefault("contextSummary", Map.of()),
+            "runtimeDiagnostics", diagnostics
+        );
+        return new ManualSuiteAgentSectionSummary(
+            "variable-audit",
+            "ExecutionContext variable audit",
+            ManualSuiteAgentSectionSource.REAL,
+            diagnostics.isEmpty() ? "PASSED" : "REVIEW",
+            summary
+        );
     }
 
     private List<ManualSuiteAgentSectionSummary> v3StagedSections(
@@ -275,36 +320,6 @@ public class ManualSuiteAgentHarness {
         TestCase testCase
     ) {
         return List.of(
-            new ManualSuiteAgentSectionSummary(
-                "variable-audit",
-                "Variable audit integration slot",
-                ManualSuiteAgentSectionSource.PENDING_RUNTIME,
-                "PENDING_RUNTIME",
-                orderedMap(
-                    "sourceMarker", "pending-runtime",
-                    "phaseNote", "Variable producer and consumer audit awaits V3-4 ExecutionContext runtime.",
-                    "producer", "create-order.response.body.orderId",
-                    "consumer", "pay-order.request.path.orderId",
-                    "targetScope", "suite",
-                    "targetKey", "orderId",
-                    "auditEvents", List.of(
-                        orderedMap(
-                            "producer", "create-order",
-                            "consumer", "pay-order",
-                            "targetScope", "suite",
-                            "targetKey", "orderId",
-                            "eventSummary", "orderId will be extracted from create response and consumed by payment step"
-                        ),
-                        orderedMap(
-                            "producer", "pay-order",
-                            "consumer", "query-order",
-                            "targetScope", "suite",
-                            "targetKey", "paymentId",
-                            "eventSummary", "paymentId will be available for downstream analysis and reporting"
-                        )
-                    )
-                )
-            ),
             new ManualSuiteAgentSectionSummary(
                 "failure-analysis",
                 "Suite failure analysis integration slot",
@@ -386,7 +401,7 @@ public class ManualSuiteAgentHarness {
     private Map<String, Object> generatedSuiteDraftSummary(SuiteDraftGenerationResult result) {
         var summary = new LinkedHashMap<String, Object>();
         summary.put("sourceMarker", "real");
-        summary.put("phaseNote", "V3-3 DependencyLinker generated this SUITE draft; runtime variable audit remains V3-4.");
+        summary.put("phaseNote", "V3-3 DependencyLinker generated this SUITE draft; V3-4 ExecutionContext runtime consumes it for variable audit.");
         summary.put("schemaVersion", result.schemaVersion());
         summary.put("status", result.status().name());
         summary.put("readinessStatus", result.readinessStatus().name());
@@ -591,7 +606,7 @@ public class ManualSuiteAgentHarness {
         return task;
     }
 
-    private TestCase orderSuiteTestCase(List<ApiSpec> apiSpecs) {
+    private TestCase orderSuiteTestCase(List<ApiSpec> apiSpecs, SuiteDraftGenerationResult suiteDraftResult) {
         var testCase = new TestCase();
         testCase.setCaseId("case-order-suite-demo");
         testCase.setPrimaryApiSpecId("api-order-create");
@@ -609,16 +624,47 @@ public class ManualSuiteAgentHarness {
         testCase.setStatus(CaseStatus.READY);
         testCase.setSource(CaseSource.MANUAL);
         testCase.setDetailType(DetailType.API);
-        testCase.setDetail(orderedMap("fixtureId", "order-suite-demo", "source", "manual-suite-agent-harness"));
-        testCase.setSteps(apiSpecs.stream()
-            .map(apiSpec -> suiteStep(apiSpec, apiSpecs.indexOf(apiSpec) + 1))
-            .toList());
+        testCase.setDetail(orderedMap(
+            "fixtureId", "order-suite-demo",
+            "source", "manual-suite-agent-harness",
+            "runtimeInput", "generated-suite-draft",
+            "draftFlowId", suiteDraftResult.draft() == null ? null : suiteDraftResult.draft().flowId()
+        ));
+        testCase.setSteps(suiteDraftResult.draft() == null
+            ? apiSpecs.stream().map(apiSpec -> suiteStep(apiSpec, apiSpecs.indexOf(apiSpec) + 1)).toList()
+            : suiteDraftResult.draft().steps().stream().map(this::suiteStep).toList());
         testCase.setBasedOnApiSpecVersions(orderedMap(
             "api-order-create", 1,
             "api-order-pay", 1,
             "api-order-query", 1
         ));
         return testCase;
+    }
+
+    private Map<String, Object> suiteStep(SuiteDraftStep step) {
+        return orderedMap(
+            "stepId", step.stepId(),
+            "order", step.order(),
+            "stepName", step.stepName(),
+            "apiSpecId", step.apiSpecId(),
+            "critical", step.critical(),
+            "requestTemplate", step.requestTemplate(),
+            "expectedStatus", step.expectedStatus(),
+            "assertionHints", step.assertionHints(),
+            "extractRules", step.extractRules().stream().map(this::extractRuleRuntime).toList(),
+            "variableReferences", step.variableReferences().stream().map(reference -> orderedMap(
+                "consumerStepId", reference.consumerStepId(),
+                "consumerLocation", reference.consumerLocation().name(),
+                "consumerField", reference.consumerField(),
+                "targetScope", reference.targetScope().name(),
+                "targetKey", reference.targetKey(),
+                "referenceExpression", reference.referenceExpression(),
+                "sourceDependencyId", reference.sourceDependencyId(),
+                "evidenceRefs", reference.evidenceRefs()
+            )).toList(),
+            "readinessStatus", step.readinessStatus().name(),
+            "metadata", step.metadata()
+        );
     }
 
     private Map<String, Object> suiteStep(ApiSpec apiSpec, int order) {
@@ -642,32 +688,90 @@ public class ManualSuiteAgentHarness {
         );
     }
 
-    private Map<String, Object> executeOrderSuite(TestCase testCase) {
-        var variables = new LinkedHashMap<String, Object>();
-        variables.put("baseUrl", "https://fixture.local");
-        variables.put("tenant", "tenant-demo");
-        variables.put("orderAuthToken", "order-demo-token");
-
+    private Map<String, Object> executeOrderSuite(Task task, TestCase testCase) {
+        var executionRequest = new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(testCase.getCaseId()),
+            ExecutionMode.SUITE_STEP,
+            "fixture-local",
+            false,
+            HttpExecutionOptions.defaults(),
+            orderedMap("baseUrl", "https://fixture.example.test", "tenant", "tenant-demo"),
+            orderedMap("orderAuthToken", "order-demo-token")
+        );
+        var context = ExecutionContext.create(task, testCase, executionRequest);
         var stepResults = new ArrayList<Map<String, Object>>();
         var responseHighlights = new ArrayList<Map<String, Object>>();
         var totalDurationMs = 0L;
-        for (var step : testCase.getSteps()) {
+        var halted = false;
+        var skipReason = "";
+        for (var step : orderedSteps(testCase)) {
             var stepId = step.get("stepId").toString();
-            var response = fakeHttpGateway.execute(stepId, variables);
-            if (response.body().containsKey("orderId")) {
-                variables.put("orderId", response.body().get("orderId"));
+            if (halted) {
+                stepResults.add(orderedMap(
+                    "stepId", stepId,
+                    "order", step.get("order"),
+                    "apiSpecId", step.get("apiSpecId"),
+                    "status", "SKIPPED",
+                    "statusCode", null,
+                    "durationMs", 0L,
+                    "skipReason", skipReason,
+                    "contextBefore", context.summary(),
+                    "contextAfter", context.summary(),
+                    "variableEvents", eventsForStep(context, stepId),
+                    "runtimeDiagnostics", diagnosticsForStep(context, stepId)
+                ));
+                continue;
             }
-            if (response.body().containsKey("paymentId")) {
-                variables.put("paymentId", response.body().get("paymentId"));
+
+            var contextBefore = context.summary();
+            var requestTemplate = objectMap(step.get("requestTemplate"));
+            var resolvedTemplate = variableResolver.resolveRequestTemplate(context, stepId, requestTemplate);
+            if (!resolvedTemplate.successful()) {
+                var message = "Variable resolution failed for suite step " + stepId;
+                stepResults.add(orderedMap(
+                    "stepId", stepId,
+                    "order", step.get("order"),
+                    "apiSpecId", step.get("apiSpecId"),
+                    "status", "BLOCKED",
+                    "statusCode", null,
+                    "durationMs", 0L,
+                    "message", message,
+                    "requestTemplate", RuntimeRedactor.redact(requestTemplate, "requestTemplate"),
+                    "contextBefore", contextBefore,
+                    "contextAfter", context.summary(),
+                    "variableEvents", eventsForStep(context, stepId),
+                    "runtimeDiagnostics", diagnosticsForStep(context, stepId)
+                ));
+                halted = true;
+                skipReason = message;
+                continue;
             }
+
+            var clientRequest = clientRequest(objectMap(resolvedTemplate.resolvedValue()), executionRequest);
+            var response = fakeHttpGateway.execute(stepId, clientRequest);
+            var httpResponse = new HttpClientResponse(
+                response.statusCode(),
+                orderedMap("Content-Type", "application/json", "X-Fixture-Gateway", "manual-suite-agent"),
+                response.body(),
+                response.durationMs()
+            );
+            var extracted = responseExtractor.extract(stepId, step, httpResponse);
+            var writeBackBlockingFailure = variableWriteBackService.write(context, stepId, extracted);
             totalDurationMs += response.durationMs();
+            var status = writeBackBlockingFailure ? "BLOCKED" : response.statusCode() < 400 ? "PASSED" : "FAILED";
             stepResults.add(orderedMap(
                 "stepId", stepId,
                 "order", step.get("order"),
                 "apiSpecId", step.get("apiSpecId"),
-                "status", response.statusCode() < 400 ? "PASSED" : "FAILED",
+                "status", status,
                 "statusCode", response.statusCode(),
-                "durationMs", response.durationMs()
+                "durationMs", response.durationMs(),
+                "requestSnapshot", requestSnapshot(clientRequest),
+                "contextBefore", contextBefore,
+                "contextAfter", context.summary(),
+                "variableEvents", eventsForStep(context, stepId),
+                "runtimeDiagnostics", diagnosticsForStep(context, stepId)
             ));
             responseHighlights.add(orderedMap(
                 "stepId", stepId,
@@ -675,20 +779,37 @@ public class ManualSuiteAgentHarness {
                 "summary", response.summary(),
                 "body", response.body()
             ));
+            if (writeBackBlockingFailure) {
+                halted = true;
+                skipReason = "Required variable extraction failed for suite step " + stepId;
+            }
         }
+        var passed = countStatus(stepResults, "PASSED");
+        var failed = countStatus(stepResults, "FAILED");
+        var skipped = countStatus(stepResults, "SKIPPED");
+        var blocked = countStatus(stepResults, "BLOCKED");
         return orderedMap(
+            "sourceMarker", "real",
+            "runtime", "ExecutionContext",
+            "runtimeSource", "V3-4 ExecutionContext runtime",
+            "runtimeInput", "generated-suite-draft",
+            "draftFlowId", testCase.getDetail() == null ? null : testCase.getDetail().get("draftFlowId"),
             "environment", "fixture-local",
             "gateway", "FAKE_HTTP",
             "usesExternalHttp", false,
             "caseCount", 1,
             "stepCount", testCase.getSteps().size(),
-            "passed", 3,
-            "failed", 0,
-            "skipped", 0,
-            "blocked", 0,
+            "status", blocked > 0 ? "BLOCKED" : failed > 0 ? "FAILED" : skipped > 0 ? "SKIPPED" : "PASSED",
+            "passed", passed,
+            "failed", failed,
+            "skipped", skipped,
+            "blocked", blocked,
             "totalDurationMs", totalDurationMs,
             "stepResults", stepResults,
-            "responseHighlights", responseHighlights
+            "responseHighlights", responseHighlights,
+            "contextSummary", context.summary(),
+            "variableAuditSummary", context.variableAuditSummary(),
+            "runtimeDiagnostics", context.diagnostics()
         );
     }
 
@@ -916,6 +1037,147 @@ public class ManualSuiteAgentHarness {
                 orderedMap("diagnosticCount", 0)
             )
         );
+    }
+
+    private Map<String, Object> extractRuleRuntime(SuiteExtractRule rule) {
+        return orderedMap(
+            "ruleId", rule.ruleId(),
+            "producerStepId", rule.producerStepId(),
+            "sourceType", rule.sourceType().name(),
+            "sourcePath", rule.sourcePath(),
+            "targetScope", rule.targetScope().name(),
+            "targetKey", rule.targetKey(),
+            "required", rule.required(),
+            "failureStrategy", rule.failureStrategy().name(),
+            "defaultValue", rule.defaultValue(),
+            "description", rule.description(),
+            "confidence", rule.confidence(),
+            "evidenceRefs", rule.evidenceRefs(),
+            "consumerStepIds", rule.consumerStepIds(),
+            "sourceDependencyIds", rule.sourceDependencyIds()
+        );
+    }
+
+    private List<Map<String, Object>> orderedSteps(TestCase testCase) {
+        return testCase.getSteps().stream()
+            .sorted(Comparator.comparingInt(step -> intValue(step.get("order"))))
+            .toList();
+    }
+
+    private HttpClientRequest clientRequest(Map<String, Object> resolvedTemplate, HttpExecutionRequest executionRequest) {
+        var method = stringValue(resolvedTemplate.getOrDefault("method", "GET"));
+        var path = stringValue(resolvedTemplate.getOrDefault("path", ""));
+        var headers = objectMap(resolvedTemplate.get("headers"));
+        var query = objectMap(firstPresent(resolvedTemplate, "query", "queryParams"));
+        var body = resolvedTemplate.getOrDefault("body", Map.of());
+        var url = buildUrl(stringValue(executionRequest.environmentVariables().get("baseUrl")), path, query);
+        return new HttpClientRequest(method, path, url, headers, query, body);
+    }
+
+    private Map<String, Object> requestSnapshot(HttpClientRequest request) {
+        return orderedMap(
+            "method", request.method(),
+            "path", request.path(),
+            "url", request.url(),
+            "headers", RuntimeRedactor.redact(request.headers(), "headers"),
+            "queryParams", RuntimeRedactor.redact(request.queryParams(), "queryParams"),
+            "body", RuntimeRedactor.redact(request.body(), "body")
+        );
+    }
+
+    private String buildUrl(String baseUrl, String path, Map<String, Object> query) {
+        var normalizedBase = baseUrl == null || baseUrl.isBlank() ? "" : baseUrl.replaceAll("/+$", "");
+        var normalizedPath = path == null ? "" : path;
+        var url = normalizedBase.isBlank()
+            ? normalizedPath
+            : normalizedBase + "/" + normalizedPath.replaceAll("^/+", "");
+        if (query.isEmpty()) {
+            return url;
+        }
+        var queryString = query.entrySet().stream()
+            .filter(entry -> entry.getValue() != null)
+            .map(entry -> entry.getKey() + "=" + entry.getValue())
+            .toList();
+        return queryString.isEmpty() ? url : url + "?" + String.join("&", queryString);
+    }
+
+    private List<Map<String, Object>> eventsForStep(ExecutionContext context, String stepId) {
+        return context.auditEvents().stream()
+            .filter(event -> stepId.equals(event.get("stepId")))
+            .toList();
+    }
+
+    private List<Map<String, Object>> diagnosticsForStep(ExecutionContext context, String stepId) {
+        return context.diagnostics().stream()
+            .filter(diagnostic -> stepId.equals(diagnostic.get("stepId")))
+            .toList();
+    }
+
+    private List<Map<String, Object>> producerHighlights(List<Map<String, Object>> auditEvents) {
+        return auditEvents.stream()
+            .filter(event -> "PRODUCTION".equals(event.get("eventType")) && Boolean.TRUE.equals(event.get("success")))
+            .map(event -> orderedMap(
+                "stepId", event.get("stepId"),
+                "variable", event.get("targetScope") + "." + event.get("targetKey"),
+                "source", event.get("sourceType") + ":" + event.get("sourcePath"),
+                "summary", event.get("stepId") + " produces " + event.get("targetScope") + "."
+                    + event.get("targetKey") + " from " + event.get("sourceType") + " " + event.get("sourcePath")
+            ))
+            .toList();
+    }
+
+    private List<Map<String, Object>> consumerHighlights(List<Map<String, Object>> auditEvents) {
+        return auditEvents.stream()
+            .filter(event -> "CONSUMPTION".equals(event.get("eventType")) && Boolean.TRUE.equals(event.get("resolved")))
+            .map(event -> orderedMap(
+                "stepId", event.get("stepId"),
+                "expression", event.get("expression"),
+                "location", event.get("location"),
+                "summary", event.get("stepId") + " consumes " + event.get("expression") + " at " + event.get("location")
+            ))
+            .toList();
+    }
+
+    private int countStatus(List<Map<String, Object>> stepResults, String status) {
+        return (int) stepResults.stream()
+            .filter(step -> status.equals(step.get("status")))
+            .count();
+    }
+
+    private Object firstPresent(Map<String, Object> values, String... keys) {
+        for (var key : keys) {
+            if (values.containsKey(key)) {
+                return values.get(key);
+            }
+        }
+        return null;
+    }
+
+    private Map<String, Object> objectMap(Object value) {
+        if (!(value instanceof Map<?, ?> incoming)) {
+            return new LinkedHashMap<>();
+        }
+        var map = new LinkedHashMap<String, Object>();
+        incoming.forEach((key, mapValue) -> {
+            if (key != null) {
+                map.put(key.toString(), mapValue);
+            }
+        });
+        return map;
+    }
+
+    private int intValue(Object value) {
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value == null || value.toString().isBlank()) {
+            return Integer.MAX_VALUE;
+        }
+        return Integer.parseInt(value.toString());
+    }
+
+    private String stringValue(Object value) {
+        return value == null ? "" : value.toString();
     }
 
     private Map<String, Object> orderedMap(Object... keyValues) {
