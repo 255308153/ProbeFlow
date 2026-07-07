@@ -295,7 +295,7 @@ public class HttpExecutionApplicationService {
             flattenedAssertions.addAll(stepAssertionsWithStepRefs(stepResult));
             if (Boolean.TRUE.equals(stepResult.get("runtimeBlockingFailure"))) {
                 halted = true;
-                skipReason = "Skipped because prerequisite runtime variable failure in step: " + stepId(step);
+                skipReason = runtimeSkipReason(executionContext, stepId(step));
             } else if (request.options().stopOnCriticalFailure() && stepCriticalFailure(stepResult)) {
                 halted = true;
                 skipReason = "Skipped because prerequisite step failed: " + stepId(step);
@@ -582,6 +582,46 @@ public class HttpExecutionApplicationService {
         return executionContext.diagnostics().stream()
             .filter(diagnostic -> stepId.equals(diagnostic.get("stepId")))
             .toList();
+    }
+
+    private String runtimeSkipReason(ExecutionContext executionContext, String stepId) {
+        var diagnostic = executionContext.diagnostics().stream()
+            .filter(item -> stepId.equals(item.get("stepId")))
+            .findFirst()
+            .orElse(Map.of());
+        var code = stringValue(diagnostic.get("code"));
+        var variableReference = runtimeVariableReference(diagnostic);
+        var reason = "Skipped because prerequisite runtime variable failure in step: " + stepId;
+        if (StringUtils.hasText(code)) {
+            reason += " diagnostic=" + code;
+        }
+        if (StringUtils.hasText(variableReference)) {
+            reason += " variable=" + variableReference;
+        }
+        return reason;
+    }
+
+    private String runtimeVariableReference(Map<String, Object> diagnostic) {
+        var targetScope = stringValue(diagnostic.get("targetScope"));
+        var targetKey = stringValue(diagnostic.get("targetKey"));
+        if (StringUtils.hasText(targetScope) && StringUtils.hasText(targetKey)) {
+            return targetScope + "." + targetKey;
+        }
+        var scope = stringValue(diagnostic.get("scope"));
+        var path = stringValue(diagnostic.get("path"));
+        if (StringUtils.hasText(scope) && StringUtils.hasText(path)) {
+            return scope + "." + path;
+        }
+        var expression = stringValue(diagnostic.get("expression"));
+        if (StringUtils.hasText(expression)) {
+            return expression;
+        }
+        var sourceType = stringValue(diagnostic.get("sourceType"));
+        var sourcePath = stringValue(diagnostic.get("sourcePath"));
+        if (StringUtils.hasText(sourceType) && StringUtils.hasText(sourcePath)) {
+            return sourceType + ":" + sourcePath;
+        }
+        return "";
     }
 
     private Map<String, Object> withRequestRuntime(
