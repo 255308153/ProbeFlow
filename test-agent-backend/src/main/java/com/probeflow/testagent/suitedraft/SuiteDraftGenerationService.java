@@ -51,7 +51,8 @@ public class SuiteDraftGenerationService {
         }
 
         var dependencies = dependencyLinker.link(request);
-        var steps = draftSteps(request, dependencies);
+        var artifacts = dependencyArtifacts(dependencies);
+        var steps = draftSteps(request, dependencies, artifacts);
         var readinessStatus = request.candidate().requiresHumanReview()
             ? SuiteReadinessStatus.REVIEW_REQUIRED
             : SuiteReadinessStatus.READY;
@@ -99,20 +100,22 @@ public class SuiteDraftGenerationService {
 
     private List<SuiteDraftStep> draftSteps(
         SuiteDraftGenerationRequest request,
-        List<SuiteVariableDependency> dependencies
+        List<SuiteVariableDependency> dependencies,
+        SuiteDependencyArtifacts artifacts
     ) {
         var apiSpecs = request.apiSpecs().stream()
             .collect(Collectors.toMap(ApiSpec::getApiSpecId, Function.identity(), (left, right) -> left, LinkedHashMap::new));
         return request.candidate().steps().stream()
             .sorted(Comparator.comparingInt(BusinessFlowDiscoveryStep::order))
-            .map(step -> draftStep(step, apiSpecs.get(step.apiSpecId()), dependencies))
+            .map(step -> draftStep(step, apiSpecs.get(step.apiSpecId()), dependencies, artifacts))
             .toList();
     }
 
     private SuiteDraftStep draftStep(
         BusinessFlowDiscoveryStep step,
         ApiSpec apiSpec,
-        List<SuiteVariableDependency> dependencies
+        List<SuiteVariableDependency> dependencies,
+        SuiteDependencyArtifacts artifacts
     ) {
         var dependencyRefs = dependencies.stream()
             .filter(dependency -> dependency.producerStepId().equals(step.stepId())
@@ -128,8 +131,8 @@ public class SuiteDraftGenerationService {
             fallbackRequestTemplate(apiSpec, step),
             expectedStatus(step),
             List.of(orderedMap("source", "api-spec", "summary", "status code should match expectedStatus")),
-            List.of(),
-            List.of(),
+            artifacts.extractRulesByProducer().getOrDefault(step.stepId(), List.of()),
+            artifacts.referencesByConsumer().getOrDefault(step.stepId(), List.of()),
             step.sourceRefs(),
             dependencyRefs,
             SuiteReadinessStatus.READY,
@@ -138,6 +141,62 @@ public class SuiteDraftGenerationService {
                 "sourceOperationKind", step.operationKind().name(),
                 "sourcePath", step.path()
             )
+        );
+    }
+
+    private SuiteDependencyArtifacts dependencyArtifacts(List<SuiteVariableDependency> dependencies) {
+        var grouped = new LinkedHashMap<String, List<SuiteVariableDependency>>();
+        for (var dependency : dependencies) {
+            var key = String.join("|",
+                dependency.producerStepId(),
+                dependency.sourceType().name(),
+                nullToBlank(dependency.sourcePath()),
+                dependency.targetScope().name(),
+                dependency.targetKey()
+            );
+            grouped.computeIfAbsent(key, ignored -> new ArrayList<>()).add(dependency);
+        }
+
+        var extractRulesByProducer = new LinkedHashMap<String, List<SuiteExtractRule>>();
+        var referencesByConsumer = new LinkedHashMap<String, List<SuiteVariableReference>>();
+        for (var dependenciesForRule : grouped.values()) {
+            var first = dependenciesForRule.get(0);
+            var rule = new SuiteExtractRule(
+                "rule-" + first.producerStepId() + "-" + first.targetKey(),
+                first.producerStepId(),
+                first.sourceType(),
+                first.sourcePath(),
+                first.targetScope(),
+                first.targetKey(),
+                first.required(),
+                first.required() ? SuiteExtractFailureStrategy.FAIL_FAST : SuiteExtractFailureStrategy.WRITE_NULL,
+                null,
+                "Extract " + first.targetKey() + " for "
+                    + dependenciesForRule.stream().map(SuiteVariableDependency::consumerStepId).distinct().toList(),
+                dependenciesForRule.stream().mapToDouble(SuiteVariableDependency::confidence).min().orElse(0.0),
+                dependenciesForRule.stream().flatMap(dependency -> dependency.evidenceRefs().stream()).distinct().toList(),
+                dependenciesForRule.stream().map(SuiteVariableDependency::consumerStepId).distinct().toList(),
+                dependenciesForRule.stream().map(SuiteVariableDependency::dependencyId).toList()
+            );
+            extractRulesByProducer.computeIfAbsent(first.producerStepId(), ignored -> new ArrayList<>()).add(rule);
+            for (var dependency : dependenciesForRule) {
+                var reference = new SuiteVariableReference(
+                    dependency.consumerStepId(),
+                    dependency.consumerLocation(),
+                    dependency.consumerField(),
+                    dependency.targetScope(),
+                    dependency.targetKey(),
+                    dependency.referenceExpression(),
+                    dependency.dependencyId(),
+                    dependency.evidenceRefs()
+                );
+                referencesByConsumer.computeIfAbsent(dependency.consumerStepId(), ignored -> new ArrayList<>())
+                    .add(reference);
+            }
+        }
+        return new SuiteDependencyArtifacts(
+            copyListMap(extractRulesByProducer),
+            copyListMap(referencesByConsumer)
         );
     }
 
@@ -240,5 +299,23 @@ public class SuiteDraftGenerationService {
             map.put(keyValues[i].toString(), keyValues[i + 1]);
         }
         return map;
+    }
+
+    private String nullToBlank(String value) {
+        return value == null ? "" : value;
+    }
+
+    private <T> Map<String, List<T>> copyListMap(Map<String, List<T>> source) {
+        var copy = new LinkedHashMap<String, List<T>>();
+        for (var entry : source.entrySet()) {
+            copy.put(entry.getKey(), List.copyOf(entry.getValue()));
+        }
+        return copy;
+    }
+
+    private record SuiteDependencyArtifacts(
+        Map<String, List<SuiteExtractRule>> extractRulesByProducer,
+        Map<String, List<SuiteVariableReference>> referencesByConsumer
+    ) {
     }
 }
