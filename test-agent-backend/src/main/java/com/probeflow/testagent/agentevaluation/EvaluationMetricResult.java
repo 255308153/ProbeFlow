@@ -1,5 +1,7 @@
 package com.probeflow.testagent.agentevaluation;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 public record EvaluationMetricResult(
@@ -18,8 +20,8 @@ public record EvaluationMetricResult(
         score = normalize(score);
         threshold = normalize(threshold);
         weight = weight <= 0.0d || Double.isNaN(weight) || Double.isInfinite(weight) ? 1.0d : weight;
-        actual = actual == null ? Map.of() : Map.copyOf(actual);
-        expected = expected == null ? Map.of() : Map.copyOf(expected);
+        actual = copyNullableValueMap(actual);
+        expected = copyNullableValueMap(expected);
         diagnosticMessage = diagnosticMessage == null ? "" : diagnosticMessage.trim();
     }
 
@@ -63,5 +65,12 @@ public record EvaluationMetricResult(
             return 1.0d;
         }
         return value;
+    }
+
+    private static Map<String, Object> copyNullableValueMap(Map<String, Object> source) {
+        if (source == null || source.isEmpty()) {
+            return Map.of();
+        }
+        return Collections.unmodifiableMap(new LinkedHashMap<>(source));
     }
 }
