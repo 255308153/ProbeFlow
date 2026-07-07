@@ -63,6 +63,16 @@ public class VariableResolver {
         List<Map<String, Object>> diagnostics
     ) {
         var matcher = VARIABLE_EXPRESSION.matcher(text);
+        if (!matcher.find()) {
+            if (text.contains("${")) {
+                var diagnostic = diagnostic("INVALID_VARIABLE_EXPRESSION", "Unsupported variable expression: " + text,
+                    stepId, location, null, null, text);
+                diagnostics.add(diagnostic);
+                auditConsumption(context, stepId, location, text, null, null, false, null, "INVALID_VARIABLE_EXPRESSION");
+            }
+            return text;
+        }
+        matcher.reset();
         if (matcher.matches()) {
             return resolveExpression(context, stepId, location, matcher.group(0), matcher.group(1), diagnostics);
         }

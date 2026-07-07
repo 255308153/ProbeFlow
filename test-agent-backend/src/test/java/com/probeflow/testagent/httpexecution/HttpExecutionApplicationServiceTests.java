@@ -1121,6 +1121,200 @@ class HttpExecutionApplicationServiceTests {
     }
 
     @Test
+    void variableResolverCoversScopesPathsLocationsAndTypePreservation() {
+        var createOrder = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/orders", 201));
+        var payOrder = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/orders/order-123/pay", 200));
+        var task = newTask(List.of(createOrder.getApiSpecId(), payOrder.getApiSpecId()));
+        task.setMetadata(Map.of("externalTaskId", "task-42"));
+        task = tasks.save(task);
+        var suiteCase = newSuiteTestCase(createOrder.getApiSpecId(), List.of(
+            suiteStepWithRuntime(
+                1,
+                "create-order",
+                createOrder.getApiSpecId(),
+                "POST",
+                "/api/orders",
+                201,
+                List.of(
+                    Map.of(
+                        "sourceType", "BODY_JSON",
+                        "sourcePath", "$.data.order",
+                        "targetScope", "SUITE",
+                        "targetKey", "order",
+                        "required", true,
+                        "failureStrategy", "FAIL_FAST"
+                    ),
+                    Map.of(
+                        "sourceType", "BODY_JSON",
+                        "sourcePath", "$.data.items",
+                        "targetScope", "SUITE",
+                        "targetKey", "items",
+                        "required", true,
+                        "failureStrategy", "FAIL_FAST"
+                    ),
+                    Map.of(
+                        "sourceType", "BODY_JSON",
+                        "sourcePath", "$.data.order.id",
+                        "targetScope", "STEP",
+                        "targetKey", "orderId",
+                        "required", true,
+                        "failureStrategy", "FAIL_FAST"
+                    )
+                )
+            ),
+            suiteStepWithTemplate(
+                2,
+                "pay-order",
+                payOrder.getApiSpecId(),
+                Map.of(
+                    "method", "POST",
+                    "path", "/tenants/${env.tenant}/tasks/${task.externalTaskId}/cases/${case.customerId}/orders/${suite.order.id}/items/${suite.items[0].id}/step/${step.create-order.orderId}/pay",
+                    "query", Map.of("task", "${task.externalTaskId}", "customer", "${case.customerId}"),
+                    "headers", Map.of("X-Trace-Id", "trace-${step.create-order.orderId}", "X-Tenant", "${env.tenant}"),
+                    "body", Map.of(
+                        "quantity", "${suite.order.quantity}",
+                        "paid", "${case.shouldPay}",
+                        "orderCopy", "${suite.order}",
+                        "itemsCopy", "${suite.items}",
+                        "note", "tenant-${env.tenant}-customer-${case.customerId}"
+                    )
+                ),
+                200,
+                List.of()
+            )
+        ));
+        suiteCase.setDetail(Map.of("suite", true, "customerId", "cust-9", "shouldPay", true));
+        var suite = testCases.save(suiteCase);
+        fakeHttpClient.respondWithSequence(
+            new HttpClientResponse(201, Map.of(), Map.of(
+                "data", Map.of(
+                    "order", Map.of("id", "order-123", "quantity", 2),
+                    "items", List.of(Map.of("id", "item-1"), Map.of("id", "item-2"))
+                )
+            ), 8L),
+            new HttpClientResponse(200, Map.of(), Map.of("paid", true), 6L)
+        );
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(suite.getCaseId()),
+            ExecutionMode.SUITE_STEP,
+            "test",
+            false,
+            HttpExecutionOptions.defaults(),
+            Map.of("tenant", "tenant-a"),
+            Map.of()
+        ));
+
+        assertThat(result.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.PASSED);
+        assertThat(fakeHttpClient.requests()).hasSize(2);
+        var payRequest = fakeHttpClient.requests().get(1);
+        assertThat(payRequest.path()).isEqualTo("/tenants/tenant-a/tasks/task-42/cases/cust-9/orders/order-123/items/item-1/step/order-123/pay");
+        assertThat(payRequest.queryParams()).containsEntry("task", "task-42").containsEntry("customer", "cust-9");
+        assertThat(payRequest.headers()).containsEntry("X-Trace-Id", "trace-order-123").containsEntry("X-Tenant", "tenant-a");
+        @SuppressWarnings("unchecked")
+        var body = (Map<String, Object>) payRequest.body();
+        assertThat(body.get("quantity")).isEqualTo(2);
+        assertThat(body.get("paid")).isEqualTo(true);
+        assertThat(body.get("orderCopy")).isInstanceOf(Map.class);
+        assertThat(body.get("itemsCopy")).isInstanceOf(List.class);
+        assertThat(body.get("note")).isEqualTo("tenant-tenant-a-customer-cust-9");
+    }
+
+    @Test
+    void variableResolverBlocksMissingInvalidScopeAndInvalidExpressionBeforeTransport() {
+        var apiSpec = apiSpecs.save(newApiSpec(HttpMethod.GET, "/api/orders", 200));
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var missingVariableSuite = testCases.save(newSuiteTestCase(apiSpec.getApiSpecId(), List.of(
+            suiteStepWithTemplate(1, "missing-variable", apiSpec.getApiSpecId(), Map.of(
+                "method", "GET",
+                "path", "/api/orders/${suite.missingOrderId}"
+            ), 200, List.of())
+        )));
+        var invalidScopeSuite = testCases.save(newSuiteTestCase(apiSpec.getApiSpecId(), List.of(
+            suiteStepWithTemplate(1, "invalid-scope", apiSpec.getApiSpecId(), Map.of(
+                "method", "GET",
+                "path", "/api/orders/${window.location}"
+            ), 200, List.of())
+        )));
+        var invalidExpressionSuite = testCases.save(newSuiteTestCase(apiSpec.getApiSpecId(), List.of(
+            suiteStepWithTemplate(1, "invalid-expression", apiSpec.getApiSpecId(), Map.of(
+                "method", "GET",
+                "path", "/api/orders/${suite.orderId + system.exit()}"
+            ), 200, List.of())
+        )));
+
+        var missing = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(missingVariableSuite.getCaseId()),
+            ExecutionMode.SUITE_STEP,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+        var invalidScope = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(invalidScopeSuite.getCaseId()),
+            ExecutionMode.SUITE_STEP,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+        var invalidExpression = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(invalidExpressionSuite.getCaseId()),
+            ExecutionMode.SUITE_STEP,
+            "test",
+            false,
+            HttpExecutionOptions.defaults()
+        ));
+
+        assertThat(fakeHttpClient.requests()).isEmpty();
+        assertThat(missing.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.BLOCKED);
+        assertThat(invalidScope.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.BLOCKED);
+        assertThat(invalidExpression.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.BLOCKED);
+        assertRuntimeDiagnostic(missing.caseResults().getFirst().executionRecordId(), "PATH_MISSING", "missing-variable");
+        assertRuntimeDiagnostic(invalidScope.caseResults().getFirst().executionRecordId(), "UNSUPPORTED_VARIABLE_SCOPE", "invalid-scope");
+        assertRuntimeDiagnostic(invalidExpression.caseResults().getFirst().executionRecordId(), "INVALID_VARIABLE_EXPRESSION", "invalid-expression");
+    }
+
+    @Test
+    void dryRunResolvesSuiteRequestTemplateWithoutCallingTransport() {
+        var apiSpec = apiSpecs.save(newApiSpec(HttpMethod.GET, "/api/orders", 200));
+        var task = tasks.save(newTask(apiSpec.getApiSpecId()));
+        var suite = testCases.save(newSuiteTestCase(apiSpec.getApiSpecId(), List.of(
+            suiteStepWithTemplate(1, "dry-run-step", apiSpec.getApiSpecId(), Map.of(
+                "method", "GET",
+                "path", "/api/${env.tenant}/orders",
+                "headers", Map.of("X-Tenant", "${env.tenant}")
+            ), 200, List.of())
+        )));
+
+        var result = executionService.execute(new HttpExecutionRequest(
+            task.getTaskId(),
+            List.of(suite.getCaseId()),
+            ExecutionMode.SUITE_STEP,
+            "test",
+            true,
+            HttpExecutionOptions.defaults(),
+            Map.of("tenant", "tenant-a"),
+            Map.of()
+        ));
+
+        assertThat(result.caseResults().getFirst().status()).isEqualTo(HttpExecutionOutcomeStatus.SKIPPED);
+        assertThat(fakeHttpClient.requests()).isEmpty();
+        var record = executionRecords.findById(result.caseResults().getFirst().executionRecordId()).orElseThrow();
+        @SuppressWarnings("unchecked")
+        var steps = (List<Map<String, Object>>) record.getResponseSnapshot().get("steps");
+        @SuppressWarnings("unchecked")
+        var requestSnapshot = (Map<String, Object>) steps.getFirst().get("requestSnapshot");
+        assertThat(requestSnapshot).containsEntry("path", "/api/tenant-a/orders");
+        @SuppressWarnings("unchecked")
+        var headers = (Map<String, Object>) requestSnapshot.get("headers");
+        assertThat(headers).containsEntry("X-Tenant", "tenant-a");
+    }
+
+    @Test
     void suiteStopsDependentStepsAfterFailedPrerequisiteWhenConfigured() {
         var createOrder = apiSpecs.save(newApiSpec(HttpMethod.POST, "/api/orders", 201));
         var readOrder = apiSpecs.save(newApiSpec(HttpMethod.GET, "/api/orders/order-123", 200));
@@ -1329,6 +1523,34 @@ class HttpExecutionApplicationServiceTests {
         ));
         step.put("extractRules", extractRules);
         return step;
+    }
+
+    private Map<String, Object> suiteStepWithTemplate(
+        int order,
+        String stepId,
+        String apiSpecId,
+        Map<String, Object> requestTemplate,
+        int expectedStatus,
+        List<Map<String, Object>> extractRules
+    ) {
+        var step = new java.util.LinkedHashMap<String, Object>();
+        step.put("order", order);
+        step.put("stepId", stepId);
+        step.put("apiSpecId", apiSpecId);
+        step.put("expectedStatus", expectedStatus);
+        step.put("requestTemplate", requestTemplate);
+        step.put("extractRules", extractRules);
+        return step;
+    }
+
+    private void assertRuntimeDiagnostic(String executionRecordId, String code, String stepId) {
+        var record = executionRecords.findById(executionRecordId).orElseThrow();
+        @SuppressWarnings("unchecked")
+        var diagnostics = (List<Map<String, Object>>) record.getResponseSnapshot().get("runtimeDiagnostics");
+        assertThat(diagnostics)
+            .anySatisfy(diagnostic -> assertThat(diagnostic)
+                .containsEntry("code", code)
+                .containsEntry("stepId", stepId));
     }
 
     @TestConfiguration

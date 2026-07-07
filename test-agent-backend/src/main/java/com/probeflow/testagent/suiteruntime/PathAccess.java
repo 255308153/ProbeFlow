@@ -17,7 +17,13 @@ final class PathAccess {
             return PathResult.found(root);
         }
         var current = root;
-        for (var token : parse(path)) {
+        List<PathToken> tokens;
+        try {
+            tokens = parse(path);
+        } catch (IllegalArgumentException exception) {
+            return PathResult.missing("INVALID_PATH_SYNTAX");
+        }
+        for (var token : tokens) {
             if (!token.field().isBlank()) {
                 if (!(current instanceof Map<?, ?> map) || !map.containsKey(token.field())) {
                     return PathResult.missing("PATH_MISSING");
@@ -51,7 +57,7 @@ final class PathAccess {
                 var open = rawSegment.indexOf('[', cursor);
                 var close = rawSegment.indexOf(']', open + 1);
                 if (open < 0 || close < 0) {
-                    break;
+                    throw new IllegalArgumentException("Invalid array selector");
                 }
                 indexes.add(Integer.parseInt(rawSegment.substring(open + 1, close)));
                 cursor = close + 1;
