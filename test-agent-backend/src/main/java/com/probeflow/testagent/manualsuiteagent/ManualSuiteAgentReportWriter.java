@@ -149,6 +149,9 @@ public class ManualSuiteAgentReportWriter {
             if (phaseNote != null) {
                 markdown.append("  - Note: ").append(phaseNote).append("\n");
             }
+            if ("generated-suite-draft".equals(section.sectionId())) {
+                appendGeneratedSuiteDraft(markdown, redactor.redactMap(section.summary()));
+            }
         }
         markdown.append("\n");
 
@@ -177,5 +180,61 @@ public class ManualSuiteAgentReportWriter {
                 .append("\n");
         }
         return markdown.toString();
+    }
+
+    @SuppressWarnings("unchecked")
+    private void appendGeneratedSuiteDraft(StringBuilder markdown, Map<String, Object> summary) {
+        markdown.append("  - Flow: ")
+            .append(summary.get("flowId"))
+            .append(" / ")
+            .append(summary.get("scenarioName"))
+            .append("\n");
+        markdown.append("  - Readiness: ")
+            .append(summary.get("readinessStatus"))
+            .append(", steps=")
+            .append(summary.get("stepCount"))
+            .append(", dependencies=")
+            .append(summary.get("dependencyCount"))
+            .append(", diagnostics=")
+            .append(summary.get("diagnosticCount"))
+            .append("\n");
+        appendRows(markdown, "Steps", (List<Object>) summary.getOrDefault("steps", List.of()),
+            List.of("stepId", "order", "apiSpecId", "readinessStatus"));
+        appendRows(markdown, "Dependency links", (List<Object>) summary.getOrDefault("dependencyLinks", List.of()),
+            List.of("dependencyId", "producerStepId", "consumerStepId", "targetKey", "referenceExpression"));
+        appendRows(markdown, "Extract rules", (List<Object>) summary.getOrDefault("extractRules", List.of()),
+            List.of("ruleId", "producerStepId", "sourceType", "sourcePath", "targetKey"));
+        appendRows(markdown, "Variable references", (List<Object>) summary.getOrDefault("variableReferences", List.of()),
+            List.of("consumerStepId", "consumerLocation", "targetKey", "referenceExpression", "sourceDependencyId"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private void appendRows(
+        StringBuilder markdown,
+        String title,
+        List<Object> rows,
+        List<String> fields
+    ) {
+        if (rows.isEmpty()) {
+            markdown.append("  - ").append(title).append(": none\n");
+            return;
+        }
+        markdown.append("  - ").append(title).append(":\n");
+        for (var row : rows) {
+            if (!(row instanceof Map<?, ?> map)) {
+                markdown.append("    - ").append(row).append("\n");
+                continue;
+            }
+            var typed = (Map<String, Object>) map;
+            markdown.append("    - ");
+            for (int index = 0; index < fields.size(); index++) {
+                var field = fields.get(index);
+                if (index > 0) {
+                    markdown.append(", ");
+                }
+                markdown.append(field).append("=").append(typed.get(field));
+            }
+            markdown.append("\n");
+        }
     }
 }

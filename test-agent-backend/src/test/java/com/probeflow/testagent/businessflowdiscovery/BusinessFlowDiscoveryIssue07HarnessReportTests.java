@@ -41,10 +41,12 @@ class BusinessFlowDiscoveryIssue07HarnessReportTests {
             .filter(section -> section.sectionId().equals("generated-suite-draft"))
             .findFirst()
             .orElseThrow();
-        assertThat(generatedSuiteDraft.source()).isEqualTo(ManualSuiteAgentSectionSource.FIXTURE);
+        assertThat(generatedSuiteDraft.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
         assertThat(generatedSuiteDraft.summary().get("phaseNote").toString())
-            .contains("V3-3 DependencyLinker")
-            .doesNotContain("real V3-3");
+            .contains("V3-3 DependencyLinker");
+        assertThat(generatedSuiteDraft.summary().toString())
+            .contains("dep-create-order-to-pay-order-orderId")
+            .contains("${suite.orderId}");
 
         var json = new ObjectMapper().readTree(Files.readString(artifactPath(result, "JSON_REPORT")));
         var sections = json.get("sections").toString();

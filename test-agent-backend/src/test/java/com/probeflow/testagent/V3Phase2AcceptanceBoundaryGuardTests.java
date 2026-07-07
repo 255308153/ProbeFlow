@@ -21,7 +21,7 @@ class V3Phase2AcceptanceBoundaryGuardTests {
     private Path outputDir;
 
     @Test
-    void orderSuiteDemoContainsRealBusinessFlowDiscoveryButNoV3Phase3OrRuntimeVariableOutput() throws Exception {
+    void orderSuiteDemoContainsRealBusinessFlowDiscoveryAndSuiteDraftButNoRuntimeVariableOutput() throws Exception {
         var result = ManualSuiteAgentHarness.defaults()
             .run(ManualSuiteAgentRunRequest.fake("order-suite-demo", outputDir));
 
@@ -42,12 +42,18 @@ class V3Phase2AcceptanceBoundaryGuardTests {
             .filter(section -> section.sectionId().equals("generated-suite-draft"))
             .findFirst()
             .orElseThrow();
-        assertThat(generatedSuiteDraft.source()).isEqualTo(ManualSuiteAgentSectionSource.FIXTURE);
+        assertThat(generatedSuiteDraft.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
         assertThat(generatedSuiteDraft.summary().toString())
-            .doesNotContain("${suite.")
-            .doesNotContain("${step.")
-            .doesNotContain("extractRules=[")
+            .contains("${suite.orderId}")
+            .contains("extractRules")
             .contains("V3-3 DependencyLinker");
+
+        var variableAudit = result.sections().stream()
+            .filter(section -> section.sectionId().equals("variable-audit"))
+            .findFirst()
+            .orElseThrow();
+        assertThat(variableAudit.source()).isEqualTo(ManualSuiteAgentSectionSource.PENDING_RUNTIME);
+        assertThat(variableAudit.status()).isEqualTo("PENDING_RUNTIME");
 
         assertThat(result.sections())
             .extracting(section -> section.sectionId())

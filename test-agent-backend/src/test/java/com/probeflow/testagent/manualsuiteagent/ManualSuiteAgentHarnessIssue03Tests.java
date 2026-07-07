@@ -17,15 +17,16 @@ class ManualSuiteAgentHarnessIssue03Tests {
     private Path outputDir;
 
     @Test
-    void orderFixtureExposesStagedV3SectionsWithExplicitSourceMarkersInJsonAndMarkdown() throws Exception {
+    void orderFixtureExposesV3SectionsWithExplicitSourceMarkersInJsonAndMarkdown() throws Exception {
         var result = ManualSuiteAgentHarness.defaults()
             .run(ManualSuiteAgentRunRequest.fake("order-suite-demo", outputDir));
 
         var suiteDraft = section(result, "generated-suite-draft");
-        assertThat(suiteDraft.source()).isEqualTo(ManualSuiteAgentSectionSource.FIXTURE);
+        assertThat(suiteDraft.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
         assertThat(suiteDraft.summary())
-            .containsEntry("scenarioName", "Order checkout happy path")
-            .containsEntry("sourceMarker", "fixture");
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("readinessStatus", "READY")
+            .containsEntry("dependencyCount", 2);
         @SuppressWarnings("unchecked")
         var suiteDraftSteps = (List<Map<String, Object>>) suiteDraft.summary().get("steps");
         assertThat(suiteDraftSteps.stream().map(step -> step.get("stepName")).toList())
@@ -64,7 +65,7 @@ class ManualSuiteAgentHarnessIssue03Tests {
             .containsEntry("fixtureId", "order-suite-demo");
 
         var json = new ObjectMapper().readTree(Files.readString(artifactPath(result, "JSON_REPORT")));
-        assertSectionSource(json, "generated-suite-draft", "FIXTURE", "fixture");
+        assertSectionSource(json, "generated-suite-draft", "REAL", "real");
         assertSectionSource(json, "variable-audit", "PENDING_RUNTIME", "pending-runtime");
         assertSectionSource(json, "failure-analysis", "STAGED", "staged");
         assertSectionSource(json, "memory-feedback", "STAGED", "staged");

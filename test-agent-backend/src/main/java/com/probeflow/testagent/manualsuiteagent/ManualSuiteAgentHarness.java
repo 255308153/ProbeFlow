@@ -16,6 +16,14 @@ import com.probeflow.testagent.knowledge.KnowledgeContextEntry;
 import com.probeflow.testagent.memory.LongTermMemoryRetrievalHit;
 import com.probeflow.testagent.memory.MemoryScopeType;
 import com.probeflow.testagent.memory.MemorySourceType;
+import com.probeflow.testagent.suitedraft.SuiteDraftGenerationRequest;
+import com.probeflow.testagent.suitedraft.SuiteDraftGenerationResult;
+import com.probeflow.testagent.suitedraft.SuiteDraftGenerationService;
+import com.probeflow.testagent.suitedraft.SuiteDraftProviderMode;
+import com.probeflow.testagent.suitedraft.SuiteExtractRule;
+import com.probeflow.testagent.suitedraft.SuiteReadinessDiagnostic;
+import com.probeflow.testagent.suitedraft.SuiteVariableDependency;
+import com.probeflow.testagent.suitedraft.SuiteVariableReference;
 import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskPriority;
 import com.probeflow.testagent.task.TaskSourceType;
@@ -44,6 +52,7 @@ public class ManualSuiteAgentHarness {
     private final ManualSuiteAgentReportWriter reportWriter;
     private final ManualSuiteAgentFakeHttpGateway fakeHttpGateway = new ManualSuiteAgentFakeHttpGateway();
     private final BusinessFlowDiscoveryService businessFlowDiscoveryService = new BusinessFlowDiscoveryService();
+    private final SuiteDraftGenerationService suiteDraftGenerationService = new SuiteDraftGenerationService();
 
     public ManualSuiteAgentHarness(
         ManualSuiteAgentFixtureRegistry fixtureRegistry,
@@ -199,15 +208,18 @@ public class ManualSuiteAgentHarness {
             request.runProfile(),
             Map.of("harnessFixture", fixture.fixtureId())
         ));
+        var suiteDraftResult = generateSuiteDraft(request, fixture, apiSpecs, discoveryResult);
         var task = orderTask(apiSpecs.stream().map(ApiSpec::getApiSpecId).toList());
         var testCase = orderSuiteTestCase(apiSpecs);
         var executionSummary = executeOrderSuite(testCase);
+        var suiteDraftSummary = generatedSuiteDraftSummary(suiteDraftResult);
 
         var metadata = new LinkedHashMap<String, Object>();
         metadata.put("task", taskSummary(task));
         metadata.put("apiSpecs", apiSpecs.stream().map(this::apiSpecSummary).toList());
         metadata.put("testCases", List.of(testCaseSummary(testCase)));
         metadata.put("businessFlowDiscovery", businessFlowDiscoverySummary(discoveryResult));
+        metadata.put("generatedSuiteDraft", suiteDraftSummary);
         metadata.put("executionSummary", executionSummary);
 
         var sections = new ArrayList<>(baseSections(request, fixture));
@@ -239,6 +251,13 @@ public class ManualSuiteAgentHarness {
             "READY",
             testCaseSummary(testCase)
         ));
+        sections.add(new ManualSuiteAgentSectionSummary(
+            "generated-suite-draft",
+            "Generated suite draft summary",
+            ManualSuiteAgentSectionSource.REAL,
+            suiteDraftResult.readinessStatus().name(),
+            suiteDraftSummary
+        ));
         sections.addAll(v3StagedSections(request, fixture, testCase));
         sections.add(new ManualSuiteAgentSectionSummary(
             "execution-result",
@@ -256,26 +275,6 @@ public class ManualSuiteAgentHarness {
         TestCase testCase
     ) {
         return List.of(
-            new ManualSuiteAgentSectionSummary(
-                "generated-suite-draft",
-                "Generated suite draft summary",
-                ManualSuiteAgentSectionSource.FIXTURE,
-                "READY",
-                orderedMap(
-                    "sourceMarker", "fixture",
-                    "phaseNote", "Business Flow Discovery is real in V3-2; this suite draft remains fixture-provided until V3-3 DependencyLinker.",
-                    "scenarioName", testCase.getScenarioName(),
-                    "steps", testCase.getSteps().stream()
-                        .map(step -> orderedMap(
-                            "order", step.get("order"),
-                            "stepName", step.get("stepName"),
-                            "critical", step.get("critical"),
-                            "sourceRefs", List.of(step.get("apiSpecId")),
-                            "sourceMarker", "fixture"
-                        ))
-                        .toList()
-                )
-            ),
             new ManualSuiteAgentSectionSummary(
                 "variable-audit",
                 "Variable audit integration slot",
@@ -350,6 +349,153 @@ public class ManualSuiteAgentHarness {
                     "expectedMarkers", List.of("suite-draft-present", "fake-http-passed", "no-external-llm", "no-external-http")
                 )
             )
+        );
+    }
+
+    private SuiteDraftGenerationResult generateSuiteDraft(
+        ManualSuiteAgentRunRequest request,
+        ManualSuiteAgentFixture fixture,
+        List<ApiSpec> apiSpecs,
+        BusinessFlowDiscoveryResult discoveryResult
+    ) {
+        var candidate = discoveryResult.candidates().stream()
+            .filter(BusinessFlowCandidate::primary)
+            .findFirst()
+            .or(() -> discoveryResult.candidates().stream().findFirst())
+            .orElse(null);
+        return suiteDraftGenerationService.generate(new SuiteDraftGenerationRequest(
+            fixture.fixtureId(),
+            candidate,
+            apiSpecs,
+            List.of(),
+            suiteDraftProviderMode(request.providerMode()),
+            request.allowManualProvider(),
+            List.of(),
+            null,
+            request.runProfile(),
+            orderedMap("harnessFixture", fixture.fixtureId(), "source", "manual-suite-agent-harness")
+        ));
+    }
+
+    private SuiteDraftProviderMode suiteDraftProviderMode(ManualSuiteAgentProviderMode providerMode) {
+        return providerMode == ManualSuiteAgentProviderMode.MANUAL_REAL_LLM
+            ? SuiteDraftProviderMode.MANUAL_REAL_LLM
+            : SuiteDraftProviderMode.DETERMINISTIC_FAKE;
+    }
+
+    private Map<String, Object> generatedSuiteDraftSummary(SuiteDraftGenerationResult result) {
+        var summary = new LinkedHashMap<String, Object>();
+        summary.put("sourceMarker", "real");
+        summary.put("phaseNote", "V3-3 DependencyLinker generated this SUITE draft; runtime variable audit remains V3-4.");
+        summary.put("schemaVersion", result.schemaVersion());
+        summary.put("status", result.status().name());
+        summary.put("readinessStatus", result.readinessStatus().name());
+        summary.put("providerMode", result.providerMode().name());
+        summary.put(ManualSuiteAgentRunResult.USES_REAL_LLM_REPORT_KEY, result.usesManualProvider());
+        summary.put("usesExternalHttp", result.usesExternalHttp());
+        summary.put("dependencyCount", result.dependencyLinks().size());
+        summary.put("diagnosticCount", result.diagnostics().size());
+        summary.put("diagnostics", result.diagnostics().stream().map(this::suiteDiagnosticSummary).toList());
+        summary.put("blockers", result.blockers().stream().map(this::suiteDiagnosticSummary).toList());
+        summary.put("dependencyLinks", result.dependencyLinks().stream().map(this::dependencyLinkSummary).toList());
+        summary.put("metadata", result.metadata());
+        if (result.draft() == null) {
+            summary.put("flowId", null);
+            summary.put("scenarioName", null);
+            summary.put("stepCount", 0);
+            summary.put("steps", List.of());
+            summary.put("extractRules", List.of());
+            summary.put("variableReferences", List.of());
+            return summary;
+        }
+        summary.put("flowId", result.draft().flowId());
+        summary.put("scenarioName", result.draft().scenarioName());
+        summary.put("stepCount", result.draft().steps().size());
+        summary.put("steps", result.draft().steps().stream()
+            .map(step -> orderedMap(
+                "stepId", step.stepId(),
+                "stepName", step.stepName(),
+                "order", step.order(),
+                "apiSpecId", step.apiSpecId(),
+                "critical", step.critical(),
+                "sourceRefs", step.sourceRefs(),
+                "dependencyRefs", step.dependencyRefs(),
+                "readinessStatus", step.readinessStatus().name(),
+                "requestTemplate", step.requestTemplate(),
+                "metadata", step.metadata()
+            ))
+            .toList());
+        summary.put("extractRules", result.draft().steps().stream()
+            .flatMap(step -> step.extractRules().stream())
+            .map(this::extractRuleSummary)
+            .toList());
+        summary.put("variableReferences", result.draft().steps().stream()
+            .flatMap(step -> step.variableReferences().stream())
+            .map(this::variableReferenceSummary)
+            .toList());
+        summary.put("draftMetadata", result.draft().metadata());
+        return summary;
+    }
+
+    private Map<String, Object> dependencyLinkSummary(SuiteVariableDependency dependency) {
+        return orderedMap(
+            "dependencyId", dependency.dependencyId(),
+            "producerStepId", dependency.producerStepId(),
+            "consumerStepId", dependency.consumerStepId(),
+            "variableName", dependency.variableName(),
+            "sourceType", dependency.sourceType().name(),
+            "sourcePath", dependency.sourcePath(),
+            "consumerLocation", dependency.consumerLocation().name(),
+            "consumerField", dependency.consumerField(),
+            "targetScope", dependency.targetScope().name(),
+            "targetKey", dependency.targetKey(),
+            "referenceExpression", dependency.referenceExpression(),
+            "confidence", dependency.confidence(),
+            "evidenceRefs", dependency.evidenceRefs(),
+            "riskLevel", dependency.riskLevel()
+        );
+    }
+
+    private Map<String, Object> extractRuleSummary(SuiteExtractRule rule) {
+        return orderedMap(
+            "ruleId", rule.ruleId(),
+            "producerStepId", rule.producerStepId(),
+            "sourceType", rule.sourceType().name(),
+            "sourcePath", rule.sourcePath(),
+            "targetScope", rule.targetScope().name(),
+            "targetKey", rule.targetKey(),
+            "required", rule.required(),
+            "failureStrategy", rule.failureStrategy().name(),
+            "description", rule.description(),
+            "confidence", rule.confidence(),
+            "evidenceRefs", rule.evidenceRefs(),
+            "consumerStepIds", rule.consumerStepIds(),
+            "sourceDependencyIds", rule.sourceDependencyIds()
+        );
+    }
+
+    private Map<String, Object> variableReferenceSummary(SuiteVariableReference reference) {
+        return orderedMap(
+            "consumerStepId", reference.consumerStepId(),
+            "consumerLocation", reference.consumerLocation().name(),
+            "consumerField", reference.consumerField(),
+            "targetScope", reference.targetScope().name(),
+            "targetKey", reference.targetKey(),
+            "referenceExpression", reference.referenceExpression(),
+            "sourceDependencyId", reference.sourceDependencyId(),
+            "evidenceRefs", reference.evidenceRefs()
+        );
+    }
+
+    private Map<String, Object> suiteDiagnosticSummary(SuiteReadinessDiagnostic diagnostic) {
+        return orderedMap(
+            "code", diagnostic.code(),
+            "severity", diagnostic.severity(),
+            "affectedSteps", diagnostic.affectedSteps(),
+            "affectedDependencyId", diagnostic.affectedDependencyId(),
+            "reason", diagnostic.reason(),
+            "recommendedAction", diagnostic.recommendedAction(),
+            "metadata", diagnostic.metadata()
         );
     }
 

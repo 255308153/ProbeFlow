@@ -30,7 +30,7 @@ class ManualSuiteAgentHarnessIssue06Tests {
         assertThat(result.usesExternalHttp()).isFalse();
         assertThat(result.metadata().get("executionSummary").toString()).contains("FAKE_HTTP");
 
-        assertThat(section(result, "generated-suite-draft").source()).isEqualTo(ManualSuiteAgentSectionSource.FIXTURE);
+        assertThat(section(result, "generated-suite-draft").source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
         assertThat(section(result, "business-flow-discovery").source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
         assertThat(section(result, "variable-audit").source()).isEqualTo(ManualSuiteAgentSectionSource.PENDING_RUNTIME);
         assertThat(section(result, "failure-analysis").source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
