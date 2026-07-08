@@ -7,7 +7,42 @@ import java.util.Map;
 class ManualSuiteAgentFakeHttpGateway {
 
     ManualSuiteAgentFakeHttpResponse execute(String stepId, HttpClientRequest request) {
+        return execute(stepId, request, "");
+    }
+
+    ManualSuiteAgentFakeHttpResponse execute(String stepId, HttpClientRequest request, String failureScenario) {
         var orderId = orderIdFromPath(request == null ? null : request.path());
+        if ("variable-extraction-failure".equals(failureScenario) && "create-order".equals(stepId)) {
+            return new ManualSuiteAgentFakeHttpResponse(
+                201,
+                orderedMap(
+                    "status", "CREATED",
+                    "data", orderedMap("status", "CREATED")
+                ),
+                15L,
+                "order created without expected orderId field"
+            );
+        }
+        if ("prerequisite-step-failure".equals(failureScenario) && "create-order".equals(stepId)) {
+            return new ManualSuiteAgentFakeHttpResponse(
+                500,
+                orderedMap(
+                    "orderId", "ORD-1001",
+                    "status", "CREATE_FAILED",
+                    "data", orderedMap("orderId", "ORD-1001")
+                ),
+                17L,
+                "create order API returned 500"
+            );
+        }
+        if ("downstream-api-failure".equals(failureScenario) && "pay-order".equals(stepId)) {
+            return new ManualSuiteAgentFakeHttpResponse(
+                503,
+                orderedMap("paymentId", "PAY-9001", "orderId", orderId, "status", "PAYMENT_GATEWAY_UNAVAILABLE"),
+                22L,
+                "payment service returned 503"
+            );
+        }
         return switch (stepId) {
             case "create-order" -> new ManualSuiteAgentFakeHttpResponse(
                 201,

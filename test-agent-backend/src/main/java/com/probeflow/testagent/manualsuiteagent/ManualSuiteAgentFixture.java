@@ -37,6 +37,29 @@ public record ManualSuiteAgentFixture(
     }
 
     static ManualSuiteAgentFixture orderSuiteDemo() {
+        return orderSuiteFixture(
+            "order-suite-demo",
+            "Order payment suite demo",
+            "Deterministic order create, pay and query fixture for the V3 manual suite harness.",
+            null
+        );
+    }
+
+    static ManualSuiteAgentFixture orderSuiteFailure(String fixtureId, String displayName, String failureScenario) {
+        return orderSuiteFixture(
+            fixtureId,
+            displayName,
+            "Deterministic order suite failure fixture for V3-5 failure-analysis harness demos.",
+            failureScenario
+        );
+    }
+
+    private static ManualSuiteAgentFixture orderSuiteFixture(
+        String fixtureId,
+        String displayName,
+        String description,
+        String failureScenario
+    ) {
         var metadata = new LinkedHashMap<String, Object>();
         metadata.put("fixtureType", "order-suite-demo");
         metadata.put("baseUrl", "https://fixture.local");
@@ -48,12 +71,17 @@ public record ManualSuiteAgentFixture(
         metadata.put("businessSteps", List.of("create-order", "pay-order", "query-order"));
         metadata.put("usesFixtureProvider", true);
         metadata.put("usesFakeHttpGateway", true);
+        if (failureScenario != null && !failureScenario.isBlank()) {
+            metadata.put("failureScenario", failureScenario);
+        }
         return new ManualSuiteAgentFixture(
-            "order-suite-demo",
+            fixtureId,
             "2026.07.order.v1",
-            "Order payment suite demo",
-            "Deterministic order create, pay and query fixture for the V3 manual suite harness.",
-            List.of("v3-1", "suite", "order", "fake-http"),
+            displayName,
+            description,
+            failureScenario == null || failureScenario.isBlank()
+                ? List.of("v3-1", "suite", "order", "fake-http")
+                : List.of("v3-5", "suite", "order", "fake-http", "failure-analysis", failureScenario),
             metadata
         );
     }

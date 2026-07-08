@@ -33,7 +33,11 @@ class ManualSuiteAgentHarnessIssue06Tests {
         assertThat(section(result, "generated-suite-draft").source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
         assertThat(section(result, "business-flow-discovery").source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
         assertThat(section(result, "variable-audit").source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
-        assertThat(section(result, "failure-analysis").source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
+        assertThat(section(result, "failure-analysis").source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(section(result, "failure-analysis").summary())
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("classification", "NONE")
+            .containsEntry("recoveryActionType", "NO_ACTION");
         assertThat(section(result, "memory-feedback").source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
         assertThat(section(result, "evaluation-comparison").source()).isEqualTo(ManualSuiteAgentSectionSource.NOT_RUN);
         assertThat(result.sections())

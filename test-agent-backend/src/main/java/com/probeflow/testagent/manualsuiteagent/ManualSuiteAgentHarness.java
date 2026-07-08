@@ -168,7 +168,7 @@ public class ManualSuiteAgentHarness {
         var metadata = new LinkedHashMap<String, Object>();
         metadata.put("harnessScope", "v3-1-manual-suite-agent-harness");
         var sections = baseSections(request, fixtureValue);
-        if ("order-suite-demo".equals(fixtureValue.fixtureId())) {
+        if ("order-suite-demo".equals(fixtureValue.metadata().get("fixtureType"))) {
             var orderRun = runOrderSuiteFixture(request, fixtureValue);
             metadata.putAll(orderRun.metadata());
             sections = orderRun.sections();
@@ -229,8 +229,11 @@ public class ManualSuiteAgentHarness {
         var suiteDraftResult = generateSuiteDraft(request, fixture, apiSpecs, discoveryResult);
         var task = orderTask(apiSpecs.stream().map(ApiSpec::getApiSpecId).toList());
         var testCase = orderSuiteTestCase(apiSpecs, suiteDraftResult);
-        var executionSummary = executeOrderSuite(task, testCase);
+        var failureScenario = stringValue(fixture.metadata().get("failureScenario"));
+        applyFailureScenario(testCase, failureScenario);
+        var executionSummary = executeOrderSuite(task, testCase, failureScenario);
         var suiteDraftSummary = generatedSuiteDraftSummary(suiteDraftResult);
+        var failureAnalysisSection = failureAnalysisSection(executionSummary, failureScenario);
 
         var metadata = new LinkedHashMap<String, Object>();
         metadata.put("task", taskSummary(task));
@@ -239,6 +242,7 @@ public class ManualSuiteAgentHarness {
         metadata.put("businessFlowDiscovery", businessFlowDiscoverySummary(discoveryResult));
         metadata.put("generatedSuiteDraft", suiteDraftSummary);
         metadata.put("executionSummary", executionSummary);
+        metadata.put("failureAnalysis", failureAnalysisSection.summary());
 
         var sections = new ArrayList<>(baseSections(request, fixture));
         sections.add(new ManualSuiteAgentSectionSummary(
@@ -277,6 +281,7 @@ public class ManualSuiteAgentHarness {
             suiteDraftSummary
         ));
         sections.add(variableAuditSection(executionSummary));
+        sections.add(failureAnalysisSection);
         sections.addAll(v3StagedSections(request, fixture, testCase));
         sections.add(new ManualSuiteAgentSectionSummary(
             "execution-result",
@@ -286,6 +291,32 @@ public class ManualSuiteAgentHarness {
             executionSummary
         ));
         return new OrderFixtureRun(sections, metadata);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void applyFailureScenario(TestCase testCase, String failureScenario) {
+        if (!"variable-resolution-failure".equals(failureScenario)) {
+            return;
+        }
+        for (var step : testCase.getSteps()) {
+            if (!"pay-order".equals(step.get("stepId"))) {
+                continue;
+            }
+            var requestTemplate = new LinkedHashMap<>(objectMap(step.get("requestTemplate")));
+            requestTemplate.put("path", "/api/orders/${suite.missingOrderId}/payments");
+            step.put("requestTemplate", requestTemplate);
+            var references = new ArrayList<Map<String, Object>>((List<Map<String, Object>>) step.getOrDefault("variableReferences", List.of()));
+            references.add(orderedMap(
+                "consumerStepId", "pay-order",
+                "consumerLocation", "PATH",
+                "consumerField", "orderId",
+                "targetScope", "suite",
+                "targetKey", "missingOrderId",
+                "referenceExpression", "${suite.missingOrderId}",
+                "sourceDependencyId", "fixture-missing-order-id"
+            ));
+            step.put("variableReferences", references);
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -314,27 +345,263 @@ public class ManualSuiteAgentHarness {
         );
     }
 
+    @SuppressWarnings("unchecked")
+    private ManualSuiteAgentSectionSummary failureAnalysisSection(
+        Map<String, Object> executionSummary,
+        String failureScenario
+    ) {
+        var steps = (List<Map<String, Object>>) executionSummary.getOrDefault("stepResults", List.of());
+        var diagnostics = (List<Map<String, Object>>) executionSummary.getOrDefault("runtimeDiagnostics", List.of());
+        var auditSummary = objectMap(executionSummary.get("variableAuditSummary"));
+        var auditEvents = (List<Map<String, Object>>) auditSummary.getOrDefault("events", List.of());
+        var rootStep = firstProblemStep(steps);
+        var affectedSteps = affectedSkippedSteps(steps, rootStep);
+        var classification = failureClassification(rootStep, affectedSteps, diagnostics, auditEvents, failureScenario);
+        var riskLevel = "NONE".equals(classification) ? "LOW" : "HIGH";
+        var confidence = "NONE".equals(classification) ? "1.00" : "0.90";
+        var nextSuggestion = failureNextSuggestion(classification, rootStep);
+        var evidence = failureEvidence(executionSummary, rootStep, affectedSteps, diagnostics, auditEvents, classification);
+        var rootStepId = rootStep == null ? null : stringValue(rootStep.get("stepId"));
+        var affectedStepIds = affectedSteps.stream()
+            .map(step -> stringValue(step.get("stepId")))
+            .toList();
+        var summary = orderedMap(
+            "sourceMarker", "real",
+            "phaseNote", "V3-5 failure-analysis section generated from the current Manual Suite Agent fake runtime execution.",
+            "analysisMode", "BASIC",
+            "classification", classification,
+            "rootStep", rootStepId,
+            "rootCause", rootCauseSummary(classification, rootStep, diagnostics),
+            "affectedSteps", affectedStepIds,
+            "affectedDownstreamSteps", affectedStepIds,
+            "evidence", evidence,
+            "riskLevel", riskLevel,
+            "confidence", confidence,
+            "requiresHumanReview", !"NONE".equals(classification),
+            "nextSuggestion", nextSuggestion,
+            "recoveryActionType", recoveryActionType(classification),
+            "suiteFailureAnalysis", orderedMap(
+                "suiteExecution", true,
+                "classification", classification,
+                "rootCauseStep", stepSummary(rootStep),
+                "affectedDownstreamSteps", affectedSteps.stream().map(this::stepSummary).toList(),
+                "variableFailure", variableFailureSummary(classification, diagnostics, auditEvents),
+                "impactSummary", impactSummary(classification, rootStepId, affectedStepIds)
+            ),
+            "replanningHandoff", orderedMap(
+                "available", !"NONE".equals(classification),
+                "sourceStepId", rootStepId,
+                "affectedDownstreamStepIds", affectedStepIds,
+                "recoveryActionType", recoveryActionType(classification),
+                "nextSuggestion", nextSuggestion,
+                "policyNotes", List.of("PolicyValidator and Human-in-the-loop gates remain required before any recovery is applied.")
+            ),
+            "humanHandoff", orderedMap(
+                "required", !"NONE".equals(classification),
+                "reason", "NONE".equals(classification) ? "No failure follow-up is required." : "Manual review can confirm the proposed recovery before replanning.",
+                "suggestedAction", nextSuggestion
+            )
+        );
+        return new ManualSuiteAgentSectionSummary(
+            "failure-analysis",
+            "Suite failure analysis",
+            ManualSuiteAgentSectionSource.REAL,
+            "NONE".equals(classification) ? "PASSED" : "REVIEW",
+            summary
+        );
+    }
+
+    private Map<String, Object> firstProblemStep(List<Map<String, Object>> steps) {
+        return steps.stream()
+            .filter(step -> {
+                var status = stringValue(step.get("status"));
+                return "FAILED".equals(status) || "ERROR".equals(status) || "BLOCKED".equals(status);
+            })
+            .findFirst()
+            .orElse(null);
+    }
+
+    private List<Map<String, Object>> affectedSkippedSteps(
+        List<Map<String, Object>> steps,
+        Map<String, Object> rootStep
+    ) {
+        if (rootStep == null) {
+            return List.of();
+        }
+        var rootOrder = intValue(rootStep.get("order"));
+        return steps.stream()
+            .filter(step -> "SKIPPED".equals(stringValue(step.get("status"))))
+            .filter(step -> intValue(step.get("order")) > rootOrder)
+            .toList();
+    }
+
+    private String failureClassification(
+        Map<String, Object> rootStep,
+        List<Map<String, Object>> affectedSteps,
+        List<Map<String, Object>> diagnostics,
+        List<Map<String, Object>> auditEvents,
+        String failureScenario
+    ) {
+        if (rootStep == null) {
+            return "NONE";
+        }
+        if ("variable-extraction-failure".equals(failureScenario) || diagnostics.stream().anyMatch(this::extractionDiagnostic)) {
+            return "VARIABLE_EXTRACTION_FAILURE";
+        }
+        if ("variable-resolution-failure".equals(failureScenario) || diagnostics.stream().anyMatch(this::resolutionDiagnostic)) {
+            return "VARIABLE_RESOLUTION_FAILURE";
+        }
+        if ("FAILED".equals(stringValue(rootStep.get("status")))
+            && intValue(rootStep.get("order")) > 1
+            && auditEvents.stream().anyMatch(event -> stringValue(rootStep.get("stepId")).equals(stringValue(event.get("stepId")))
+                && "CONSUMPTION".equals(stringValue(event.get("eventType")))
+                && Boolean.TRUE.equals(event.get("resolved")))) {
+            return "DOWNSTREAM_API_FAILURE";
+        }
+        if (!affectedSteps.isEmpty()) {
+            return "PREREQUISITE_STEP_FAILURE";
+        }
+        return "UNKNOWN";
+    }
+
+    private boolean extractionDiagnostic(Map<String, Object> diagnostic) {
+        return diagnostic.containsKey("sourcePath")
+            || diagnostic.containsKey("targetKey")
+            || diagnostic.containsKey("sourceType");
+    }
+
+    private boolean resolutionDiagnostic(Map<String, Object> diagnostic) {
+        return diagnostic.containsKey("expression")
+            || diagnostic.containsKey("location")
+            || diagnostic.containsKey("path");
+    }
+
+    private String failureNextSuggestion(String classification, Map<String, Object> rootStep) {
+        return switch (classification) {
+            case "VARIABLE_EXTRACTION_FAILURE" -> "Check response field path, extractRule source mapping, and upstream response shape before rerunning downstream steps.";
+            case "VARIABLE_RESOLUTION_FAILURE" -> "Provide the missing variable, fix the variable reference, or move the producing suite step before this consumer.";
+            case "DOWNSTREAM_API_FAILURE" -> "Inspect the downstream API response and service health; prerequisite variables were already produced and consumed.";
+            case "PREREQUISITE_STEP_FAILURE" -> "Inspect suite prerequisite step " + stringValue(rootStep == null ? null : rootStep.get("stepId"))
+                + " before treating downstream skipped steps as independent failures.";
+            case "NONE" -> "No failure follow-up is required.";
+            default -> "Review deterministic failure analysis evidence.";
+        };
+    }
+
+    private String recoveryActionType(String classification) {
+        return switch (classification) {
+            case "VARIABLE_EXTRACTION_FAILURE" -> "FIX_EXTRACT_RULE";
+            case "VARIABLE_RESOLUTION_FAILURE" -> "FIX_VARIABLE_REFERENCE";
+            case "PREREQUISITE_STEP_FAILURE", "DOWNSTREAM_API_FAILURE" -> "WAIT_FOR_SERVICE_OR_DATA_FIX";
+            case "NONE" -> "NO_ACTION";
+            default -> "WAIT_FOR_HUMAN";
+        };
+    }
+
+    private List<String> failureEvidence(
+        Map<String, Object> executionSummary,
+        Map<String, Object> rootStep,
+        List<Map<String, Object>> affectedSteps,
+        List<Map<String, Object>> diagnostics,
+        List<Map<String, Object>> auditEvents,
+        String classification
+    ) {
+        var evidence = new ArrayList<String>();
+        evidence.add("suiteStatus=" + executionSummary.get("status"));
+        evidence.add("classification=" + classification);
+        if (rootStep != null) {
+            evidence.add("rootStep=" + rootStep.get("stepId") + " status=" + rootStep.get("status") + " statusCode=" + rootStep.get("statusCode"));
+        }
+        if (!affectedSteps.isEmpty()) {
+            evidence.add("affectedDownstreamSteps=" + affectedSteps.stream().map(step -> stringValue(step.get("stepId"))).toList());
+        }
+        diagnostics.stream()
+            .limit(3)
+            .map(diagnostic -> "runtimeDiagnostic=" + diagnostic.get("code")
+                + " stepId=" + diagnostic.get("stepId")
+                + " targetKey=" + diagnostic.get("targetKey")
+                + " expression=" + diagnostic.get("expression"))
+            .forEach(evidence::add);
+        auditEvents.stream()
+            .filter(event -> Boolean.FALSE.equals(event.get("success")) || Boolean.FALSE.equals(event.get("resolved")))
+            .limit(3)
+            .map(event -> "variableAuditEvent=" + event.get("eventType")
+                + " stepId=" + event.get("stepId")
+                + " targetKey=" + event.get("targetKey")
+                + " expression=" + event.get("expression"))
+            .forEach(evidence::add);
+        return List.copyOf(evidence);
+    }
+
+    private Map<String, Object> rootCauseSummary(
+        String classification,
+        Map<String, Object> rootStep,
+        List<Map<String, Object>> diagnostics
+    ) {
+        return orderedMap(
+            "classification", classification,
+            "stepId", rootStep == null ? null : rootStep.get("stepId"),
+            "status", rootStep == null ? null : rootStep.get("status"),
+            "statusCode", rootStep == null ? null : rootStep.get("statusCode"),
+            "diagnostics", diagnostics.stream().limit(3).toList()
+        );
+    }
+
+    private Map<String, Object> stepSummary(Map<String, Object> step) {
+        if (step == null) {
+            return Map.of();
+        }
+        return orderedMap(
+            "stepId", step.get("stepId"),
+            "order", step.get("order"),
+            "apiSpecId", step.get("apiSpecId"),
+            "status", step.get("status"),
+            "statusCode", step.get("statusCode"),
+            "message", firstPresent(step, "message", "skipReason")
+        );
+    }
+
+    private Map<String, Object> variableFailureSummary(
+        String classification,
+        List<Map<String, Object>> diagnostics,
+        List<Map<String, Object>> auditEvents
+    ) {
+        if (!classification.startsWith("VARIABLE_")) {
+            return Map.of();
+        }
+        var diagnostic = diagnostics.stream().findFirst().orElse(Map.of());
+        var event = auditEvents.stream()
+            .filter(item -> Boolean.FALSE.equals(item.get("success")) || Boolean.FALSE.equals(item.get("resolved")))
+            .findFirst()
+            .orElse(Map.of());
+        return orderedMap(
+            "classification", classification,
+            "stepId", firstPresent(diagnostic, "stepId"),
+            "expression", firstPresent(diagnostic, "expression", "referenceExpression"),
+            "location", diagnostic.get("location"),
+            "sourceType", diagnostic.get("sourceType"),
+            "sourcePath", diagnostic.get("sourcePath"),
+            "targetScope", firstPresent(diagnostic, "targetScope", "scope"),
+            "targetKey", firstPresent(diagnostic, "targetKey", "path"),
+            "failureReason", firstPresent(event, "failureReason", "code")
+        );
+    }
+
+    private String impactSummary(String classification, String rootStepId, List<String> affectedStepIds) {
+        if ("NONE".equals(classification)) {
+            return "Suite execution passed; no downstream failure impact.";
+        }
+        return "Suite root step " + rootStepId
+            + " classified as " + classification
+            + " affected downstream steps " + affectedStepIds + ".";
+    }
+
     private List<ManualSuiteAgentSectionSummary> v3StagedSections(
         ManualSuiteAgentRunRequest request,
         ManualSuiteAgentFixture fixture,
         TestCase testCase
     ) {
         return List.of(
-            new ManualSuiteAgentSectionSummary(
-                "failure-analysis",
-                "Suite failure analysis integration slot",
-                ManualSuiteAgentSectionSource.STAGED,
-                "STAGED",
-                orderedMap(
-                    "sourceMarker", "staged",
-                    "phaseNote", "Suite failure analysis slot awaits V3-5.",
-                    "rootStep", "pay-order",
-                    "affectedSteps", List.of("query-order"),
-                    "failureType", "STAGED_SUITE_FAILURE_SLOT",
-                    "evidence", List.of("fake-http happy path passed; staged failure slot kept for downstream phase replacement"),
-                    "nextSuggestion", "Replace this staged summary with V3-5 Suite Failure Analysis output."
-                )
-            ),
             new ManualSuiteAgentSectionSummary(
                 "memory-feedback",
                 "Memory feedback summary integration slot",
@@ -688,7 +955,7 @@ public class ManualSuiteAgentHarness {
         );
     }
 
-    private Map<String, Object> executeOrderSuite(Task task, TestCase testCase) {
+    private Map<String, Object> executeOrderSuite(Task task, TestCase testCase, String failureScenario) {
         var executionRequest = new HttpExecutionRequest(
             task.getTaskId(),
             List.of(testCase.getCaseId()),
@@ -749,7 +1016,7 @@ public class ManualSuiteAgentHarness {
             }
 
             var clientRequest = clientRequest(objectMap(resolvedTemplate.resolvedValue()), executionRequest);
-            var response = fakeHttpGateway.execute(stepId, clientRequest);
+            var response = fakeHttpGateway.execute(stepId, clientRequest, failureScenario);
             var httpResponse = new HttpClientResponse(
                 response.statusCode(),
                 orderedMap("Content-Type", "application/json", "X-Fixture-Gateway", "manual-suite-agent"),
@@ -782,6 +1049,9 @@ public class ManualSuiteAgentHarness {
             if (writeBackBlockingFailure) {
                 halted = true;
                 skipReason = "Required variable extraction failed for suite step " + stepId;
+            } else if (response.statusCode() >= 400) {
+                halted = true;
+                skipReason = "Skipped because prerequisite step failed: " + stepId;
             }
         }
         var passed = countStatus(stepResults, "PASSED");
@@ -793,6 +1063,7 @@ public class ManualSuiteAgentHarness {
             "runtime", "ExecutionContext",
             "runtimeSource", "V3-4 ExecutionContext runtime",
             "runtimeInput", "generated-suite-draft",
+            "failureScenario", failureScenario == null || failureScenario.isBlank() ? "none" : failureScenario,
             "draftFlowId", testCase.getDetail() == null ? null : testCase.getDetail().get("draftFlowId"),
             "environment", "fixture-local",
             "gateway", "FAKE_HTTP",

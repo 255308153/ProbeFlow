@@ -55,11 +55,13 @@ class ManualSuiteAgentHarnessIssue03Tests {
                 .containsEntry("expression", "${suite.orderId}"));
 
         var failureAnalysis = section(result, "failure-analysis");
-        assertThat(failureAnalysis.source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
+        assertThat(failureAnalysis.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(failureAnalysis.status()).isEqualTo("PASSED");
         assertThat(failureAnalysis.summary())
-            .containsEntry("sourceMarker", "staged")
-            .containsEntry("rootStep", "pay-order")
-            .containsEntry("failureType", "STAGED_SUITE_FAILURE_SLOT");
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("classification", "NONE")
+            .containsEntry("rootStep", null)
+            .containsEntry("recoveryActionType", "NO_ACTION");
 
         var memoryFeedback = section(result, "memory-feedback");
         assertThat(memoryFeedback.source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
@@ -79,7 +81,7 @@ class ManualSuiteAgentHarnessIssue03Tests {
         var json = new ObjectMapper().readTree(Files.readString(artifactPath(result, "JSON_REPORT")));
         assertSectionSource(json, "generated-suite-draft", "REAL", "real");
         assertSectionSource(json, "variable-audit", "REAL", "real");
-        assertSectionSource(json, "failure-analysis", "STAGED", "staged");
+        assertSectionSource(json, "failure-analysis", "REAL", "real");
         assertSectionSource(json, "memory-feedback", "STAGED", "staged");
         assertSectionSource(json, "evaluation-comparison", "NOT_RUN", "not-run");
 
@@ -95,7 +97,8 @@ class ManualSuiteAgentHarnessIssue03Tests {
             .contains("create-order produces suite.orderId")
             .contains("pay-order consumes ${suite.orderId}")
             .contains("query-order consumes ${suite.orderId}")
-            .contains("awaits V3-5")
+            .contains("Classification: NONE")
+            .contains("No failure follow-up is required")
             .contains("awaits V3-6");
         assertThat(markdown).doesNotContain("PENDING_RUNTIME", "awaits V3-4");
     }

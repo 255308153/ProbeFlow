@@ -100,12 +100,131 @@ class ManualSuiteAgentHarnessIssue07Tests {
             .contains("query-order consumes ${suite.orderId}");
         assertThat(jsonText).contains("create-order produces suite.orderId");
 
-        assertThat(section(result, "failure-analysis").source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
+        var failureAnalysis = section(result, "failure-analysis");
+        assertThat(failureAnalysis.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(failureAnalysis.status()).isEqualTo("PASSED");
+        assertThat(failureAnalysis.summary())
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("classification", "NONE")
+            .containsEntry("rootStep", null)
+            .containsEntry("affectedSteps", List.of())
+            .containsEntry("nextSuggestion", "No failure follow-up is required.")
+            .containsEntry("recoveryActionType", "NO_ACTION");
         assertThat(section(result, "memory-feedback").source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
         assertThat(section(result, "evaluation-comparison").source()).isEqualTo(ManualSuiteAgentSectionSource.NOT_RUN);
         assertThat(jsonText).doesNotContain("PENDING_RUNTIME");
         assertThat(markdown).doesNotContain("PENDING_RUNTIME");
+        assertThat(json.at("/sections/" + sectionIndex(json, "failure-analysis") + "/summary/suiteFailureAnalysis/classification").asText())
+            .isEqualTo("NONE");
+        assertThat(markdown)
+            .contains("failure-analysis (REAL, PASSED)")
+            .contains("Classification: NONE")
+            .contains("Root cause:")
+            .contains("No failure follow-up is required.");
 
+        assertNoSensitiveValues(jsonText);
+        assertNoSensitiveValues(markdown);
+    }
+
+    @Test
+    void failureAnalysisExplainsVariableExtractionFailureFixture() throws Exception {
+        var result = ManualSuiteAgentHarness.defaults()
+            .run(ManualSuiteAgentRunRequest.fake("order-suite-variable-extraction-failure", outputDir));
+
+        var failureAnalysis = section(result, "failure-analysis");
+        assertThat(failureAnalysis.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(failureAnalysis.status()).isEqualTo("REVIEW");
+        assertThat(failureAnalysis.summary())
+            .containsEntry("classification", "VARIABLE_EXTRACTION_FAILURE")
+            .containsEntry("rootStep", "create-order")
+            .containsEntry("riskLevel", "HIGH")
+            .containsEntry("confidence", "0.90")
+            .containsEntry("requiresHumanReview", true)
+            .containsEntry("recoveryActionType", "FIX_EXTRACT_RULE");
+        assertThat(stringList(failureAnalysis.summary().get("affectedSteps")))
+            .containsExactly("pay-order", "query-order");
+        assertThat(failureAnalysis.summary().get("nextSuggestion").toString())
+            .contains("response field path")
+            .contains("extractRule");
+        assertThat(stringList(failureAnalysis.summary().get("evidence")))
+            .anySatisfy(evidence -> assertThat(evidence).contains("runtimeDiagnostic"))
+            .anySatisfy(evidence -> assertThat(evidence).contains("variableAuditEvent"));
+        assertThat(section(result, "execution-result").summary())
+            .containsEntry("status", "BLOCKED")
+            .containsEntry("blocked", 1);
+    }
+
+    @Test
+    void failureAnalysisExplainsVariableResolutionFailureFixture() throws Exception {
+        var result = ManualSuiteAgentHarness.defaults()
+            .run(ManualSuiteAgentRunRequest.fake("order-suite-variable-resolution-failure", outputDir));
+
+        var failureAnalysis = section(result, "failure-analysis");
+        assertThat(failureAnalysis.summary())
+            .containsEntry("classification", "VARIABLE_RESOLUTION_FAILURE")
+            .containsEntry("rootStep", "pay-order")
+            .containsEntry("recoveryActionType", "FIX_VARIABLE_REFERENCE");
+        assertThat(stringList(failureAnalysis.summary().get("affectedSteps")))
+            .containsExactly("query-order");
+        assertThat(failureAnalysis.summary().get("nextSuggestion").toString())
+            .contains("missing variable")
+            .contains("variable reference");
+        assertThat(stringList(failureAnalysis.summary().get("evidence")))
+            .anySatisfy(evidence -> assertThat(evidence).contains("runtimeDiagnostic"))
+            .anySatisfy(evidence -> assertThat(evidence).contains("variableAuditEvent"));
+    }
+
+    @Test
+    void failureAnalysisExplainsPrerequisiteFailureSkippedDownstreamFixture() throws Exception {
+        var result = ManualSuiteAgentHarness.defaults()
+            .run(ManualSuiteAgentRunRequest.fake("order-suite-prerequisite-failure", outputDir));
+
+        var failureAnalysis = section(result, "failure-analysis");
+        assertThat(failureAnalysis.summary())
+            .containsEntry("classification", "PREREQUISITE_STEP_FAILURE")
+            .containsEntry("rootStep", "create-order")
+            .containsEntry("recoveryActionType", "WAIT_FOR_SERVICE_OR_DATA_FIX");
+        assertThat(stringList(failureAnalysis.summary().get("affectedSteps")))
+            .containsExactly("pay-order", "query-order");
+        assertThat(failureAnalysis.summary().get("nextSuggestion").toString())
+            .contains("prerequisite step create-order");
+        assertThat(section(result, "execution-result").summary())
+            .containsEntry("status", "FAILED")
+            .containsEntry("failed", 1)
+            .containsEntry("skipped", 2);
+    }
+
+    @Test
+    void failureAnalysisExplainsDownstreamApiFailureFixtureAndReportsConsistentArtifacts() throws Exception {
+        var result = ManualSuiteAgentHarness.defaults()
+            .run(ManualSuiteAgentRunRequest.fake("order-suite-downstream-api-failure", outputDir));
+        var failureAnalysis = section(result, "failure-analysis");
+
+        assertThat(failureAnalysis.summary())
+            .containsEntry("classification", "DOWNSTREAM_API_FAILURE")
+            .containsEntry("rootStep", "pay-order")
+            .containsEntry("recoveryActionType", "WAIT_FOR_SERVICE_OR_DATA_FIX");
+        assertThat(stringList(failureAnalysis.summary().get("affectedSteps")))
+            .containsExactly("query-order");
+        assertThat(failureAnalysis.summary().get("nextSuggestion").toString())
+            .contains("downstream API")
+            .contains("prerequisite variables");
+        assertThat(stringList(failureAnalysis.summary().get("evidence")))
+            .anySatisfy(evidence -> assertThat(evidence).contains("statusCode=503"));
+
+        var jsonText = Files.readString(artifactPath(result, "JSON_REPORT"));
+        var markdown = Files.readString(artifactPath(result, "MARKDOWN_REPORT"));
+        var json = new ObjectMapper().readTree(jsonText);
+        var failureJson = section(json, "failure-analysis");
+        assertThat(failureJson.get("source").asText()).isEqualTo("REAL");
+        assertThat(failureJson.at("/summary/classification").asText()).isEqualTo("DOWNSTREAM_API_FAILURE");
+        assertThat(failureJson.at("/summary/suiteFailureAnalysis/classification").asText()).isEqualTo("DOWNSTREAM_API_FAILURE");
+        assertThat(markdown)
+            .contains("failure-analysis (REAL, REVIEW)")
+            .contains("Classification: DOWNSTREAM_API_FAILURE")
+            .contains("Root cause:")
+            .contains("Affected steps: [query-order]")
+            .contains("Next suggestion: Inspect the downstream API response");
         assertNoSensitiveValues(jsonText);
         assertNoSensitiveValues(markdown);
     }
@@ -121,6 +240,16 @@ class ManualSuiteAgentHarnessIssue07Tests {
         for (var section : json.get("sections")) {
             if (sectionId.equals(section.get("sectionId").asText())) {
                 return section;
+            }
+        }
+        throw new IllegalArgumentException("Section not found: " + sectionId);
+    }
+
+    private int sectionIndex(JsonNode json, String sectionId) {
+        var sections = json.get("sections");
+        for (var index = 0; index < sections.size(); index++) {
+            if (sectionId.equals(sections.get(index).get("sectionId").asText())) {
+                return index;
             }
         }
         throw new IllegalArgumentException("Section not found: " + sectionId);
@@ -143,6 +272,11 @@ class ManualSuiteAgentHarnessIssue07Tests {
             .map(ManualSuiteAgentArtifactReference::path)
             .map(Path::of)
             .orElseThrow();
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> stringList(Object value) {
+        return (List<String>) value;
     }
 
     private void assertNoSensitiveValues(String text) {

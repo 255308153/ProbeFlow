@@ -155,6 +155,9 @@ public class ManualSuiteAgentReportWriter {
             if ("variable-audit".equals(section.sectionId())) {
                 appendVariableAudit(markdown, redactor.redactMap(section.summary()));
             }
+            if ("failure-analysis".equals(section.sectionId())) {
+                appendFailureAnalysis(markdown, redactor.redactMap(section.summary()));
+            }
         }
         markdown.append("\n");
 
@@ -226,6 +229,37 @@ public class ManualSuiteAgentReportWriter {
             List.of("stepId", "expression", "location", "summary"));
         appendRows(markdown, "Audit events", (List<Object>) summary.getOrDefault("auditEvents", List.of()),
             List.of("eventType", "stepId", "expression", "targetScope", "targetKey", "success", "resolved"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private void appendFailureAnalysis(StringBuilder markdown, Map<String, Object> summary) {
+        markdown.append("  - Classification: ")
+            .append(summary.get("classification"))
+            .append("\n");
+        markdown.append("  - Root step: ")
+            .append(summary.get("rootStep"))
+            .append("\n");
+        markdown.append("  - Root cause: ")
+            .append(summary.get("rootCause"))
+            .append("\n");
+        markdown.append("  - Affected steps: ")
+            .append(summary.getOrDefault("affectedSteps", List.of()))
+            .append("\n");
+        markdown.append("  - Risk/confidence: ")
+            .append(summary.get("riskLevel"))
+            .append(" / ")
+            .append(summary.get("confidence"))
+            .append("\n");
+        markdown.append("  - Next suggestion: ")
+            .append(summary.get("nextSuggestion"))
+            .append("\n");
+        appendRows(markdown, "Evidence", (List<Object>) summary.getOrDefault("evidence", List.of()), List.of());
+        var suiteFailureAnalysis = summary.get("suiteFailureAnalysis");
+        if (suiteFailureAnalysis instanceof Map<?, ?> map) {
+            var typed = (Map<String, Object>) map;
+            appendRows(markdown, "Affected downstream", (List<Object>) typed.getOrDefault("affectedDownstreamSteps", List.of()),
+                List.of("stepId", "status", "statusCode", "message"));
+        }
     }
 
     @SuppressWarnings("unchecked")
