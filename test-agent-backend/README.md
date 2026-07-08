@@ -37,6 +37,16 @@ mvn test
 
 Automated startup tests use the `test` profile with an in-memory H2 database, so they do not require locally running containers.
 
+## V4 Demo Console
+
+V4 adds a local Demo Run API and Demo Console over the existing Manual Suite Agent Harness. The default fake baseline is deterministic and does not require a real LLM key, real embedding, or real external HTTP.
+
+See [docs/v4-demo-console.md](/Users/lqc/Downloads/ProbeFlow/test-agent-backend/docs/v4-demo-console.md) for fake demo startup, real LLM configuration validation, comparison reports, Demo Console access, artifact fields, and the V4/V5 boundary. A local verification shortcut is available:
+
+```bash
+./scripts/verify-v4-demo.sh
+```
+
 ## V3-1 Manual Suite Agent Harness
 
 V3-1 提供一个后端本地演示入口，用固定 fixture、deterministic fake provider 和 fake HTTP gateway 运行 Manual Suite Agent Harness。默认不会调用真实 LLM、真实 embedding 或真实外部 HTTP。
