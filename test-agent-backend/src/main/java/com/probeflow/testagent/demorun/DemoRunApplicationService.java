@@ -22,6 +22,7 @@ public class DemoRunApplicationService {
 
     private final ManualSuiteAgentHarness harness;
     private final DemoRunRealLlmGateway realLlmGateway;
+    private final DemoRunComparisonReportWriter comparisonReportWriter = new DemoRunComparisonReportWriter();
 
     public DemoRunApplicationService() {
         this(ManualSuiteAgentHarness.defaults(), DemoRunRealLlmGateway.disabled());
@@ -45,6 +46,9 @@ public class DemoRunApplicationService {
         var effectiveRequest = request == null
             ? new DemoRunRequest(null, null, null, null)
             : request;
+        if (effectiveRequest.comparisonEnabled() || effectiveRequest.providerMode() == DemoRunProviderMode.COMPARISON) {
+            return runComparison(effectiveRequest);
+        }
         if (effectiveRequest.providerMode() == DemoRunProviderMode.REAL) {
             var realGuard = validateRealRunProfile(effectiveRequest);
             if (realGuard != null) {
@@ -102,6 +106,7 @@ public class DemoRunApplicationService {
             mappedSection(harnessResult, "failure-analysis", "failure-analysis", "Failure Analysis"),
             mappedSection(harnessResult, "memory-feedback", "memory-feedback", "Memory Feedback"),
             mappedSection(harnessResult, "evaluation-comparison", "evaluation", "Evaluation"),
+            DemoRunSectionView.notRun("comparison", "Comparison"),
             errorsSection(harnessResult),
             harnessResult.artifacts().stream().map(this::artifactView).toList(),
             harnessResult.diagnostics().stream().map(this::diagnosticView).toList()
@@ -236,10 +241,201 @@ public class DemoRunApplicationService {
             DemoRunSectionView.notRun("failure-analysis", "Failure Analysis"),
             DemoRunSectionView.notRun("memory-feedback", "Memory Feedback"),
             DemoRunSectionView.notRun("evaluation", "Evaluation"),
+            DemoRunSectionView.notRun("comparison", "Comparison"),
             errors,
             List.of(),
             List.of(diagnostic)
         );
+    }
+
+    private DemoRunResult runComparison(DemoRunRequest request) {
+        var comparisonRunId = "v4d-comparison-" + java.util.UUID.randomUUID();
+        var now = Instant.now();
+        var fakeRequest = new DemoRunRequest(
+            request.fixtureId(),
+            DemoRunProviderMode.FAKE,
+            "comparison-demo",
+            request.outputDirectory(),
+            false,
+            false,
+            request.outputFormats()
+        );
+        var realRequest = new DemoRunRequest(
+            request.fixtureId(),
+            DemoRunProviderMode.REAL,
+            "manual-real-llm",
+            request.outputDirectory(),
+            false,
+            false,
+            request.outputFormats()
+        );
+        var fakeBaseline = run(fakeRequest);
+        var realRun = run(realRequest);
+        var comparison = comparisonSection(fakeBaseline, realRun);
+        var diagnostics = mergeDiagnostics(fakeBaseline, realRun);
+        var artifacts = comparisonReportWriter.artifactReferences(
+            comparisonRunId,
+            request.outputDirectory(),
+            request.outputFormats(),
+            fakeBaseline.runId(),
+            realRun.runId()
+        );
+        var result = new DemoRunResult(
+            DemoRunResult.SCHEMA_VERSION,
+            comparisonRunId,
+            request.fixtureId(),
+            fakeBaseline.fixtureVersion(),
+            DemoRunProviderMode.COMPARISON,
+            fakeBaseline.status() == DemoRunStatus.COMPLETED ? DemoRunStatus.COMPLETED : DemoRunStatus.FAILED,
+            now,
+            Instant.now(),
+            "comparison-demo",
+            realRun.usesRealLlm(),
+            fakeBaseline.usesExternalHttp() || realRun.usesExternalHttp(),
+            new DemoRunProviderSummary(
+                DemoRunProviderMode.COMPARISON,
+                "FAKE_BASELINE_AND_MANUAL_REAL_LLM",
+                request.providerMode().name(),
+                "comparison-demo",
+                realRun.usesRealLlm(),
+                fakeBaseline.usesExternalHttp() || realRun.usesExternalHttp(),
+                true,
+                true,
+                false,
+                request.outputFormats(),
+                realRun.provider().llmCalls(),
+                List.of(
+                    "comparison mode always runs a deterministic fake baseline",
+                    "comparison mode attempts real LLM only through the existing provider seam",
+                    "comparison mode defaults allowMemoryWrite=false",
+                    "real LLM unavailable is represented as a real-run result, not a demo crash"
+                )
+            ),
+            fakeBaseline.plan(),
+            fakeBaseline.context(),
+            fakeBaseline.tools(),
+            fakeBaseline.suite(),
+            fakeBaseline.execution(),
+            fakeBaseline.variableAudit(),
+            fakeBaseline.failureAnalysis(),
+            fakeBaseline.memoryFeedback(),
+            fakeBaseline.evaluation(),
+            comparison,
+            comparisonErrorsSection(fakeBaseline, realRun),
+            mergeArtifacts(artifacts, fakeBaseline, realRun),
+            diagnostics
+        );
+        comparisonReportWriter.write(result, fakeBaseline, realRun);
+        return result;
+    }
+
+    private DemoRunSectionView comparisonSection(DemoRunResult fakeBaseline, DemoRunResult realRun) {
+        var summary = orderedMap(
+            "fakeBaseline", runComparisonSummary("fake-baseline", fakeBaseline),
+            "realRun", runComparisonSummary("real-run", realRun),
+            "memoryWriteSuppressed", true,
+            "planStepDifferences", difference("plan", fakeBaseline.plan(), realRun.plan()),
+            "toolSelectionDifferences", difference("tools", fakeBaseline.tools(), realRun.tools()),
+            "failureAnalysisDifferences", difference("failure-analysis", fakeBaseline.failureAnalysis(), realRun.failureAnalysis()),
+            "memoryFeedbackDifferences", difference("memory-feedback", fakeBaseline.memoryFeedback(), realRun.memoryFeedback()),
+            "reportSummaryDifferences", difference("evaluation", fakeBaseline.evaluation(), realRun.evaluation()),
+            "humanJudgmentNotes", List.of(
+                "Comparison shows behavioral differences and risk points; it does not rank real LLM as automatically better.",
+                "A rejected real run is still useful evidence about configuration or policy readiness.",
+                "Fake baseline remains the stable CI-safe reference."
+            )
+        );
+        return new DemoRunSectionView(
+            "comparison",
+            "Fake vs Real LLM Comparison",
+            DemoRunSectionSource.APPLICATION,
+            "READY",
+            summary
+        );
+    }
+
+    private Map<String, Object> runComparisonSummary(String role, DemoRunResult result) {
+        return orderedMap(
+            "role", role,
+            "runId", result.runId(),
+            "status", result.status().name(),
+            "providerMode", result.providerMode().name(),
+            "usesRealLlm", result.usesRealLlm(),
+            "usesExternalHttp", result.usesExternalHttp(),
+            "runProfile", result.runProfile(),
+            "diagnostics", result.diagnostics().stream()
+                .map(diagnostic -> orderedMap(
+                    "code", diagnostic.code(),
+                    "severity", diagnostic.severity(),
+                    "message", diagnostic.message()
+                ))
+                .toList()
+        );
+    }
+
+    private Map<String, Object> difference(
+        String dimension,
+        DemoRunSectionView fakeSection,
+        DemoRunSectionView realSection
+    ) {
+        return orderedMap(
+            "dimension", dimension,
+            "fakeProvider", sectionComparisonSummary(fakeSection),
+            "realProvider", sectionComparisonSummary(realSection),
+            "statusChanged", !fakeSection.status().equals(realSection.status()),
+            "sourceChanged", fakeSection.source() != realSection.source(),
+            "summaryChanged", !String.valueOf(fakeSection.summary()).equals(String.valueOf(realSection.summary()))
+        );
+    }
+
+    private Map<String, Object> sectionComparisonSummary(DemoRunSectionView section) {
+        return orderedMap(
+            "sectionId", section.sectionId(),
+            "status", section.status(),
+            "source", section.source().name(),
+            "summary", section.summary()
+        );
+    }
+
+    private DemoRunSectionView comparisonErrorsSection(DemoRunResult fakeBaseline, DemoRunResult realRun) {
+        var diagnostics = mergeDiagnostics(fakeBaseline, realRun).stream()
+            .map(diagnostic -> orderedMap(
+                "code", diagnostic.code(),
+                "category", diagnosticCategory(diagnostic.code()),
+                "severity", diagnostic.severity(),
+                "message", diagnostic.message(),
+                "metadata", diagnostic.metadata()
+            ))
+            .toList();
+        return new DemoRunSectionView(
+            "errors",
+            "Errors",
+            DemoRunSectionSource.APPLICATION,
+            diagnostics.isEmpty() ? "NONE" : "COMPARISON_WARNINGS",
+            orderedMap(
+                "hasErrors", !diagnostics.isEmpty(),
+                "diagnostics", diagnostics
+            )
+        );
+    }
+
+    private List<DemoRunArtifactReference> mergeArtifacts(
+        List<DemoRunArtifactReference> comparisonArtifacts,
+        DemoRunResult fakeBaseline,
+        DemoRunResult realRun
+    ) {
+        var artifacts = new java.util.ArrayList<DemoRunArtifactReference>();
+        artifacts.addAll(comparisonArtifacts);
+        artifacts.addAll(fakeBaseline.artifacts());
+        artifacts.addAll(realRun.artifacts());
+        return List.copyOf(artifacts);
+    }
+
+    private List<DemoRunDiagnosticView> mergeDiagnostics(DemoRunResult fakeBaseline, DemoRunResult realRun) {
+        var diagnostics = new java.util.ArrayList<DemoRunDiagnosticView>();
+        diagnostics.addAll(fakeBaseline.diagnostics());
+        diagnostics.addAll(realRun.diagnostics());
+        return List.copyOf(diagnostics);
     }
 
     private DemoRunSectionView errorsSection(ManualSuiteAgentRunResult result) {

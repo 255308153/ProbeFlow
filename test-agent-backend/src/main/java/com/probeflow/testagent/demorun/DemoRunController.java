@@ -52,7 +52,7 @@ public class DemoRunController {
                 "INVALID_PROVIDER_MODE",
                 "VALIDATION",
                 "providerMode",
-                "providerMode must be one of: FAKE, REAL.",
+                "providerMode must be one of: FAKE, REAL, COMPARISON.",
                 Map.of("requestedProviderMode", request.providerMode())
             ));
         }
@@ -98,7 +98,7 @@ public class DemoRunController {
             providerMode,
             runProfile,
             outputDirectory,
-            Boolean.TRUE.equals(request.comparison()),
+            providerMode == DemoRunProviderMode.COMPARISON || Boolean.TRUE.equals(request.comparison()),
             Boolean.TRUE.equals(request.allowMemoryWrite()),
             outputFormats
         ));

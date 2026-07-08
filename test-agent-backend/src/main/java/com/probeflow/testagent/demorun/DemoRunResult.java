@@ -25,6 +25,7 @@ public record DemoRunResult(
     DemoRunSectionView failureAnalysis,
     DemoRunSectionView memoryFeedback,
     DemoRunSectionView evaluation,
+    DemoRunSectionView comparison,
     DemoRunSectionView errors,
     List<DemoRunArtifactReference> artifacts,
     List<DemoRunDiagnosticView> diagnostics
@@ -34,6 +35,7 @@ public record DemoRunResult(
 
     public DemoRunResult {
         schemaVersion = schemaVersion == null || schemaVersion.isBlank() ? SCHEMA_VERSION : schemaVersion;
+        comparison = comparison == null ? DemoRunSectionView.notRun("comparison", "Comparison") : comparison;
         artifacts = artifacts == null ? List.of() : List.copyOf(artifacts);
         diagnostics = diagnostics == null ? List.of() : List.copyOf(diagnostics);
     }
