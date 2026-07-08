@@ -121,7 +121,10 @@ class V2Phase7AcceptanceBoundaryGuardTests {
     void realLlmIsNotCiDependencyAndLlmCannotDirectlyWriteLongTermMemory() throws Exception {
         var testConfig = Files.readString(PROJECT_ROOT.resolve("src/test/resources/application-test.yml"));
         var llmSources = sourceText(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/llm"));
-        var phase7Sources = phase7SourceText();
+        var phase7Sources = phase7SourceTextWithoutOptionalLlmFactExtractor();
+        var optionalFactExtractor = Files.readString(PROJECT_ROOT.resolve(
+            "src/main/java/com/probeflow/testagent/memory/LlmAssistedMemoryFactExtractor.java"
+        ));
         var memoryFeedbackService = Files.readString(PROJECT_ROOT.resolve(
             "src/main/java/com/probeflow/testagent/agentmemoryfeedback/AgentMemoryFeedbackApplicationService.java"
         ));
@@ -137,6 +140,13 @@ class V2Phase7AcceptanceBoundaryGuardTests {
             .doesNotContain("LlmApplicationService")
             .doesNotContain("LlmCallRequest")
             .doesNotContain("LlmProvider");
+        assertThat(optionalFactExtractor)
+            .contains("ConditionalOnProperty")
+            .contains("havingValue = \"llm-assisted\"")
+            .contains("LlmApplicationService")
+            .doesNotContain("LongTermMemoryRepository")
+            .doesNotContain("MemoryRefineryService")
+            .doesNotContain("new LongTermMemory");
         assertThat(memoryFeedbackService)
             .contains("MemoryRefineryService")
             .contains("memoryRefinery.refine")
@@ -261,6 +271,12 @@ class V2Phase7AcceptanceBoundaryGuardTests {
         return sourceText(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/agentmemoryfeedback"))
             + "\n"
             + sourceText(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/memory"));
+    }
+
+    private String phase7SourceTextWithoutOptionalLlmFactExtractor() throws Exception {
+        return phase7SourceText().replace(Files.readString(PROJECT_ROOT.resolve(
+            "src/main/java/com/probeflow/testagent/memory/LlmAssistedMemoryFactExtractor.java"
+        )), "");
     }
 
     private String mainSourceText() throws Exception {

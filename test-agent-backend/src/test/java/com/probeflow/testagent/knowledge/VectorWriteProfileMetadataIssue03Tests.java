@@ -117,7 +117,10 @@ class VectorWriteProfileMetadataIssue03Tests {
         assertProfile(first.memory().metadata(), "memory-profile-a", "bge-a");
         assertProfile(second.memory().metadata(), "memory-profile-b", "bge-b");
         assertThat(embeddingService.documentInputs().getLast())
-            .isEqualTo(second.memory().summary() + "\n" + second.memory().content())
+            .contains(second.memory().summary())
+            .contains(second.memory().content())
+            .contains(second.memory().fullContent())
+            .contains("Execution showed GW_TIMEOUT on POST /api/orders/{orderId}/pay.")
             .isNotEqualTo(firstDocumentInput);
     }
 
