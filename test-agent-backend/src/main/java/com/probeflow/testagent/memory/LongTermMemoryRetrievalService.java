@@ -2,6 +2,7 @@ package com.probeflow.testagent.memory;
 
 import com.probeflow.testagent.knowledge.EmbeddingService;
 import com.probeflow.testagent.knowledge.EmbeddingProfileMetadata;
+import com.probeflow.testagent.knowledge.EmbeddingValidation;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -36,22 +37,30 @@ public class LongTermMemoryRetrievalService {
     public LongTermMemoryRetrievalResult retrieve(LongTermMemoryQuery query) {
         validate(query);
         var normalized = normalize(query);
+        var queryEmbedding = embeddingService.embedQuery(normalized.rawQuery());
+        validateEmbedding(queryEmbedding);
+        var candidateLimit = Math.max(normalized.limit() * 4, 24);
 
-        var activeCandidates = longTermMemories.findAllByStatusOrderByCreatedAtAscMemoryIdAsc(MemoryStatus.ACTIVE)
-            .stream()
-            .filter(memory -> matchesScope(memory, normalized.scopeTypes()))
-            .filter(memory -> matchesStructure(memory, normalized))
-            .toList();
-        if (activeCandidates.isEmpty()) {
+        var candidates = longTermMemories.findPgvectorCandidates(
+            normalized.scopeTypes(),
+            normalized.systemName(),
+            normalized.moduleName(),
+            normalized.apiPath(),
+            normalized.errorCode(),
+            normalized.tags(),
+            normalized.stageProfile(),
+            queryEmbedding,
+            candidateLimit
+        );
+        if (candidates.isEmpty()) {
             return new LongTermMemoryRetrievalResult(List.of(), 0, 0);
         }
 
-        var queryEmbedding = embeddingService.embedQuery(normalized.rawQuery());
-        var newest = activeCandidates.stream().mapToLong(memory -> memory.getUpdatedAt().toEpochMilli()).max().orElse(0L);
-        var oldest = activeCandidates.stream().mapToLong(memory -> memory.getUpdatedAt().toEpochMilli()).min().orElse(newest);
+        var newest = candidates.stream().mapToLong(candidate -> candidate.memory().getUpdatedAt().toEpochMilli()).max().orElse(0L);
+        var oldest = candidates.stream().mapToLong(candidate -> candidate.memory().getUpdatedAt().toEpochMilli()).min().orElse(newest);
 
-        var ranked = activeCandidates.stream()
-            .map(memory -> score(memory, normalized, queryEmbedding, newest, oldest))
+        var ranked = candidates.stream()
+            .map(candidate -> score(candidate, normalized, newest, oldest))
             .sorted(Comparator
                 .comparingDouble(LongTermMemoryRetrievalHit::score).reversed()
                 .thenComparing(LongTermMemoryRetrievalHit::summary)
@@ -68,17 +77,22 @@ public class LongTermMemoryRetrievalService {
     }
 
     private LongTermMemoryRetrievalHit score(
-        LongTermMemory memory,
+        LongTermMemoryVectorCandidate candidate,
         LongTermMemoryQuery query,
-        float[] queryEmbedding,
         long newest,
         long oldest
     ) {
+        var memory = candidate.memory();
         var structure = structureScore(memory, query);
         var tag = tagScore(memory, query);
-        var metadata = EmbeddingProfileMetadata.withReindexStatus(memory.getMetadata(), embeddingService.profile());
+        var metadata = new LinkedHashMap<>(
+            EmbeddingProfileMetadata.withReindexStatus(memory.getMetadata(), embeddingService.profile())
+        );
+        metadata.put("retrievalChannel", "pgvector");
+        metadata.put("vectorDistance", candidate.vectorDistance());
+        metadata.put("candidateRank", candidate.candidateRank());
         var profileCompatible = EmbeddingProfileMetadata.isCompatible(metadata, embeddingService.profile());
-        var vector = profileCompatible ? semanticScore(memory, query, queryEmbedding) : 0.0d;
+        var vector = profileCompatible ? semanticScore(memory, query, candidate.vectorDistance()) : 0.0d;
         var importance = memory.getImportance();
         var confidence = memory.getConfidence();
         var success = memory.getSuccessContribution();
@@ -108,7 +122,7 @@ public class LongTermMemoryRetrievalService {
             memory.getSuccessContribution(),
             memory.getHitCount(),
             memory.getLastUsedAt(),
-            metadata,
+            Map.copyOf(metadata),
             estimateTokens(memory),
             score,
             weighted,
@@ -168,25 +182,6 @@ public class LongTermMemoryRetrievalService {
         return selected;
     }
 
-    private boolean matchesScope(LongTermMemory memory, List<MemoryScopeType> scopeTypes) {
-        return scopeTypes.isEmpty() || scopeTypes.contains(memory.getScopeType());
-    }
-
-    private boolean matchesStructure(LongTermMemory memory, LongTermMemoryQuery query) {
-        return matchesMetadata(memory, "systemName", query.systemName())
-            && matchesMetadata(memory, "module", query.moduleName())
-            && matchesMetadata(memory, "apiPath", query.apiPath())
-            && matchesMetadata(memory, "errorCode", query.errorCode());
-    }
-
-    private boolean matchesMetadata(LongTermMemory memory, String key, String expected) {
-        if (!StringUtils.hasText(expected)) {
-            return true;
-        }
-        var value = memory.getMetadata().get(key);
-        return value != null && expected.equalsIgnoreCase(value.toString().trim());
-    }
-
     private double structureScore(LongTermMemory memory, LongTermMemoryQuery query) {
         double score = 0.0d;
         score += scoreMetadata(memory, "systemName", query.systemName(), 0.25d);
@@ -218,8 +213,8 @@ public class LongTermMemoryRetrievalService {
         return matches / (double) query.tags().size();
     }
 
-    private double semanticScore(LongTermMemory memory, LongTermMemoryQuery query, float[] queryEmbedding) {
-        var embeddingSimilarity = Math.max(0.0d, cosineSimilarity(queryEmbedding, memory.getEmbedding()));
+    private double semanticScore(LongTermMemory memory, LongTermMemoryQuery query, double vectorDistance) {
+        var embeddingSimilarity = Math.max(0.0d, 1.0d - vectorDistance);
         var lexicalSimilarity = Math.max(
             tokenSimilarity(query.rawQuery(), memory.getSummary()),
             tokenSimilarity(query.rawQuery(), memory.getContent())
@@ -260,7 +255,7 @@ public class LongTermMemoryRetrievalService {
         weighted.put("vector", vector * weights.get("vector"));
         weighted.put("importance", importance * weights.get("importance"));
         weighted.put("confidence", confidence * weights.get("confidence"));
-        weighted.put("success", success * weights.get("success"));
+        weighted.put("successContribution", success * weights.get("success"));
         weighted.put("hitCount", hitCount * weights.get("hitCount"));
         weighted.put("freshness", freshness * weights.get("freshness"));
         weighted.put("stageFit", stageFit * weights.get("stageFit"));
@@ -294,21 +289,6 @@ public class LongTermMemoryRetrievalService {
             return 1.0d;
         }
         return (memory.getUpdatedAt().toEpochMilli() - oldest) / (double) (newest - oldest);
-    }
-
-    private double cosineSimilarity(float[] left, float[] right) {
-        var dot = 0.0d;
-        var leftNorm = 0.0d;
-        var rightNorm = 0.0d;
-        for (var index = 0; index < Math.min(left.length, right.length); index++) {
-            dot += left[index] * right[index];
-            leftNorm += left[index] * left[index];
-            rightNorm += right[index] * right[index];
-        }
-        if (leftNorm == 0.0d || rightNorm == 0.0d) {
-            return 0.0d;
-        }
-        return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
     }
 
     private double tokenSimilarity(String left, String right) {
@@ -364,6 +344,15 @@ public class LongTermMemoryRetrievalService {
         if (query.tokenBudget() != null && query.tokenBudget() <= 0) {
             throw new IllegalArgumentException("tokenBudget must be positive");
         }
+    }
+
+    private void validateEmbedding(float[] embedding) {
+        EmbeddingValidation.requireVector(
+            "query",
+            embeddingService.profile(),
+            embedding,
+            embeddingService.dimensions()
+        );
     }
 
     private LongTermMemoryQuery normalize(LongTermMemoryQuery query) {

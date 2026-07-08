@@ -396,7 +396,9 @@ public class MemoryReuseClosedLoopEvaluator implements AgentEvaluationEvaluator 
             scenario.moduleName(),
             scenario.apiPath(),
             scenario.errorCode(),
-            List.of("phase8", "memory-reuse", "payment", "auth", "tenant", scenario.errorCode()),
+            scenario.suiteMemoryReuse()
+                ? List.of("v3", "suite", "memory-reuse", "closed-loop", "payment", "auth", "tenant", scenario.errorCode())
+                : List.of("phase8", "memory-reuse", "payment", "auth", "tenant", scenario.errorCode()),
             500,
             MemoryUsageConsumer.AGENT_EVALUATION,
             usageSourceRef
