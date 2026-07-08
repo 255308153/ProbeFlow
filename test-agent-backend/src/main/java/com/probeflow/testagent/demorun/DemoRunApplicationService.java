@@ -52,12 +52,19 @@ public class DemoRunApplicationService {
         if (effectiveRequest.providerMode() == DemoRunProviderMode.REAL) {
             var realGuard = validateRealRunProfile(effectiveRequest);
             if (realGuard != null) {
-                return rejectedRealResult(effectiveRequest, realGuard, List.of(), Map.of("category", "CONFIGURATION"));
+                return rejectedRealResult(
+                    effectiveRequest,
+                    "REAL_LLM_NOT_AVAILABLE",
+                    realGuard,
+                    List.of(),
+                    Map.of("category", "CONFIGURATION")
+                );
             }
             var probe = realLlmGateway.probe(effectiveRequest, realProbeInput(effectiveRequest));
             if (probe.status() != DemoRunRealLlmProbeStatus.SUCCESS) {
                 return rejectedRealResult(
                     effectiveRequest,
+                    realRejectionCode(probe),
                     probe.message(),
                     probe.callSummaries(),
                     probe.metadata()
@@ -104,7 +111,7 @@ public class DemoRunApplicationService {
             mappedSection(harnessResult, "execution-result", "execution", "Execution"),
             mappedSection(harnessResult, "variable-audit", "variable-audit", "Variable Audit"),
             mappedSection(harnessResult, "failure-analysis", "failure-analysis", "Failure Analysis"),
-            mappedSection(harnessResult, "memory-feedback", "memory-feedback", "Memory Feedback"),
+            memoryFeedbackSection(effectiveRequest, harnessResult, providerMode),
             mappedSection(harnessResult, "evaluation-comparison", "evaluation", "Evaluation"),
             DemoRunSectionView.notRun("comparison", "Comparison"),
             errorsSection(harnessResult),
@@ -145,7 +152,7 @@ public class DemoRunApplicationService {
             request.comparisonEnabled(),
             request.allowMemoryWrite(),
             request.outputFormats(),
-            llmCalls,
+            DemoRunRedactor.sanitizeLlmCalls(llmCalls),
             List.of(
                 "default demo run uses deterministic fake provider",
                 "default demo run does not require a real LLM key",
@@ -174,16 +181,17 @@ public class DemoRunApplicationService {
 
     private DemoRunResult rejectedRealResult(
         DemoRunRequest request,
+        String diagnosticCode,
         String message,
         List<DemoRunLlmCallSummary> llmCalls,
         Map<String, Object> metadata
     ) {
         var now = Instant.now();
         var diagnostic = new DemoRunDiagnosticView(
-            "REAL_LLM_NOT_AVAILABLE",
+            diagnosticCode,
             "ERROR",
-            message,
-            sanitizedMap(metadata)
+            DemoRunRedactor.sanitizeText(message),
+            DemoRunRedactor.sanitizeMap(metadata)
         );
         var errors = new DemoRunSectionView(
             "errors",
@@ -196,7 +204,7 @@ public class DemoRunApplicationService {
                     "code", diagnostic.code(),
                     "category", diagnosticCategory(diagnostic.code()),
                     "severity", diagnostic.severity(),
-                    "message", diagnostic.message(),
+                    "message", DemoRunRedactor.sanitizeText(diagnostic.message()),
                     "metadata", diagnostic.metadata()
                 ))
             )
@@ -224,7 +232,7 @@ public class DemoRunApplicationService {
                 request.comparisonEnabled(),
                 request.allowMemoryWrite(),
                 request.outputFormats(),
-                llmCalls,
+                DemoRunRedactor.sanitizeLlmCalls(llmCalls),
                 List.of(
                     "real LLM mode requires explicit providerMode=REAL",
                     "real LLM mode requires runProfile=manual-real-llm",
@@ -246,6 +254,14 @@ public class DemoRunApplicationService {
             List.of(),
             List.of(diagnostic)
         );
+    }
+
+    private String realRejectionCode(DemoRunRealLlmProbeResult probe) {
+        var policyBlocked = probe.callSummaries().stream()
+            .anyMatch(call -> "POLICY_BLOCKED".equals(call.errorType()));
+        return probe.status() == DemoRunRealLlmProbeStatus.BLOCKED && policyBlocked
+            ? "REAL_LLM_POLICY_BLOCKED"
+            : "REAL_LLM_NOT_AVAILABLE";
     }
 
     private DemoRunResult runComparison(DemoRunRequest request) {
@@ -367,7 +383,7 @@ public class DemoRunApplicationService {
                 .map(diagnostic -> orderedMap(
                     "code", diagnostic.code(),
                     "severity", diagnostic.severity(),
-                    "message", diagnostic.message()
+                    "message", DemoRunRedactor.sanitizeText(diagnostic.message())
                 ))
                 .toList()
         );
@@ -393,7 +409,7 @@ public class DemoRunApplicationService {
             "sectionId", section.sectionId(),
             "status", section.status(),
             "source", section.source().name(),
-            "summary", section.summary()
+            "summary", DemoRunRedactor.sanitize(section.summary())
         );
     }
 
@@ -403,7 +419,7 @@ public class DemoRunApplicationService {
                 "code", diagnostic.code(),
                 "category", diagnosticCategory(diagnostic.code()),
                 "severity", diagnostic.severity(),
-                "message", diagnostic.message(),
+                "message", DemoRunRedactor.sanitizeText(diagnostic.message()),
                 "metadata", diagnostic.metadata()
             ))
             .toList();
@@ -444,8 +460,8 @@ public class DemoRunApplicationService {
                 "code", diagnostic.code(),
                 "category", diagnosticCategory(diagnostic.code()),
                 "severity", diagnostic.severity(),
-                "message", diagnostic.message(),
-                "metadata", sanitized(diagnostic.metadata())
+                "message", DemoRunRedactor.sanitizeText(diagnostic.message()),
+                "metadata", DemoRunRedactor.sanitize(diagnostic.metadata())
             ))
             .toList();
         return new DemoRunSectionView(
@@ -485,7 +501,7 @@ public class DemoRunApplicationService {
             "providerMode", result.providerMode().name(),
             "fixtureId", result.fixtureId(),
             "runProfile", result.runProfile(),
-            "businessFlowDiscovery", discovery == null ? Map.of() : sanitized(discovery.summary())
+            "businessFlowDiscovery", discovery == null ? Map.of() : DemoRunRedactor.sanitize(discovery.summary())
         );
         return new DemoRunSectionView("plan", "Plan", DemoRunSectionSource.APPLICATION, status(summary), summary);
     }
@@ -553,7 +569,7 @@ public class DemoRunApplicationService {
             "contextType", contextType,
             "sourceSectionId", section == null ? null : section.sectionId(),
             "status", section == null ? "NOT_RUN" : section.status(),
-            "summary", section == null ? Map.of() : sanitized(section.summary())
+            "summary", section == null ? Map.of() : DemoRunRedactor.sanitize(section.summary())
         );
     }
 
@@ -569,6 +585,55 @@ public class DemoRunApplicationService {
             "status", section == null ? "NOT_RUN" : section.status(),
             "source", section == null ? DemoRunSectionSource.NOT_RUN.name() : toDemoSource(section.source()).name(),
             "usesExternalHttp", result.usesExternalHttp()
+        );
+    }
+
+    private DemoRunSectionView memoryFeedbackSection(
+        DemoRunRequest request,
+        ManualSuiteAgentRunResult result,
+        DemoRunProviderMode providerMode
+    ) {
+        var section = section(result, "memory-feedback");
+        if (section == null) {
+            return DemoRunSectionView.notRun("memory-feedback", "Memory Feedback");
+        }
+        var summary = orderedMap(
+            "sourceSectionId", section.sectionId(),
+            "sourceTitle", section.title(),
+            "summary", DemoRunRedactor.sanitize(section.summary()),
+            "memoryWrite", memoryWriteSafety(request, result, providerMode, section)
+        );
+        return new DemoRunSectionView(
+            "memory-feedback",
+            "Memory Feedback",
+            toDemoSource(section.source()),
+            section.status(),
+            summary
+        );
+    }
+
+    private Map<String, Object> memoryWriteSafety(
+        DemoRunRequest request,
+        ManualSuiteAgentRunResult result,
+        DemoRunProviderMode providerMode,
+        ManualSuiteAgentSectionSummary section
+    ) {
+        var explicitlyAllowed = request.allowMemoryWrite()
+            && providerMode == DemoRunProviderMode.REAL
+            && "manual-real-llm".equals(request.runProfile());
+        return orderedMap(
+            "requested", request.allowMemoryWrite(),
+            "enabled", explicitlyAllowed,
+            "actualWritePerformed", false,
+            "comparisonMode", request.comparisonEnabled() || request.providerMode() == DemoRunProviderMode.COMPARISON,
+            "providerMode", providerMode.name(),
+            "runProfile", result.runProfile(),
+            "decision", explicitlyAllowed ? "EXPLICITLY_ALLOWED_BUT_DEMO_HARNESS_DOES_NOT_PERSIST" : "DISABLED_BY_DEFAULT",
+            "sourceEvidence", List.of(orderedMap(
+                "sourceSectionId", section.sectionId(),
+                "redacted", true,
+                "summary", DemoRunRedactor.sanitize(section.summary())
+            ))
         );
     }
 
@@ -590,7 +655,7 @@ public class DemoRunApplicationService {
             orderedMap(
                 "sourceSectionId", section.sectionId(),
                 "sourceTitle", section.title(),
-                "summary", sanitized(section.summary())
+                "summary", DemoRunRedactor.sanitize(section.summary())
             )
         );
     }
@@ -635,7 +700,7 @@ public class DemoRunApplicationService {
             artifact.artifactType(),
             artifact.path(),
             artifact.mediaType(),
-            sanitizedMap(artifact.metadata())
+            DemoRunRedactor.sanitizeMap(artifact.metadata())
         );
     }
 
@@ -643,54 +708,9 @@ public class DemoRunApplicationService {
         return new DemoRunDiagnosticView(
             diagnostic.code(),
             diagnostic.severity(),
-            diagnostic.message(),
-            sanitizedMap(diagnostic.metadata())
+            DemoRunRedactor.sanitizeText(diagnostic.message()),
+            DemoRunRedactor.sanitizeMap(diagnostic.metadata())
         );
-    }
-
-    private Object sanitized(Object value) {
-        if (value instanceof Map<?, ?> map) {
-            var sanitized = new LinkedHashMap<String, Object>();
-            map.forEach((key, child) -> {
-                var keyText = String.valueOf(key);
-                sanitized.put(keyText, sensitiveKey(keyText) ? "[REDACTED]" : sanitized(child));
-            });
-            return sanitized;
-        }
-        if (value instanceof Iterable<?> values) {
-            var sanitized = new java.util.ArrayList<Object>();
-            values.forEach(child -> sanitized.add(sanitized(child)));
-            return sanitized;
-        }
-        if (value instanceof String text && sensitiveValue(text)) {
-            return "[REDACTED]";
-        }
-        return value;
-    }
-
-    @SuppressWarnings("unchecked")
-    private Map<String, Object> sanitizedMap(Map<String, Object> map) {
-        return (Map<String, Object>) sanitized(map == null ? Map.of() : map);
-    }
-
-    private boolean sensitiveKey(String key) {
-        var normalized = key.toLowerCase();
-        return normalized.contains("authorization")
-            || normalized.contains("token")
-            || normalized.contains("secret")
-            || normalized.contains("apikey")
-            || normalized.contains("api_key")
-            || normalized.contains("modelkey");
-    }
-
-    private boolean sensitiveValue(String value) {
-        var normalized = value.toLowerCase();
-        return normalized.contains("unredacted-fixture-secret")
-            || normalized.contains("authorization: bearer")
-            || normalized.contains("api_key=")
-            || normalized.contains("apikey=")
-            || normalized.startsWith("sk-")
-            || normalized.contains(" sk-");
     }
 
     private String status(Map<String, Object> summary) {
