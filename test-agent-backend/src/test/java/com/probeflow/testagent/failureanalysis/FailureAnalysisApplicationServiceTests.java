@@ -965,6 +965,122 @@ class FailureAnalysisApplicationServiceTests {
     }
 
     @Test
+    void analysisPreparesPolicyGatedReplanningAndHumanHandoffsWithoutApplyingRecovery() {
+        var record = executionRecords.save(newExecutionRecord(
+            OverallStatus.BLOCKED,
+            Map.of("suite", true, "stepCount", 3),
+            suiteResponse(
+                List.of(
+                    suiteStep("pay-order", 1, "api-pay", "BLOCKED", "Variable resolution failed before producer ran", null),
+                    suiteStep("create-order", 2, "api-create", "PASSED", null, 201),
+                    suiteStep("query-order", 3, "api-query", "SKIPPED", "Skipped because prerequisite step failed: pay-order", null)
+                ),
+                List.of(mapOf(
+                    "code", "VARIABLE_PRODUCER_AFTER_CONSUMER",
+                    "message", "Consumer used authorization=Bearer raw-order-token before producer",
+                    "producerStepId", "create-order",
+                    "producerOrder", 2,
+                    "consumerStepId", "pay-order",
+                    "consumerOrder", 1,
+                    "scope", "suite",
+                    "path", "orderId",
+                    "expression", "${suite.orderId}"
+                )),
+                List.of(
+                    mapOf(
+                        "eventType", "CONSUMPTION",
+                        "stepId", "pay-order",
+                        "location", "request.path",
+                        "expression", "${suite.orderId}",
+                        "scope", "suite",
+                        "path", "orderId",
+                        "resolved", false,
+                        "failureReason", "PATH_MISSING"
+                    ),
+                    mapOf(
+                        "eventType", "PRODUCTION",
+                        "stepId", "create-order",
+                        "sourceType", "BODY_JSON",
+                        "sourcePath", "$.orderId",
+                        "targetScope", "suite",
+                        "targetKey", "orderId",
+                        "success", true
+                    )
+                )
+            ),
+            List.of()
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
+
+        assertThat(result.classification()).isEqualTo(FailureClassification.DEPENDENCY_ORDER_FAILURE);
+        assertThat(result.requiresHumanReview()).isTrue();
+        assertThat(result.recoveryActionType()).isEqualTo(RecoveryActionType.REORDER_STEPS);
+        assertThat(result.replanningHandoff())
+            .satisfies(handoff -> {
+                assertThat(handoff.available()).isTrue();
+                assertThat(handoff.triggerHint().name()).isEqualTo("FAILURE_ANALYSIS_HIGH_RISK");
+                assertThat(handoff.sourceStepId()).isEqualTo("pay-order");
+                assertThat(handoff.rootCauseClassification()).isEqualTo(FailureClassification.DEPENDENCY_ORDER_FAILURE);
+                assertThat(handoff.affectedDownstreamStepIds()).containsExactly("query-order");
+                assertThat(handoff.recoveryActionType()).isEqualTo(RecoveryActionType.REORDER_STEPS);
+                assertThat(handoff.nextSuggestion()).isEqualTo(result.nextSuggestion());
+                assertThat(handoff.contextSummary()).contains("sourceStepId pay-order", "affectedDownstreamSteps [query-order]");
+                assertThat(handoff.constraints()).anySatisfy(item -> assertThat(item).contains("must not mutate PlanStep or TestCase"));
+                assertThat(handoff.policyNotes()).anySatisfy(item -> assertThat(item).contains("PolicyValidator"));
+                assertThat(handoff.policyNotes()).anySatisfy(item -> assertThat(item).contains("HumanInTheLoopApplicationService"));
+            });
+        assertThat(result.humanHandoff())
+            .satisfies(handoff -> {
+                assertThat(handoff.required()).isTrue();
+                assertThat(handoff.requestType().name()).isEqualTo("BLOCKER_RESOLUTION");
+                assertThat(handoff.riskLevel()).isEqualTo("HIGH");
+                assertThat(handoff.suggestedAction()).isEqualTo(result.nextSuggestion());
+                assertThat(handoff.requiredInputFields()).singleElement()
+                    .satisfies(field -> assertThat(field)
+                        .containsEntry("name", "stepOrderConfirmation")
+                        .containsEntry("required", true));
+                assertThat(handoff.reason()).contains("dependency order");
+                assertThat(handoff.evidence()).isNotEmpty();
+            });
+        assertThat(String.join("\n", result.replanningHandoff().contextSummary(), String.join("\n", result.humanHandoff().evidence())))
+            .doesNotContain("raw-order-token");
+    }
+
+    @Test
+    void lowConfidenceFailureAnalysisRequiresPlannerClarificationHandoff() {
+        var record = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("method", "POST", "path", "/api/orders"),
+            Map.of("message", "ambiguous failure with secret=raw-low-confidence-secret"),
+            List.of()
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
+
+        assertThat(result.classification()).isEqualTo(FailureClassification.UNKNOWN);
+        assertThat(result.confidence()).isLessThan(0.65d);
+        assertThat(result.requiresHumanReview()).isTrue();
+        assertThat(result.recoveryActionType()).isEqualTo(RecoveryActionType.WAIT_FOR_HUMAN);
+        assertThat(result.replanningHandoff().triggerHint().name()).isEqualTo("HUMAN_INPUT_REQUIRED");
+        assertThat(result.humanHandoff())
+            .satisfies(handoff -> {
+                assertThat(handoff.required()).isTrue();
+                assertThat(handoff.requestType().name()).isEqualTo("PLANNER_CLARIFICATION");
+                assertThat(handoff.requiredInputFields()).singleElement()
+                    .satisfies(field -> assertThat(field).containsEntry("name", "reviewerDecision"));
+                assertThat(handoff.reason()).contains("confidence is low");
+            });
+        assertThat(String.join("\n", result.evidence()))
+            .contains("[REDACTED]")
+            .doesNotContain("raw-low-confidence-secret");
+    }
+
+    @Test
     void taskAnalysisAggregatesDeduplicatesOrdersAndFlagsMissingLinkedRecords() {
         var api = apiSpecs.save(newApiSpec("/api/orders"));
         var caseOne = testCases.save(newTestCase("case-one", api.getApiSpecId()));

@@ -28,6 +28,8 @@ public record FailureAnalysisResult(
     boolean requiresHumanReview,
     String impactSummary,
     RecoveryActionType recoveryActionType,
+    FailureAnalysisReplanningHandoff replanningHandoff,
+    FailureAnalysisHumanHandoff humanHandoff,
     boolean retryable,
     String retryReason,
     List<String> taskMemoryIds,

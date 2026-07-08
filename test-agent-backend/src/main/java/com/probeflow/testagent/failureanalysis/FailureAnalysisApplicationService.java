@@ -8,6 +8,7 @@ import com.probeflow.testagent.apispec.ApiSpecRepository;
 import com.probeflow.testagent.executionrecord.ExecutionRecord;
 import com.probeflow.testagent.executionrecord.ExecutionRecordRepository;
 import com.probeflow.testagent.executionrecord.OverallStatus;
+import com.probeflow.testagent.humanintheloop.HumanRequestType;
 import com.probeflow.testagent.memory.MemoryScopeType;
 import com.probeflow.testagent.memory.MemoryCandidateRequest;
 import com.probeflow.testagent.memory.MemorySourceType;
@@ -19,6 +20,7 @@ import com.probeflow.testagent.observation.ObservationRepository;
 import com.probeflow.testagent.observation.ObservationRiskLevel;
 import com.probeflow.testagent.observation.ObservationSource;
 import com.probeflow.testagent.observation.ObservationType;
+import com.probeflow.testagent.replanning.ReplanningTrigger;
 import com.probeflow.testagent.task.MemoryRefinementStatus;
 import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.testcase.TestCaseRepository;
@@ -86,6 +88,25 @@ public class FailureAnalysisApplicationService {
         var requiresHumanReview = requiresHumanReview(record, classification, suiteFailureAnalysis, evidence, confidence);
         var impactSummary = redact(impactSummary(record, suiteFailure, suiteFailureAnalysis));
         var recoveryActionType = recoveryActionType(classification, requiresHumanReview, confidence);
+        var replanningHandoff = replanningHandoff(
+            record,
+            classification,
+            suiteFailureAnalysis,
+            recoveryActionType,
+            nextSuggestion,
+            riskLevel,
+            requiresHumanReview,
+            confidence
+        );
+        var humanHandoff = humanHandoff(
+            classification,
+            recoveryActionType,
+            riskLevel,
+            requiresHumanReview,
+            confidence,
+            nextSuggestion,
+            evidence
+        );
         var observationIds = writeObservationIfUseful(
             record,
             classification,
@@ -138,6 +159,8 @@ public class FailureAnalysisApplicationService {
             requiresHumanReview,
             impactSummary,
             recoveryActionType,
+            replanningHandoff,
+            humanHandoff,
             retryable,
             retryReason,
             taskMemoryIds,
@@ -1318,6 +1341,8 @@ public class FailureAnalysisApplicationService {
             result.requiresHumanReview(),
             result.impactSummary(),
             result.recoveryActionType(),
+            result.replanningHandoff(),
+            result.humanHandoff(),
             result.retryable(),
             result.retryReason(),
             result.taskMemoryIds(),
@@ -1953,11 +1978,27 @@ public class FailureAnalysisApplicationService {
         if (rootCauseCandidateCount(suiteFailureAnalysis) > 1) {
             return true;
         }
+        if (record.isCriticalFailed() || highRiskRecoveryClassification(classification)) {
+            return true;
+        }
         return classification == FailureClassification.DEPENDENCY_ORDER_FAILURE
             || classification == FailureClassification.BUSINESS_PRECONDITION_FAILURE
             || classification == FailureClassification.INVALID_EXTRACT_RULE
+            || classification == FailureClassification.UNSUPPORTED_EXTRACT_SOURCE;
+    }
+
+    private boolean highRiskRecoveryClassification(FailureClassification classification) {
+        return classification == FailureClassification.SERVER_ERROR
+            || classification == FailureClassification.PREREQUISITE_STEP_FAILURE
+            || classification == FailureClassification.SUITE_PREREQUISITE_FAILURE
+            || classification == FailureClassification.VARIABLE_RESOLUTION_FAILURE
+            || classification == FailureClassification.VARIABLE_EXTRACTION_FAILURE
+            || classification == FailureClassification.VARIABLE_WRITEBACK_FAILURE
+            || classification == FailureClassification.INVALID_EXTRACT_RULE
             || classification == FailureClassification.UNSUPPORTED_EXTRACT_SOURCE
-            || (record.isCriticalFailed() && confidence < 0.75d);
+            || classification == FailureClassification.DEPENDENCY_ORDER_FAILURE
+            || classification == FailureClassification.BUSINESS_PRECONDITION_FAILURE
+            || classification == FailureClassification.DOWNSTREAM_API_FAILURE;
     }
 
     private String impactSummary(
@@ -2000,6 +2041,215 @@ public class FailureAnalysisApplicationService {
             case NONE, SKIPPED, PASSED_WITH_WARNING -> RecoveryActionType.NOOP;
             default -> RecoveryActionType.NOOP;
         };
+    }
+
+    private FailureAnalysisReplanningHandoff replanningHandoff(
+        ExecutionRecord record,
+        FailureClassification classification,
+        SuiteFailureAnalysis suiteFailureAnalysis,
+        RecoveryActionType recoveryActionType,
+        String nextSuggestion,
+        ObservationRiskLevel riskLevel,
+        boolean requiresHumanReview,
+        double confidence
+    ) {
+        if (classification == FailureClassification.NONE || classification == FailureClassification.SKIPPED) {
+            return FailureAnalysisReplanningHandoff.unavailable("Execution does not need recovery.");
+        }
+        var sourceStepId = sourceStepId(record, suiteFailureAnalysis);
+        var affectedDownstreamStepIds = suiteFailureAnalysis.affectedDownstreamSteps().stream()
+            .map(SuiteFailureStep::stepId)
+            .filter(stepId -> stepId != null && !stepId.isBlank())
+            .toList();
+        var triggerHint = triggerHint(recoveryActionType, riskLevel, requiresHumanReview);
+        var contextSummary = redact("Failure analysis classified " + record.getExecutionId()
+            + " as " + classification
+            + " with recoveryActionType " + recoveryActionType
+            + ", confidence " + confidence
+            + ", sourceStepId " + sourceStepId
+            + ", affectedDownstreamSteps " + affectedDownstreamStepIds + ".");
+        return new FailureAnalysisReplanningHandoff(
+            recoveryActionType != RecoveryActionType.NOOP,
+            triggerHint,
+            sourceStepId,
+            classification,
+            affectedDownstreamStepIds,
+            contextSummary,
+            recoveryConstraints(recoveryActionType),
+            recoveryPolicyNotes(requiresHumanReview),
+            recoveryActionType,
+            nextSuggestion
+        );
+    }
+
+    private FailureAnalysisHumanHandoff humanHandoff(
+        FailureClassification classification,
+        RecoveryActionType recoveryActionType,
+        ObservationRiskLevel riskLevel,
+        boolean requiresHumanReview,
+        double confidence,
+        String nextSuggestion,
+        List<String> evidence
+    ) {
+        var required = requiresHumanReview
+            || recoveryActionType == RecoveryActionType.PROVIDE_INPUT
+            || recoveryActionType == RecoveryActionType.WAIT_FOR_HUMAN;
+        if (!required) {
+            return FailureAnalysisHumanHandoff.notRequired(
+                "Failure analysis produced a deterministic recovery hint that can enter policy-gated replanning.",
+                riskLevel.name()
+            );
+        }
+        var requestType = humanRequestType(classification, recoveryActionType, confidence);
+        var reason = redact(humanReason(classification, confidence));
+        return new FailureAnalysisHumanHandoff(
+            true,
+            requestType,
+            requiredInputFields(classification, recoveryActionType, confidence),
+            reason,
+            evidence.stream().limit(6).toList(),
+            nextSuggestion,
+            riskLevel.name(),
+            recoveryPolicyNotes(true)
+        );
+    }
+
+    private String sourceStepId(ExecutionRecord record, SuiteFailureAnalysis suiteFailureAnalysis) {
+        if (suiteFailureAnalysis.rootCauseStep() != null && suiteFailureAnalysis.rootCauseStep().stepId() != null) {
+            return suiteFailureAnalysis.rootCauseStep().stepId();
+        }
+        if (suiteFailureAnalysis.variableFailure() != null && suiteFailureAnalysis.variableFailure().stepId() != null) {
+            return suiteFailureAnalysis.variableFailure().stepId();
+        }
+        if (suiteFailureAnalysis.dependencyFailure() != null && suiteFailureAnalysis.dependencyFailure().consumerStepId() != null) {
+            return suiteFailureAnalysis.dependencyFailure().consumerStepId();
+        }
+        return record.getStepId();
+    }
+
+    private ReplanningTrigger triggerHint(
+        RecoveryActionType recoveryActionType,
+        ObservationRiskLevel riskLevel,
+        boolean requiresHumanReview
+    ) {
+        if (recoveryActionType == RecoveryActionType.PROVIDE_INPUT || recoveryActionType == RecoveryActionType.WAIT_FOR_HUMAN) {
+            return ReplanningTrigger.HUMAN_INPUT_REQUIRED;
+        }
+        if (requiresHumanReview || riskLevel == ObservationRiskLevel.HIGH || riskLevel == ObservationRiskLevel.CRITICAL) {
+            return ReplanningTrigger.FAILURE_ANALYSIS_HIGH_RISK;
+        }
+        return ReplanningTrigger.PLAN_STEP_FAILED;
+    }
+
+    private List<String> recoveryConstraints(RecoveryActionType recoveryActionType) {
+        var constraints = new ArrayList<String>();
+        constraints.add("Failure analysis may only prepare recovery context; it must not mutate PlanStep or TestCase snapshots.");
+        constraints.add("Apply any replanning decision through PolicyValidator before changing the plan.");
+        constraints.add("Use ManualReviewGate before promoting or applying draft changes.");
+        constraints.add("Do not rerun HTTP, rewrite extractRules, reorder steps, or submit human decisions from failure analysis.");
+        if (recoveryActionType == RecoveryActionType.FIX_EXTRACT_RULE) {
+            constraints.add("ExtractRule changes must be generated by replanning or confirmed by a human reviewer.");
+        }
+        if (recoveryActionType == RecoveryActionType.REORDER_STEPS) {
+            constraints.add("Step order changes must be planned as a controlled mutation and reviewed when high risk.");
+        }
+        return List.copyOf(constraints);
+    }
+
+    private List<String> recoveryPolicyNotes(boolean requiresHumanReview) {
+        var notes = new ArrayList<String>();
+        notes.add("PolicyValidator remains the enforcement point for recovery actions.");
+        notes.add("Human-in-the-loop requests must be created through HumanInTheLoopApplicationService.");
+        if (requiresHumanReview) {
+            notes.add("requiresHumanReview=true; recovery must wait for reviewer confirmation or policy-gated replanning.");
+        }
+        return List.copyOf(notes);
+    }
+
+    private HumanRequestType humanRequestType(
+        FailureClassification classification,
+        RecoveryActionType recoveryActionType,
+        double confidence
+    ) {
+        if (confidence < 0.65d || classification == FailureClassification.UNKNOWN) {
+            return HumanRequestType.PLANNER_CLARIFICATION;
+        }
+        if (recoveryActionType == RecoveryActionType.PROVIDE_INPUT
+            || classification == FailureClassification.AUTH_ISSUE
+            || classification == FailureClassification.ENVIRONMENT_ISSUE
+            || classification == FailureClassification.VARIABLE_RESOLUTION_FAILURE) {
+            return HumanRequestType.MISSING_INPUT;
+        }
+        if (classification == FailureClassification.BUSINESS_PRECONDITION_FAILURE
+            || variableClassification(classification)
+            || classification == FailureClassification.DEPENDENCY_ORDER_FAILURE) {
+            return HumanRequestType.BLOCKER_RESOLUTION;
+        }
+        return HumanRequestType.HIGH_RISK_APPROVAL;
+    }
+
+    private String humanReason(FailureClassification classification, double confidence) {
+        if (confidence < 0.65d || classification == FailureClassification.UNKNOWN) {
+            return "Failure analysis confidence is low; a reviewer must clarify the recovery path before replanning.";
+        }
+        return switch (classification) {
+            case AUTH_ISSUE -> "Auth variables or token freshness must be confirmed before suite recovery.";
+            case ENVIRONMENT_ISSUE -> "Environment variables, tenant, baseUrl, or protocol are missing or invalid.";
+            case VARIABLE_RESOLUTION_FAILURE -> "A required variable could not be resolved for a consumer step.";
+            case VARIABLE_EXTRACTION_FAILURE, INVALID_EXTRACT_RULE, UNSUPPORTED_EXTRACT_SOURCE ->
+                "Variable extraction or extractRule mapping needs reviewer confirmation before downstream steps can recover.";
+            case DEPENDENCY_ORDER_FAILURE -> "Suite dependency order must be confirmed before any step reorder is planned.";
+            case BUSINESS_PRECONDITION_FAILURE -> "Business preconditions or test data must be confirmed before rerunning the suite.";
+            default -> "Recovery is high risk or requires human confirmation before policy-gated execution.";
+        };
+    }
+
+    private List<Map<String, Object>> requiredInputFields(
+        FailureClassification classification,
+        RecoveryActionType recoveryActionType,
+        double confidence
+    ) {
+        if (confidence < 0.65d || classification == FailureClassification.UNKNOWN) {
+            return List.of(requiredInputField(
+                "reviewerDecision",
+                "string",
+                "Clarify the root cause and approved recovery direction."
+            ));
+        }
+        return switch (classification) {
+            case AUTH_ISSUE -> List.of(requiredInputField("authVariable", "string", "Provide or refresh the auth variable/token reference."));
+            case ENVIRONMENT_ISSUE -> List.of(requiredInputField("targetEnvironment", "string", "Provide baseUrl, tenant, or environment variable values."));
+            case VARIABLE_RESOLUTION_FAILURE -> List.of(requiredInputField("missingVariable", "string", "Provide the missing variable or corrected variable reference."));
+            case VARIABLE_EXTRACTION_FAILURE, INVALID_EXTRACT_RULE, UNSUPPORTED_EXTRACT_SOURCE -> List.of(requiredInputField(
+                "extractRuleCorrection",
+                "object",
+                "Confirm sourceType, sourcePath, targetScope, and targetKey for the extractRule."
+            ));
+            case DEPENDENCY_ORDER_FAILURE -> List.of(requiredInputField(
+                "stepOrderConfirmation",
+                "object",
+                "Confirm producer and consumer step order before replanning."
+            ));
+            case BUSINESS_PRECONDITION_FAILURE -> List.of(requiredInputField(
+                "businessPrecondition",
+                "object",
+                "Confirm required prerequisite step or seeded test data."
+            ));
+            default -> List.of(requiredInputField(
+                recoveryActionType == RecoveryActionType.WAIT_FOR_HUMAN ? "approval" : "recoveryConfirmation",
+                "boolean",
+                "Confirm whether the suggested recovery action is approved."
+            ));
+        };
+    }
+
+    private Map<String, Object> requiredInputField(String name, String type, String description) {
+        var field = new LinkedHashMap<String, Object>();
+        field.put("name", name);
+        field.put("type", type);
+        field.put("required", true);
+        field.put("description", description);
+        return field;
     }
 
     private int rootCauseCandidateCount(SuiteFailureAnalysis suiteFailureAnalysis) {
