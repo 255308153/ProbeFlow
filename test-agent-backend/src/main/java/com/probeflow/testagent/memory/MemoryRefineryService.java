@@ -32,20 +32,28 @@ public class MemoryRefineryService {
     private final LongTermMemoryRepository longTermMemories;
     private final EmbeddingService embeddingService;
     private final int embeddingDimension;
+    private final MemoryFactExtractor factExtractor;
 
     public MemoryRefineryService(LongTermMemoryRepository longTermMemories, EmbeddingService embeddingService) {
-        this(longTermMemories, embeddingService, embeddingService == null ? 1024 : embeddingService.dimensions());
+        this(
+            longTermMemories,
+            embeddingService,
+            embeddingService == null ? 1024 : embeddingService.dimensions(),
+            new DeterministicMemoryFactExtractor()
+        );
     }
 
     @Autowired
     public MemoryRefineryService(
         LongTermMemoryRepository longTermMemories,
         EmbeddingService embeddingService,
-        @Value("${probeflow.embedding.dimension:1024}") int embeddingDimension
+        @Value("${probeflow.embedding.dimension:1024}") int embeddingDimension,
+        MemoryFactExtractor factExtractor
     ) {
         this.longTermMemories = longTermMemories;
         this.embeddingService = embeddingService;
         this.embeddingDimension = embeddingDimension;
+        this.factExtractor = factExtractor == null ? new DeterministicMemoryFactExtractor() : factExtractor;
     }
 
     @Transactional
@@ -57,14 +65,15 @@ public class MemoryRefineryService {
             return new MemoryRefineryResult(false, false, false, rejectionReason, null);
         }
 
-        var scopeType = classify(normalized);
-        var summary = compactSummary(normalized);
-        var content = compactContent(normalized);
-        var fullContent = fullContent(normalized);
-        var tags = deriveTags(normalized, scopeType);
-        var metadata = buildMetadata(normalized, scopeType);
-        var confidence = normalized.confidence();
-        var importance = importanceOf(scopeType, confidence, tags, metadata);
+        var fact = factExtractor.extract(normalized);
+        var scopeType = scopeType(fact.factType());
+        var summary = fact.summary();
+        var content = fact.content();
+        var fullContent = fact.fullContent();
+        var tags = fact.tags();
+        var metadata = buildMetadata(normalized, fact, scopeType);
+        var confidence = fact.confidence();
+        var importance = fact.importance();
         var successContribution = successContributionOf(scopeType, confidence);
 
         var existing = findMergeCandidate(scopeType, summary, content, fullContent, tags, normalized, metadata);
@@ -587,16 +596,35 @@ public class MemoryRefineryService {
         return tags.stream().sorted().toList();
     }
 
-    private Map<String, Object> buildMetadata(MemoryCandidateRequest request, MemoryScopeType scopeType) {
+    private Map<String, Object> buildMetadata(MemoryCandidateRequest request, MemoryFact fact, MemoryScopeType scopeType) {
         var metadata = new TreeMap<String, Object>();
         metadata.putAll(request.metadata());
         metadata.put("refinedAt", Instant.now().toString());
         metadata.put("scopeType", scopeType.name());
+        metadata.put("factType", fact.factType().metadataValue());
+        metadata.put("factFingerprint", fact.fingerprint());
+        metadata.put("factApplicability", fact.applicability());
+        metadata.put("factTrigger", fact.trigger());
+        metadata.put("factReuseScore", fact.reuseScore());
+        metadata.put("qualityStatus", fact.qualityStatus().name());
+        metadata.put("identityHints", fact.identityHints());
         metadata.put("evidenceCount", 1);
         metadata.put("mergeCount", 1);
         metadata.put("mergedSourceTypes", List.of(request.sourceType().name()));
-        if (StringUtils.hasText(request.summary())) {
-            metadata.put("evidenceSummaries", List.of(request.summary()));
+        var evidenceSummaries = fact.evidenceEntries().stream()
+            .map(MemoryFactEvidence::summary)
+            .filter(StringUtils::hasText)
+            .distinct()
+            .toList();
+        if (!evidenceSummaries.isEmpty()) {
+            metadata.put("evidenceSummaries", evidenceSummaries);
+            metadata.put("evidenceSummary", evidenceSummaries.getFirst());
+        }
+        var evidenceLedger = fact.evidenceEntries().stream()
+            .map(this::evidenceLedgerEntry)
+            .toList();
+        if (!evidenceLedger.isEmpty()) {
+            metadata.put("evidenceLedger", evidenceLedger);
         }
         if (request.sourceRef() != null) {
             metadata.put("sourceRef", request.sourceRef());
@@ -609,6 +637,26 @@ public class MemoryRefineryService {
             metadata.put("evidenceLength", request.rawEvidence().length());
         }
         return new LinkedHashMap<>(metadata);
+    }
+
+    private Map<String, Object> evidenceLedgerEntry(MemoryFactEvidence evidence) {
+        var entry = new LinkedHashMap<String, Object>();
+        entry.put("sourceType", evidence.sourceType().name());
+        entry.put("sourceRef", evidence.sourceRef());
+        entry.put("taskId", evidence.taskId());
+        entry.put("summary", evidence.summary());
+        entry.put("sanitizedEvidence", evidence.sanitizedEvidence());
+        entry.put("attributes", evidence.attributes());
+        return compact(entry);
+    }
+
+    private MemoryScopeType scopeType(MemoryFactType factType) {
+        return switch (factType) {
+            case FAILURE_PATTERN, POLICY_LEARNING, SUITE_DEPENDENCY_FACT, VARIABLE_EXTRACTION_FACT, BUSINESS_PRECONDITION_FACT -> MemoryScopeType.FAILURE_PATTERN;
+            case TESTING_PATTERN -> MemoryScopeType.TESTING_PATTERN;
+            case PREFERENCE -> MemoryScopeType.PREFERENCE;
+            case PROJECT_KNOWLEDGE -> MemoryScopeType.PROJECT_KNOWLEDGE;
+        };
     }
 
     private String compactSummary(MemoryCandidateRequest request) {
@@ -734,6 +782,26 @@ public class MemoryRefineryService {
             return List.copyOf(normalized);
         }
         return value;
+    }
+
+    private Map<String, Object> compact(Map<String, Object> input) {
+        var compacted = new LinkedHashMap<String, Object>();
+        input.forEach((key, value) -> {
+            if (value == null) {
+                return;
+            }
+            if (value instanceof String stringValue && !StringUtils.hasText(stringValue)) {
+                return;
+            }
+            if (value instanceof Map<?, ?> mapValue && mapValue.isEmpty()) {
+                return;
+            }
+            if (value instanceof List<?> listValue && listValue.isEmpty()) {
+                return;
+            }
+            compacted.put(key, value);
+        });
+        return compacted;
     }
 
     private String collapseWhitespace(String value) {
