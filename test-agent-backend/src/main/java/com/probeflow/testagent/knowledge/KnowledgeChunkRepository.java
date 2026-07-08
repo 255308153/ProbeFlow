@@ -5,7 +5,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.repository.query.Param;
 
-public interface KnowledgeChunkRepository extends JpaRepository<KnowledgeChunk, String> {
+public interface KnowledgeChunkRepository extends JpaRepository<KnowledgeChunk, String>, KnowledgeChunkVectorRepository {
 
     List<KnowledgeChunk> findByDocumentIdAndDocumentRevisionId(String documentId, String documentRevisionId);
 

@@ -48,12 +48,21 @@ public class KnowledgeRetrievalApplicationService {
     public KnowledgeRetrievalResult retrieve(KnowledgeQuery query) {
         validate(query);
         var normalized = normalize(query);
+        var queryEmbedding = embeddingService.embedQuery(normalized.rawQuery());
+        validateEmbedding(queryEmbedding);
+        var candidateLimit = Math.max(normalized.limit() * 4, 24);
 
-        var candidates = chunks.findActiveLatestChunks(
+        var candidates = chunks.findPgvectorCandidates(
             normalized.systemName(),
             normalized.moduleName(),
             normalized.bizEntity(),
-            normalized.documentType()
+            normalized.documentType(),
+            normalized.apiPath(),
+            normalized.httpMethod(),
+            normalized.applicableStage(),
+            normalized.tags(),
+            queryEmbedding,
+            candidateLimit
         );
         if (candidates.isEmpty()) {
             return emptyResult(normalized.rawQuery());
@@ -61,18 +70,14 @@ public class KnowledgeRetrievalApplicationService {
 
         var documentsById = loadDocuments(candidates);
         var filtered = candidates.stream()
-            .filter(chunk -> matchesApiPath(chunk, normalized.apiPath()))
-            .filter(chunk -> matchesHttpMethod(chunk, normalized.httpMethod()))
-            .filter(chunk -> matchesStage(chunk, normalized.applicableStage()))
-            .filter(chunk -> matchesTags(chunk, normalized.tags()))
-            .map(chunk -> toHit(chunk, documentsById.get(chunk.getDocumentId())))
+            .map(candidate -> toHit(candidate, documentsById.get(candidate.chunk().getDocumentId())))
             .filter(Objects::nonNull)
             .toList();
         if (filtered.isEmpty()) {
             return emptyResult(normalized.rawQuery());
         }
 
-        var ranked = rankCandidates(filtered, normalized);
+        var ranked = rankCandidates(filtered, normalized, queryEmbedding);
         var deduplicated = deduplicate(ranked);
         var constrained = applyLimitAndTokenBudget(deduplicated, normalized.limit(), normalized.tokenBudget());
         var lowConfidence = constrained.isEmpty() || constrained.getFirst().lowConfidence();
@@ -141,9 +146,9 @@ public class KnowledgeRetrievalApplicationService {
         );
     }
 
-    private Map<String, KnowledgeDocument> loadDocuments(List<KnowledgeChunk> candidates) {
+    private Map<String, KnowledgeDocument> loadDocuments(List<KnowledgeVectorCandidate> candidates) {
         var documentIds = candidates.stream()
-            .map(KnowledgeChunk::getDocumentId)
+            .map(candidate -> candidate.chunk().getDocumentId())
             .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
         var documentsById = new LinkedHashMap<String, KnowledgeDocument>();
         for (var document : documents.findAllById(documentIds)) {
@@ -152,10 +157,17 @@ public class KnowledgeRetrievalApplicationService {
         return documentsById;
     }
 
-    private KnowledgeRetrievalHit toHit(KnowledgeChunk chunk, KnowledgeDocument document) {
+    private KnowledgeRetrievalHit toHit(KnowledgeVectorCandidate candidate, KnowledgeDocument document) {
         if (document == null) {
             return null;
         }
+        var chunk = candidate.chunk();
+        var metadata = new LinkedHashMap<>(
+            EmbeddingProfileMetadata.withReindexStatus(chunk.getMetadata(), embeddingService.profile())
+        );
+        metadata.put("retrievalChannel", "pgvector");
+        metadata.put("vectorDistance", candidate.vectorDistance());
+        metadata.put("candidateRank", candidate.candidateRank());
         return new KnowledgeRetrievalHit(
             chunk.getChunkId(),
             chunk.getDocumentId(),
@@ -170,7 +182,7 @@ public class KnowledgeRetrievalApplicationService {
             document.getBizEntity(),
             List.copyOf(chunk.getTags()),
             List.copyOf(chunk.getApplicableStages()),
-            EmbeddingProfileMetadata.withReindexStatus(chunk.getMetadata(), embeddingService.profile()),
+            metadata,
             chunk.getTokenCount(),
             0.0d,
             Map.of(),
@@ -179,9 +191,11 @@ public class KnowledgeRetrievalApplicationService {
         );
     }
 
-    private List<KnowledgeRetrievalHit> rankCandidates(List<KnowledgeRetrievalHit> candidates, KnowledgeQuery query) {
-        var queryEmbedding = embeddingService.embedQuery(query.rawQuery());
-        validateEmbedding(queryEmbedding);
+    private List<KnowledgeRetrievalHit> rankCandidates(
+        List<KnowledgeRetrievalHit> candidates,
+        KnowledgeQuery query,
+        float[] queryEmbedding
+    ) {
         var newestTimestamp = candidates.stream()
             .mapToLong(hit -> documents.findById(hit.documentId()).map(document -> document.getUpdatedAt().toEpochMilli()).orElse(0L))
             .max()
@@ -210,7 +224,7 @@ public class KnowledgeRetrievalApplicationService {
         var keyword = keywordEvidence(hit, query);
         var profileCompatible = EmbeddingProfileMetadata.isCompatible(hit.metadata(), embeddingService.profile());
         var vector = profileCompatible
-            ? Math.max(0.0d, cosineSimilarity(queryEmbedding, loadChunkEmbedding(hit)))
+            ? semanticScore(hit, queryEmbedding)
             : 0.0d;
         var structure = structureScore(hit, query);
         var authority = authorityScore(hit.authority());
@@ -286,30 +300,6 @@ public class KnowledgeRetrievalApplicationService {
             }
         }
         return deduplicated;
-    }
-
-    private boolean matchesApiPath(KnowledgeChunk chunk, String apiPath) {
-        if (apiPath == null) {
-            return true;
-        }
-        return metadataList(chunk, "apiPathHints").contains(apiPath);
-    }
-
-    private boolean matchesHttpMethod(KnowledgeChunk chunk, String httpMethod) {
-        if (httpMethod == null) {
-            return true;
-        }
-        return metadataList(chunk, "httpMethodHints").stream()
-            .map(value -> value.toUpperCase(Locale.ROOT))
-            .anyMatch(httpMethod::equals);
-    }
-
-    private boolean matchesStage(KnowledgeChunk chunk, String applicableStage) {
-        return applicableStage == null || chunk.getApplicableStages().contains(applicableStage);
-    }
-
-    private boolean matchesTags(KnowledgeChunk chunk, List<String> tags) {
-        return tags.isEmpty() || chunk.getTags().containsAll(tags);
     }
 
     private KeywordEvidence keywordEvidence(KnowledgeRetrievalHit hit, KnowledgeQuery query) {
@@ -427,10 +417,12 @@ public class KnowledgeRetrievalApplicationService {
         return null;
     }
 
-    private float[] loadChunkEmbedding(KnowledgeRetrievalHit hit) {
-        return chunks.findById(hit.chunkId())
-            .map(KnowledgeChunk::getEmbedding)
-            .orElseGet(() -> new float[embeddingService.dimensions()]);
+    private double semanticScore(KnowledgeRetrievalHit hit, float[] queryEmbedding) {
+        var distance = hit.metadata().get("vectorDistance");
+        if (distance instanceof Number number) {
+            return Math.max(0.0d, 1.0d - number.doubleValue());
+        }
+        return Math.max(0.0d, cosineSimilarity(queryEmbedding, new float[embeddingService.dimensions()]));
     }
 
     private void validateEmbedding(float[] embedding) {
