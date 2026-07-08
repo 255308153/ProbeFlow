@@ -661,6 +661,210 @@ class FailureAnalysisApplicationServiceTests {
     }
 
     @Test
+    void suiteAnalysisClassifiesDependencyOrderAndRetainsSecondarySignals() {
+        var record = executionRecords.save(newExecutionRecord(
+            OverallStatus.BLOCKED,
+            Map.of("suite", true, "stepCount", 2),
+            suiteResponse(
+                List.of(
+                    suiteStep("pay-order", 1, "api-pay", "BLOCKED", "Variable resolution failed before producer ran", null),
+                    suiteStep("create-order", 2, "api-create", "PASSED", null, 201)
+                ),
+                List.of(
+                    mapOf(
+                        "code", "PATH_MISSING",
+                        "message", "Unable to resolve variable: ${suite.orderId}",
+                        "stepId", "pay-order",
+                        "location", "request.path",
+                        "scope", "suite",
+                        "path", "orderId",
+                        "expression", "${suite.orderId}"
+                    ),
+                    mapOf(
+                        "code", "BUSINESS_PRECONDITION_FAILURE",
+                        "message", "Order state precondition also failed",
+                        "stepId", "pay-order"
+                    )
+                ),
+                List.of(
+                    mapOf(
+                        "eventType", "CONSUMPTION",
+                        "stepId", "pay-order",
+                        "location", "request.path",
+                        "expression", "${suite.orderId}",
+                        "scope", "suite",
+                        "path", "orderId",
+                        "resolved", false,
+                        "failureReason", "PATH_MISSING"
+                    ),
+                    mapOf(
+                        "eventType", "PRODUCTION",
+                        "stepId", "create-order",
+                        "sourceType", "BODY_JSON",
+                        "sourcePath", "$.orderId",
+                        "targetScope", "suite",
+                        "targetKey", "orderId",
+                        "success", true
+                    )
+                )
+            ),
+            List.of()
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
+
+        assertThat(result.classification()).isEqualTo(FailureClassification.DEPENDENCY_ORDER_FAILURE);
+        assertThat(result.suiteFailureAnalysis().dependencyFailure())
+            .satisfies(failure -> {
+                assertThat(failure.producerStepId()).isEqualTo("create-order");
+                assertThat(failure.producerOrder()).isEqualTo(2);
+                assertThat(failure.consumerStepId()).isEqualTo("pay-order");
+                assertThat(failure.consumerOrder()).isEqualTo(1);
+                assertThat(failure.variableName()).isEqualTo("suite.orderId");
+                assertThat(failure.expression()).isEqualTo("${suite.orderId}");
+            });
+        assertThat(result.failureReason()).contains("consumer step pay-order", "producer step create-order");
+        assertThat(result.nextSuggestion()).contains("producer step before the consumer step");
+        assertThat(result.evidence()).anySatisfy(item -> assertThat(item)
+            .contains("dependencyOrderFailure=true", "producerStepId=create-order", "consumerStepId=pay-order", "variable=suite.orderId"));
+        assertThat(result.evidence()).anySatisfy(item -> assertThat(item)
+            .contains("runtimeDiagnostic=BUSINESS_PRECONDITION_FAILURE"));
+    }
+
+    @Test
+    void suiteAnalysisClassifiesBusinessPreconditionDownstreamApiAndPreservesAssertionClassifications() {
+        var business = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("suite", true, "stepCount", 2),
+            suiteResponse(
+                List.of(
+                    suiteStep("create-order", 1, "api-create", "PASSED", null, 201),
+                    suiteStep("pay-order", 2, "api-pay", "FAILED", "Inventory precondition failed", 409)
+                ),
+                List.of(mapOf(
+                    "code", "BUSINESS_PRECONDITION_FAILURE",
+                    "message", "Inventory is insufficient for order payment",
+                    "stepId", "pay-order"
+                )),
+                List.of()
+            ),
+            List.of()
+        ));
+        var downstream = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("suite", true, "stepCount", 3),
+            suiteResponse(
+                List.of(
+                    suiteStep("create-order", 1, "api-create", "PASSED", null, 201),
+                    suiteStep("pay-order", 2, "api-pay", "FAILED", "Payment service returned 503", 503),
+                    suiteStep("query-order", 3, "api-query", "SKIPPED", "Skipped because prerequisite step failed: pay-order", null)
+                ),
+                List.of(),
+                List.of(
+                    mapOf(
+                        "eventType", "PRODUCTION",
+                        "stepId", "create-order",
+                        "sourceType", "BODY_JSON",
+                        "sourcePath", "$.orderId",
+                        "targetScope", "suite",
+                        "targetKey", "orderId",
+                        "success", true
+                    ),
+                    mapOf(
+                        "eventType", "CONSUMPTION",
+                        "stepId", "pay-order",
+                        "location", "request.path",
+                        "expression", "${suite.orderId}",
+                        "scope", "suite",
+                        "path", "orderId",
+                        "resolved", true
+                    )
+                )
+            ),
+            List.of()
+        ));
+        var assertion = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("suite", true, "stepCount", 2),
+            suiteResponse(
+                List.of(
+                    suiteStep("create-order", 1, "api-create", "PASSED", null, 201),
+                    suiteStep("query-order", 2, "api-query", "FAILED", "Response shape changed", 200)
+                ),
+                List.of(),
+                List.of()
+            ),
+            List.of(Map.of("type", "JSON_FIELD_EXISTS", "path", "$.orderId", "expected", true, "actual", false, "status", "FAILED", "stepId", "query-order"))
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var businessResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(business.getExecutionId()));
+        var downstreamResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(downstream.getExecutionId()));
+        var assertionResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(assertion.getExecutionId()));
+
+        assertThat(businessResult.classification()).isEqualTo(FailureClassification.BUSINESS_PRECONDITION_FAILURE);
+        assertThat(businessResult.nextSuggestion()).contains("business preconditions", "test data");
+        assertThat(businessResult.evidence()).anySatisfy(item -> assertThat(item)
+            .contains("runtimeDiagnostic=BUSINESS_PRECONDITION_FAILURE", "stepId=pay-order"));
+        assertThat(downstreamResult.classification()).isEqualTo(FailureClassification.DOWNSTREAM_API_FAILURE);
+        assertThat(downstreamResult.suiteFailure().dependentSkippedStepIds()).containsExactly("query-order");
+        assertThat(downstreamResult.nextSuggestion()).contains("downstream API", "prerequisite variables");
+        assertThat(downstreamResult.evidence()).anySatisfy(item -> assertThat(item)
+            .contains("variableFlow=resolved", "stepId=pay-order", "scope=suite", "path=orderId"));
+        assertThat(assertionResult.classification()).isEqualTo(FailureClassification.RESPONSE_SHAPE_MISMATCH);
+        assertThat(assertionResult.nextSuggestion()).contains("API behavior");
+    }
+
+    @Test
+    void suiteAnalysisPrioritizesAuthEnvironmentAndSafetyPolicyBlocking() {
+        var auth = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("suite", true, "stepCount", 2),
+            suiteResponse(
+                List.of(
+                    suiteStep("login", 1, "api-login", "FAILED", "Token expired", 401),
+                    suiteStep("create-order", 2, "api-create", "SKIPPED", "Skipped because prerequisite step failed: login", null)
+                ),
+                List.of(),
+                List.of()
+            ),
+            List.of()
+        ));
+        var envStep = suiteStep("create-order", 1, "api-create", "BLOCKED", "Missing baseUrl for tenant qa", null);
+        envStep.put("responseSnapshot", Map.of("errorType", "BLOCKED_HOST"));
+        var env = executionRecords.save(newExecutionRecord(
+            OverallStatus.BLOCKED,
+            Map.of("suite", true, "stepCount", 1),
+            suiteResponse(List.of(envStep), List.of(), List.of()),
+            List.of()
+        ));
+        var blockedStep = suiteStep("create-order", 1, "api-create", "BLOCKED", "Security policy blocked external host", null);
+        blockedStep.put("responseSnapshot", Map.of("errorType", "SECURITY_POLICY_BLOCKED"));
+        var blocked = executionRecords.save(newExecutionRecord(
+            OverallStatus.BLOCKED,
+            Map.of("suite", true, "stepCount", 1),
+            suiteResponse(List.of(blockedStep), List.of(), List.of()),
+            List.of()
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var authResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(auth.getExecutionId()));
+        var envResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(env.getExecutionId()));
+        var blockedResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(blocked.getExecutionId()));
+
+        assertThat(authResult.classification()).isEqualTo(FailureClassification.AUTH_ISSUE);
+        assertThat(authResult.nextSuggestion()).contains("auth variables", "token", "login step");
+        assertThat(envResult.classification()).isEqualTo(FailureClassification.ENVIRONMENT_ISSUE);
+        assertThat(envResult.nextSuggestion()).contains("baseUrl", "tenant", "environment variables");
+        assertThat(blockedResult.classification()).isEqualTo(FailureClassification.BLOCKED_REQUEST);
+        assertThat(blockedResult.nextSuggestion()).contains("safety policy", "fake gateway");
+    }
+
+    @Test
     void taskAnalysisAggregatesDeduplicatesOrdersAndFlagsMissingLinkedRecords() {
         var api = apiSpecs.save(newApiSpec("/api/orders"));
         var caseOne = testCases.save(newTestCase("case-one", api.getApiSpecId()));
