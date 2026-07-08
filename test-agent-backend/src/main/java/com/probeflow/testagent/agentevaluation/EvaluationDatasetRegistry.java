@@ -16,6 +16,7 @@ public class EvaluationDatasetRegistry {
     public static final String REPORT_USEFULNESS_DATASET = "v2-phase-8-report-usefulness";
     public static final String MEMORY_REUSE_DATASET = "v2-phase-8-memory-reuse";
     public static final String REGRESSION_SUITE_DATASET = "v2-phase-8-regression-suite";
+    public static final String V3_SUITE_AGENT_DATASET = "v3-phase-6-suite-agent-capability";
 
     public EvaluationDataset load(String datasetName) {
         var effectiveName = datasetName == null || datasetName.isBlank() ? SMOKE_DATASET : datasetName.trim();
@@ -29,6 +30,7 @@ public class EvaluationDatasetRegistry {
             case REPORT_USEFULNESS_DATASET -> reportUsefulnessDataset();
             case MEMORY_REUSE_DATASET -> memoryReuseDataset();
             case REGRESSION_SUITE_DATASET -> regressionSuiteDataset();
+            case V3_SUITE_AGENT_DATASET -> v3SuiteAgentDataset();
             default -> throw new IllegalArgumentException("Unknown evaluation dataset: " + effectiveName);
         };
     }
@@ -735,6 +737,132 @@ public class EvaluationDatasetRegistry {
             EvaluationFixtureType.MEMORY_REUSE,
             expected,
             setup
+        );
+    }
+
+    private EvaluationDataset v3SuiteAgentDataset() {
+        return new EvaluationDataset(
+            V3_SUITE_AGENT_DATASET,
+            "2026-07-08",
+            List.of(v3SuiteAgentFixture()),
+            0.85d,
+            Map.of(
+                V3SuiteAgentCapabilityEvaluator.DEPENDENCY_COVERAGE_METRIC, 0.9d,
+                V3SuiteAgentCapabilityEvaluator.VARIABLE_AUDIT_METRIC, 0.9d,
+                V3SuiteAgentCapabilityEvaluator.FAILURE_ANALYSIS_METRIC, 0.9d,
+                V3SuiteAgentCapabilityEvaluator.MEMORY_CANDIDATE_METRIC, 0.9d,
+                V3SuiteAgentCapabilityEvaluator.HARNESS_COMPLETENESS_METRIC, 0.8d,
+                V3SuiteAgentCapabilityEvaluator.SECRET_REDACTION_METRIC, 1.0d
+            ),
+            Map.of(
+                V3SuiteAgentCapabilityEvaluator.DEPENDENCY_COVERAGE_METRIC, 1.8d,
+                V3SuiteAgentCapabilityEvaluator.VARIABLE_AUDIT_METRIC, 1.8d,
+                V3SuiteAgentCapabilityEvaluator.FAILURE_ANALYSIS_METRIC, 2.2d,
+                V3SuiteAgentCapabilityEvaluator.MEMORY_CANDIDATE_METRIC, 2.4d,
+                V3SuiteAgentCapabilityEvaluator.HARNESS_COMPLETENESS_METRIC, 1.0d,
+                V3SuiteAgentCapabilityEvaluator.SECRET_REDACTION_METRIC, 2.5d
+            ),
+            Map.of("v3-suite-agent-order-payment-loop", 0.85d)
+        );
+    }
+
+    private GoldenTaskFixture v3SuiteAgentFixture() {
+        return new GoldenTaskFixture(
+            "v3-suite-agent-order-payment-loop",
+            List.of(
+                "v3",
+                "suite",
+                "suite-dependency",
+                "variable-audit",
+                "failure-analysis",
+                "memory-feedback",
+                "harness-demo",
+                "redaction"
+            ),
+            "Evaluate deterministic fake V3 suite agent dependency, runtime audit, failure analysis, memory feedback and harness output.",
+            EvaluationFixtureType.V3_SUITE_AGENT,
+            Map.ofEntries(
+                Map.entry("expectedDependencyPairs", List.of("create-order->pay-order")),
+                Map.entry("expectedVariableWrites", List.of("suite.orderId")),
+                Map.entry("expectedVariableOverwrites", List.of("suite.orderId")),
+                Map.entry("expectedVariableConsumers", List.of("pay-order:${suite.orderId}")),
+                Map.entry("expectedMissingDiagnostics", List.of("SUITE_VARIABLE_MISSING")),
+                Map.entry("expectedFailureClassification", "VARIABLE_EXTRACTION_FAILURE"),
+                Map.entry("expectedRootStep", "create-order"),
+                Map.entry("expectedAffectedDownstreamSteps", List.of("pay-order")),
+                Map.entry("expectedNextSuggestionContains", "Fix BODY_JSON extractRule $.data.id"),
+                Map.entry("expectedMemoryTags", List.of("v3", "suite", "failure-analysis", "memory-feedback", "variable-extraction")),
+                Map.entry("expectedMemoryConfidenceMin", 0.85d),
+                Map.entry("expectedMemoryEvidence", List.of("rootStep=create-order", "failedVariable=suite.orderId", "diagnostic=SUITE_VARIABLE_MISSING")),
+                Map.entry("expectedHarnessSections", List.of(
+                    "generated-suite-draft",
+                    "execution-result",
+                    "variable-audit",
+                    "failure-analysis",
+                    "memory-feedback",
+                    "evaluation-comparison"
+                )),
+                Map.entry("expectedHarnessRealSections", List.of(
+                    "generated-suite-draft",
+                    "execution-result",
+                    "variable-audit",
+                    "failure-analysis"
+                ))
+            ),
+            Map.of(
+                "suiteDraft", Map.of(
+                    "dependencyPairs", List.of("create-order->pay-order"),
+                    "extractRules", List.of(Map.of(
+                        "id", "extract-order-id",
+                        "stepId", "create-order",
+                        "type", "BODY_JSON",
+                        "sourcePath", "$.data.id",
+                        "targetScope", "suite",
+                        "targetKey", "orderId"
+                    )),
+                    "variableReferences", List.of(Map.of(
+                        "stepId", "pay-order",
+                        "expression", "${suite.orderId}",
+                        "producerStepId", "create-order"
+                    ))
+                ),
+                "variableAudit", Map.of(
+                    "writes", List.of("suite.orderId"),
+                    "overwrites", List.of("suite.orderId"),
+                    "consumes", List.of("pay-order:${suite.orderId}"),
+                    "missingDiagnostics", List.of("SUITE_VARIABLE_MISSING")
+                ),
+                "failureAnalysis", Map.of(
+                    "classification", "VARIABLE_EXTRACTION_FAILURE",
+                    "rootStep", "create-order",
+                    "affectedDownstreamSteps", List.of("pay-order"),
+                    "nextSuggestion", "Fix BODY_JSON extractRule $.data.id before retrying the pay-order consumer step."
+                ),
+                "memoryCandidate", Map.of(
+                    "sourceRef", "suite-failure-analysis:execution-v3-order-payment:variable-extraction",
+                    "tags", List.of("v3", "suite", "failure-analysis", "memory-feedback", "variable-extraction"),
+                    "confidence", 0.9d,
+                    "evidence", List.of(
+                        "rootStep=create-order",
+                        "failedVariable=suite.orderId",
+                        "diagnostic=SUITE_VARIABLE_MISSING"
+                    ),
+                    "applicableWhen", "A consumer references ${suite.orderId} after create-order extraction.",
+                    "content", "Learn orderId extraction from $.data.id; Authorization=[REDACTED], token=[REDACTED]."
+                ),
+                "harness", Map.of("sections", Map.of(
+                    "generated-suite-draft", "REAL",
+                    "execution-result", "REAL",
+                    "variable-audit", "REAL",
+                    "failure-analysis", "REAL",
+                    "memory-feedback", "FIXTURE",
+                    "evaluation-comparison", "FIXTURE"
+                )),
+                "report", Map.of(
+                    "markdown", "V3 suite report uses Authorization=[REDACTED], cookie=[REDACTED], secret=[REDACTED].",
+                    "json", Map.of("apiKey", "[REDACTED]", "token", "[REDACTED]")
+                )
+            )
         );
     }
 }

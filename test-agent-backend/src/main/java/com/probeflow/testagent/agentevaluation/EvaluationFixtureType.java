@@ -8,5 +8,6 @@ public enum EvaluationFixtureType {
     FAILURE_CLASSIFICATION,
     TEST_CASE_COVERAGE,
     REPORT_USEFULNESS,
-    MEMORY_REUSE
+    MEMORY_REUSE,
+    V3_SUITE_AGENT
 }
