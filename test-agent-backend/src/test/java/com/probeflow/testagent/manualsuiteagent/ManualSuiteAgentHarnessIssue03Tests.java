@@ -64,26 +64,29 @@ class ManualSuiteAgentHarnessIssue03Tests {
             .containsEntry("recoveryActionType", "NO_ACTION");
 
         var memoryFeedback = section(result, "memory-feedback");
-        assertThat(memoryFeedback.source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
+        assertThat(memoryFeedback.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
         assertThat(memoryFeedback.summary())
-            .containsEntry("sourceMarker", "staged")
-            .containsEntry("candidateCount", 1)
-            .containsEntry("sourceType", "FIXTURE_EXECUTION_SUMMARY")
-            .containsEntry("confidence", "0.80");
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("candidateStatus", "REJECTED")
+            .containsEntry("classification", "NONE")
+            .containsEntry("writesLongTermMemory", false)
+            .containsEntry("rejectionReason", "suite-failure-not-learnable");
 
         var evaluationComparison = section(result, "evaluation-comparison");
-        assertThat(evaluationComparison.source()).isEqualTo(ManualSuiteAgentSectionSource.NOT_RUN);
+        assertThat(evaluationComparison.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
         assertThat(evaluationComparison.summary())
-            .containsEntry("sourceMarker", "not-run")
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("dataset", "v3-phase-6-suite-agent-capability")
+            .containsEntry("runStatus", "PASSED")
             .containsEntry("providerMode", "DETERMINISTIC_FAKE")
-            .containsEntry("fixtureId", "order-suite-demo");
+            .containsEntry("usesRealProvider", false);
 
         var json = new ObjectMapper().readTree(Files.readString(artifactPath(result, "JSON_REPORT")));
         assertSectionSource(json, "generated-suite-draft", "REAL", "real");
         assertSectionSource(json, "variable-audit", "REAL", "real");
         assertSectionSource(json, "failure-analysis", "REAL", "real");
-        assertSectionSource(json, "memory-feedback", "STAGED", "staged");
-        assertSectionSource(json, "evaluation-comparison", "NOT_RUN", "not-run");
+        assertSectionSource(json, "memory-feedback", "REAL", "real");
+        assertSectionSource(json, "evaluation-comparison", "REAL", "real");
 
         var markdown = Files.readString(artifactPath(result, "MARKDOWN_REPORT"));
         assertThat(markdown)
@@ -99,7 +102,9 @@ class ManualSuiteAgentHarnessIssue03Tests {
             .contains("query-order consumes ${suite.orderId}")
             .contains("Classification: NONE")
             .contains("No failure follow-up is required")
-            .contains("awaits V3-6");
+            .contains("memory-feedback (REAL")
+            .contains("Candidate status: REJECTED")
+            .contains("evaluation-comparison (REAL, PASSED");
         assertThat(markdown).doesNotContain("PENDING_RUNTIME", "awaits V3-4");
     }
 

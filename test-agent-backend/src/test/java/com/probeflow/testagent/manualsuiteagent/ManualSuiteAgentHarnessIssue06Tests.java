@@ -49,7 +49,12 @@ class ManualSuiteAgentHarnessIssue06Tests {
         assertThat(result.metadata())
             .containsEntry("memoryFeedbackStatus", "REJECTED")
             .containsEntry("writesLongTermMemory", false);
-        assertThat(section(result, "evaluation-comparison").source()).isEqualTo(ManualSuiteAgentSectionSource.NOT_RUN);
+        assertThat(section(result, "evaluation-comparison").source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(section(result, "evaluation-comparison").summary())
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("dataset", "v3-phase-6-suite-agent-capability")
+            .containsEntry("runStatus", "PASSED")
+            .containsEntry("usesRealProvider", false);
         assertThat(result.sections())
             .extracting(ManualSuiteAgentSectionSummary::sectionId)
             .doesNotContain(
@@ -182,8 +187,7 @@ class ManualSuiteAgentHarnessIssue06Tests {
             "Anthropic",
             "LlmApplicationService",
             "com.probeflow.testagent.replanning",
-            "com.probeflow.testagent.humanintheloop",
-            "com.probeflow.testagent.agentevaluation"
+            "com.probeflow.testagent.humanintheloop"
         ))).isEmpty();
         assertThat(presentTerms(pom, List.of(
             "react",

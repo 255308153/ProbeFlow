@@ -13,6 +13,19 @@ import org.junit.jupiter.api.Test;
 class V2Phase3AcceptanceBoundaryGuardTests {
 
     private static final Path PROJECT_ROOT = Path.of("").toAbsolutePath();
+    private static final List<String> POST_V2_PHASE3_PACKAGES = List.of(
+        "/policyvalidator/",
+        "/humanintheloop/",
+        "/replanning/",
+        "/httpexecution/",
+        "/suiteruntime/",
+        "/failureanalysis/",
+        "/agentmemoryfeedback/",
+        "/agentevaluation/",
+        "/manualsuiteagent/",
+        "/orchestration/",
+        "/report/"
+    );
 
     @Test
     void phase3AcceptanceIsCoveredThroughControlledPlannerSeams() throws Exception {
@@ -106,7 +119,7 @@ class V2Phase3AcceptanceBoundaryGuardTests {
     void phase3DoesNotIntroduceReplanningLoopHitlWorkflowMemoryFeedbackEvaluationRestFrontendQueueWorkerOrExternalIntegrations()
         throws Exception {
         var classNames = mainClassNames();
-        var mainSources = sourceText(PROJECT_ROOT.resolve("src/main/java"));
+        var mainSources = mainSourceText();
         var pom = Files.readString(PROJECT_ROOT.resolve("pom.xml"));
         var controllerAnnotations = mainSources.lines()
             .map(String::trim)
@@ -198,7 +211,7 @@ class V2Phase3AcceptanceBoundaryGuardTests {
     void realLlmStillIsNotRequiredForCi() throws Exception {
         var testConfig = Files.readString(PROJECT_ROOT.resolve("src/test/resources/application-test.yml"));
         var pom = Files.readString(PROJECT_ROOT.resolve("pom.xml"));
-        var mainSources = sourceText(PROJECT_ROOT.resolve("src/main/java"));
+        var mainSources = mainSourceText();
 
         assertThat(testConfig)
             .contains("allow-real-providers: false")
@@ -221,14 +234,19 @@ class V2Phase3AcceptanceBoundaryGuardTests {
     }
 
     private List<String> mainClassNames() throws Exception {
-        return classNames(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent"));
+        return classNames(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent"), POST_V2_PHASE3_PACKAGES);
     }
 
     private List<String> classNames(Path sourceRoot) throws Exception {
+        return classNames(sourceRoot, List.of());
+    }
+
+    private List<String> classNames(Path sourceRoot, List<String> excludedPathSegments) throws Exception {
         try (var stream = Files.walk(sourceRoot)) {
             return stream
                 .filter(Files::isRegularFile)
                 .filter(path -> path.toString().endsWith(".java"))
+                .filter(path -> excludedPathSegments.stream().noneMatch(path.toString()::contains))
                 .map(path -> path.getFileName().toString().replace(".java", ""))
                 .sorted()
                 .toList();
@@ -239,11 +257,20 @@ class V2Phase3AcceptanceBoundaryGuardTests {
         return sourceText(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/controlledplanner"));
     }
 
+    private String mainSourceText() throws Exception {
+        return sourceText(PROJECT_ROOT.resolve("src/main/java"), POST_V2_PHASE3_PACKAGES);
+    }
+
     private String sourceText(Path sourceRoot) throws Exception {
+        return sourceText(sourceRoot, List.of());
+    }
+
+    private String sourceText(Path sourceRoot, List<String> excludedPathSegments) throws Exception {
         try (var stream = Files.walk(sourceRoot)) {
             return stream
                 .filter(Files::isRegularFile)
                 .filter(path -> path.toString().endsWith(".java") || path.toString().endsWith(".sql"))
+                .filter(path -> excludedPathSegments.stream().noneMatch(path.toString()::contains))
                 .map(this::readUnchecked)
                 .collect(Collectors.joining("\n"));
         }

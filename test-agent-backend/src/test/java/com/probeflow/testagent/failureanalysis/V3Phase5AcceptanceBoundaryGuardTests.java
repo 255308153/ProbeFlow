@@ -148,7 +148,7 @@ class V3Phase5AcceptanceBoundaryGuardTests {
     }
 
     @Test
-    void manualHarnessFailureAnalysisIsRealDeterministicRedactedAndLeavesLaterSlotsUnfinished() throws Exception {
+    void manualHarnessFailureAnalysisIsRealDeterministicRedactedAndFeedsV3Phase6Slots() throws Exception {
         var result = ManualSuiteAgentHarness.defaults()
             .run(ManualSuiteAgentRunRequest.fake("order-suite-downstream-api-failure", outputDir));
 
@@ -166,10 +166,22 @@ class V3Phase5AcceptanceBoundaryGuardTests {
                     .containsEntry("recoveryActionType", "WAIT_FOR_SERVICE_OR_DATA_FIX");
                 assertThat(section.summary()).containsKeys("suiteFailureAnalysis", "evidence", "nextSuggestion");
             });
-        assertThat(section(result.sections(), "memory-feedback").source())
-            .isEqualTo(ManualSuiteAgentSectionSource.STAGED);
-        assertThat(section(result.sections(), "evaluation-comparison").source())
-            .isEqualTo(ManualSuiteAgentSectionSource.NOT_RUN);
+        assertThat(section(result.sections(), "memory-feedback"))
+            .satisfies(section -> {
+                assertThat(section.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+                assertThat(section.summary())
+                    .containsEntry("sourceMarker", "real")
+                    .containsEntry("classification", "DOWNSTREAM_API_FAILURE")
+                    .containsEntry("writesLongTermMemory", true);
+            });
+        assertThat(section(result.sections(), "evaluation-comparison"))
+            .satisfies(section -> {
+                assertThat(section.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+                assertThat(section.status()).isEqualTo("PASSED");
+                assertThat(section.summary())
+                    .containsEntry("sourceMarker", "real")
+                    .containsEntry("dataset", "v3-phase-6-suite-agent-capability");
+            });
 
         var jsonText = Files.readString(artifactPath(result, "JSON_REPORT"));
         var markdown = Files.readString(artifactPath(result, "MARKDOWN_REPORT"));

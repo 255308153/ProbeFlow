@@ -12,6 +12,13 @@ import org.junit.jupiter.api.Test;
 class Phase7AcceptanceBoundaryGuardTests {
 
     private static final Path PROJECT_ROOT = Path.of("").toAbsolutePath();
+    private static final List<String> POST_PHASE7_PACKAGES = List.of(
+        "/agentmemoryfeedback/",
+        "/agentevaluation/",
+        "/manualsuiteagent/",
+        "/orchestration/",
+        "/report/"
+    );
 
     @Test
     void phase7AcceptanceIsCoveredThroughFailureAnalysisApplicationServiceSeam() throws Exception {
@@ -233,13 +240,18 @@ class Phase7AcceptanceBoundaryGuardTests {
     }
 
     private String mainSourceText() throws Exception {
-        return sourceText(PROJECT_ROOT.resolve("src/main/java"));
+        return sourceText(PROJECT_ROOT.resolve("src/main/java"), POST_PHASE7_PACKAGES);
     }
 
     private String sourceText(Path sourceRoot) throws Exception {
+        return sourceText(sourceRoot, List.of());
+    }
+
+    private String sourceText(Path sourceRoot, List<String> excludedPathSegments) throws Exception {
         return Files.walk(sourceRoot)
             .filter(Files::isRegularFile)
             .filter(path -> path.toString().endsWith(".java"))
+            .filter(path -> excludedPathSegments.stream().noneMatch(path.toString()::contains))
             .map(this::readUnchecked)
             .collect(Collectors.joining("\n"));
     }

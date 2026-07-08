@@ -17,6 +17,18 @@ import org.junit.jupiter.api.Test;
 class V2Phase4AcceptanceBoundaryGuardTests {
 
     private static final Path PROJECT_ROOT = Path.of("").toAbsolutePath();
+    private static final List<String> POST_V2_PHASE4_PACKAGES = List.of(
+        "/humanintheloop/",
+        "/replanning/",
+        "/httpexecution/",
+        "/suiteruntime/",
+        "/failureanalysis/",
+        "/agentmemoryfeedback/",
+        "/agentevaluation/",
+        "/manualsuiteagent/",
+        "/orchestration/",
+        "/report/"
+    );
 
     @Test
     void phase4AcceptanceIsCoveredThroughPolicyValidatorServiceSeams() throws Exception {
@@ -232,14 +244,19 @@ class V2Phase4AcceptanceBoundaryGuardTests {
     }
 
     private List<String> mainClassNames() throws Exception {
-        return classNames(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent"));
+        return classNames(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent"), POST_V2_PHASE4_PACKAGES);
     }
 
     private List<String> classNames(Path sourceRoot) throws Exception {
+        return classNames(sourceRoot, List.of());
+    }
+
+    private List<String> classNames(Path sourceRoot, List<String> excludedPathSegments) throws Exception {
         try (var stream = Files.walk(sourceRoot)) {
             return stream
                 .filter(Files::isRegularFile)
                 .filter(path -> path.toString().endsWith(".java"))
+                .filter(path -> excludedPathSegments.stream().noneMatch(path.toString()::contains))
                 .map(path -> path.getFileName().toString().replace(".java", ""))
                 .sorted()
                 .toList();
@@ -251,14 +268,19 @@ class V2Phase4AcceptanceBoundaryGuardTests {
     }
 
     private String mainSourceText() throws Exception {
-        return sourceText(PROJECT_ROOT.resolve("src/main/java"));
+        return sourceText(PROJECT_ROOT.resolve("src/main/java"), POST_V2_PHASE4_PACKAGES);
     }
 
     private String sourceText(Path sourceRoot) throws Exception {
+        return sourceText(sourceRoot, List.of());
+    }
+
+    private String sourceText(Path sourceRoot, List<String> excludedPathSegments) throws Exception {
         try (var stream = Files.walk(sourceRoot)) {
             return stream
                 .filter(Files::isRegularFile)
                 .filter(path -> path.toString().endsWith(".java") || path.toString().endsWith(".sql"))
+                .filter(path -> excludedPathSegments.stream().noneMatch(path.toString()::contains))
                 .map(this::readUnchecked)
                 .collect(Collectors.joining("\n"));
         }

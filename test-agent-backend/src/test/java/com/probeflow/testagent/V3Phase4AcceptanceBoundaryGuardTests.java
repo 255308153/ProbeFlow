@@ -93,7 +93,7 @@ class V3Phase4AcceptanceBoundaryGuardTests {
     }
 
     @Test
-    void harnessUsesGeneratedSuiteDraftAsRuntimeInputAndKeepsLaterPhaseSlotsStaged() throws Exception {
+    void harnessUsesGeneratedSuiteDraftAsRuntimeInputAndShowsLaterPhaseSlotsAfterV3Phase6() throws Exception {
         var result = ManualSuiteAgentHarness.defaults()
             .run(ManualSuiteAgentRunRequest.fake("order-suite-demo", outputDir));
 
@@ -144,8 +144,16 @@ class V3Phase4AcceptanceBoundaryGuardTests {
             .containsEntry("sourceMarker", "real")
             .containsEntry("classification", "NONE")
             .containsEntry("recoveryActionType", "NO_ACTION");
-        assertThat(section(result, "memory-feedback").source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
-        assertThat(section(result, "evaluation-comparison").source()).isEqualTo(ManualSuiteAgentSectionSource.NOT_RUN);
+        assertThat(section(result, "memory-feedback").source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(section(result, "memory-feedback").summary())
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("classification", "NONE")
+            .containsEntry("writesLongTermMemory", false);
+        assertThat(section(result, "evaluation-comparison").source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(section(result, "evaluation-comparison").summary())
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("dataset", "v3-phase-6-suite-agent-capability")
+            .containsEntry("runStatus", "PASSED");
         assertThat(result.sections())
             .extracting(ManualSuiteAgentSectionSummary::sectionId)
             .doesNotContain(
@@ -168,8 +176,8 @@ class V3Phase4AcceptanceBoundaryGuardTests {
             .contains("Runtime: ExecutionContext")
             .contains("failure-analysis (REAL, PASSED)")
             .contains("Classification: NONE")
-            .contains("memory-feedback (STAGED")
-            .contains("evaluation-comparison (NOT_RUN");
+            .contains("memory-feedback (REAL")
+            .contains("evaluation-comparison (REAL, PASSED");
         assertThat(jsonText).doesNotContain("PENDING_RUNTIME");
         assertThat(markdown).doesNotContain("PENDING_RUNTIME");
         assertNoSensitiveValues(jsonText);

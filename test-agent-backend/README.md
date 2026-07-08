@@ -66,3 +66,11 @@ mvn -q -DskipTests exec:java -Dexec.args="--fixture-id=order-suite-demo --output
 - `usesExternalHttp=false`
 
 Manual real LLM 模式必须显式传入 `--provider-mode=MANUAL_REAL_LLM --allow-manual-real-llm`，并且仍受 harness provider policy 约束；默认 demo 和 CI 不依赖真实 LLM。常见失败诊断包括 `FIXTURE_NOT_FOUND`、`FIXTURE_INVALID`、`INVALID_PROVIDER_MODE`、`PROVIDER_BLOCKED` 和 `REPORT_WRITE_FAILED`。
+
+## V3-6 Memory Feedback, Agent Evaluation And Demo Loop
+
+V3-6 把已有 V3 链路能力串成轻量闭环：Manual Suite Agent Harness 使用 deterministic fake provider 和 fake HTTP gateway 展示 generated-suite-draft、execution-result、variable-audit、failure-analysis、memory-feedback 和 evaluation-comparison。默认路径不依赖真实 LLM、真实 embedding 或真实外部 HTTP。
+
+闭环叙事是：感知上下文、规划链路、调用工具执行、诊断失败、形成经验、评估能力、可视化演示。`memory-feedback` 通过 `AgentMemoryFeedbackApplicationService` 和 `MemoryRefineryService` 处理 V3-5 的失败分析输出；`evaluation-comparison` 通过 `AgentEvaluationApplicationService` 运行 `v3-phase-6-suite-agent-capability` 确定性评估数据集。
+
+V3-6 只消费前序阶段产物，不重做 V3-2、V3-3、V3-4、V3-5：不重新生成 BusinessFlowCandidate，不重新生成 extractRules 或变量引用，不重新执行 VariableResolver、ResponseExtractor、VariableWriteBack，也不重新分类 suite failure、root cause、affected downstream steps 或 recovery suggestion。它也不是完整版 RAG、mem0、完整产品前端或生产级记忆治理平台。
