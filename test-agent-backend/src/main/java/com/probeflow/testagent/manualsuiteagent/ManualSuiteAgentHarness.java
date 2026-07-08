@@ -1,6 +1,12 @@
 package com.probeflow.testagent.manualsuiteagent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.probeflow.testagent.agentmemoryfeedback.AgentMemoryFeedbackApplicationService;
+import com.probeflow.testagent.agentmemoryfeedback.MemoryCandidateProcessingStatus;
+import com.probeflow.testagent.agentmemoryfeedback.MemoryCandidateRecord;
+import com.probeflow.testagent.agentmemoryfeedback.MemoryCandidateRecordRepository;
+import com.probeflow.testagent.agentmemoryfeedback.MemoryFeedbackSanitizer;
+import com.probeflow.testagent.agentmemoryfeedback.SuiteFailureMemoryFeedbackRequest;
 import com.probeflow.testagent.apispec.ApiSpec;
 import com.probeflow.testagent.apispec.ApiSpecSourceType;
 import com.probeflow.testagent.apispec.HttpMethod;
@@ -13,12 +19,22 @@ import com.probeflow.testagent.businessflowdiscovery.BusinessFlowDiscoveryResult
 import com.probeflow.testagent.businessflowdiscovery.BusinessFlowDiscoveryService;
 import com.probeflow.testagent.businessflowdiscovery.BusinessFlowDiscoveryStep;
 import com.probeflow.testagent.businessflowdiscovery.BusinessFlowSourceCoverage;
+import com.probeflow.testagent.failureanalysis.FailureClassification;
+import com.probeflow.testagent.failureanalysis.SuiteDependencyFailure;
+import com.probeflow.testagent.failureanalysis.SuiteFailureAnalysis;
+import com.probeflow.testagent.failureanalysis.SuiteFailureStep;
+import com.probeflow.testagent.failureanalysis.SuiteVariableFailure;
 import com.probeflow.testagent.httpexecution.HttpClientRequest;
 import com.probeflow.testagent.httpexecution.HttpClientResponse;
 import com.probeflow.testagent.httpexecution.HttpExecutionOptions;
 import com.probeflow.testagent.httpexecution.HttpExecutionRequest;
+import com.probeflow.testagent.knowledge.EmbeddingService;
 import com.probeflow.testagent.knowledge.KnowledgeContextEntry;
+import com.probeflow.testagent.memory.LongTermMemory;
+import com.probeflow.testagent.memory.LongTermMemoryRepository;
 import com.probeflow.testagent.memory.LongTermMemoryRetrievalHit;
+import com.probeflow.testagent.memory.MemoryRefineryService;
+import com.probeflow.testagent.memory.MemoryStatus;
 import com.probeflow.testagent.memory.MemoryScopeType;
 import com.probeflow.testagent.memory.MemorySourceType;
 import com.probeflow.testagent.suiteruntime.DynamicValueProvider;
@@ -38,6 +54,7 @@ import com.probeflow.testagent.suitedraft.SuiteVariableDependency;
 import com.probeflow.testagent.suitedraft.SuiteVariableReference;
 import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskPriority;
+import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.task.TaskSourceType;
 import com.probeflow.testagent.task.TaskStatus;
 import com.probeflow.testagent.task.TaskType;
@@ -52,12 +69,16 @@ import com.probeflow.testagent.testcase.TestCase;
 import com.probeflow.testagent.testcase.TestCaseMode;
 import com.probeflow.testagent.testcasedraft.PromotionMode;
 import java.io.IOException;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Proxy;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 public class ManualSuiteAgentHarness {
@@ -71,6 +92,7 @@ public class ManualSuiteAgentHarness {
     private final VariableResolver variableResolver = new VariableResolver(new DynamicValueProvider());
     private final ResponseExtractor responseExtractor = new ResponseExtractor(objectMapper);
     private final VariableWriteBackService variableWriteBackService = new VariableWriteBackService();
+    private final ManualSuiteAgentMemoryFeedbackRuntime memoryFeedbackRuntime = ManualSuiteAgentMemoryFeedbackRuntime.create();
 
     public ManualSuiteAgentHarness(
         ManualSuiteAgentFixtureRegistry fixtureRegistry,
@@ -234,6 +256,7 @@ public class ManualSuiteAgentHarness {
         var executionSummary = executeOrderSuite(task, testCase, failureScenario);
         var suiteDraftSummary = generatedSuiteDraftSummary(suiteDraftResult);
         var failureAnalysisSection = failureAnalysisSection(executionSummary, failureScenario);
+        var memoryFeedbackSection = memoryFeedbackSection(request, fixture, task, testCase, executionSummary, failureAnalysisSection);
 
         var metadata = new LinkedHashMap<String, Object>();
         metadata.put("task", taskSummary(task));
@@ -243,6 +266,10 @@ public class ManualSuiteAgentHarness {
         metadata.put("generatedSuiteDraft", suiteDraftSummary);
         metadata.put("executionSummary", executionSummary);
         metadata.put("failureAnalysis", failureAnalysisSection.summary());
+        metadata.put("memoryFeedback", memoryFeedbackSection.summary());
+        metadata.put("memoryFeedbackStatus", memoryFeedbackSection.status());
+        metadata.put("writesLongTermMemory", memoryFeedbackSection.summary().getOrDefault("writesLongTermMemory", false));
+        metadata.put("candidateSourceRef", memoryFeedbackSection.summary().get("sourceRef"));
 
         var sections = new ArrayList<>(baseSections(request, fixture));
         sections.add(new ManualSuiteAgentSectionSummary(
@@ -282,6 +309,7 @@ public class ManualSuiteAgentHarness {
         ));
         sections.add(variableAuditSection(executionSummary));
         sections.add(failureAnalysisSection);
+        sections.add(memoryFeedbackSection);
         sections.addAll(v3StagedSections(request, fixture, testCase));
         sections.add(new ManualSuiteAgentSectionSummary(
             "execution-result",
@@ -603,21 +631,6 @@ public class ManualSuiteAgentHarness {
     ) {
         return List.of(
             new ManualSuiteAgentSectionSummary(
-                "memory-feedback",
-                "Memory feedback summary integration slot",
-                ManualSuiteAgentSectionSource.STAGED,
-                "STAGED",
-                orderedMap(
-                    "sourceMarker", "staged",
-                    "phaseNote", "Memory feedback slot awaits V3-6.",
-                    "candidateCount", 1,
-                    "sourceType", "FIXTURE_EXECUTION_SUMMARY",
-                    "tags", List.of("order-suite", "fake-http", "happy-path"),
-                    "confidence", "0.80",
-                    "learningNote", "Successful order payment chains should query final order status after payment."
-                )
-            ),
-            new ManualSuiteAgentSectionSummary(
                 "evaluation-comparison",
                 "Agent evaluation comparison integration slot",
                 ManualSuiteAgentSectionSource.NOT_RUN,
@@ -631,6 +644,210 @@ public class ManualSuiteAgentHarness {
                     "expectedMarkers", List.of("suite-draft-present", "fake-http-passed", "no-external-llm", "no-external-http")
                 )
             )
+        );
+    }
+
+    @SuppressWarnings("unchecked")
+    private ManualSuiteAgentSectionSummary memoryFeedbackSection(
+        ManualSuiteAgentRunRequest request,
+        ManualSuiteAgentFixture fixture,
+        Task task,
+        TestCase testCase,
+        Map<String, Object> executionSummary,
+        ManualSuiteAgentSectionSummary failureAnalysisSection
+    ) {
+        try {
+            memoryFeedbackRuntime.saveTask(task);
+            var failureSummary = failureAnalysisSection.summary();
+            var analysis = suiteFailureAnalysisFromSummary(executionSummary, failureSummary);
+            var evidence = ((List<Object>) failureSummary.getOrDefault("evidence", List.of())).stream()
+                .map(String::valueOf)
+                .toList();
+            var classification = analysis.classification() == null ? FailureClassification.UNKNOWN : analysis.classification();
+            var feedbackResult = memoryFeedbackRuntime.service().refineSuiteFailureAnalysisCandidate(
+                new SuiteFailureMemoryFeedbackRequest(
+                    task.getTaskId(),
+                    "suite-" + fixture.fixtureId(),
+                    testCase.getCaseId(),
+                    "manual-suite-agent:" + fixture.fixtureId() + ":" + executionSummary.getOrDefault("failureScenario", "none"),
+                    analysis,
+                    stringValue(failureSummary.get("nextSuggestion")),
+                    stringValue(failureSummary.get("recoveryActionType")),
+                    false,
+                    floatValue(failureSummary.get("confidence"), classification == FailureClassification.NONE ? 1.0f : 0.90f),
+                    evidence,
+                    orderedMap(
+                        "fixtureId", fixture.fixtureId(),
+                        "providerMode", request.providerMode().name(),
+                        "gateway", executionSummary.get("gateway"),
+                        "failureAnalysisRequiresHumanReview", failureSummary.get("requiresHumanReview"),
+                        "runProfile", request.runProfile()
+                    )
+                )
+            );
+            var audit = feedbackResult.auditSummary();
+            var summary = orderedMap(
+                "sourceMarker", "real",
+                "phaseNote", "V3-6 AgentMemoryFeedbackApplicationService processed this section from the current failure-analysis output.",
+                "status", feedbackResult.status().name(),
+                "candidateStatus", feedbackResult.status().name(),
+                "candidateId", feedbackResult.candidateId(),
+                "memoryId", feedbackResult.memoryId(),
+                "rejectionReason", feedbackResult.rejectionReason(),
+                "blockers", feedbackResult.blockers(),
+                "sourceType", audit.get("sourceType"),
+                "sourceRef", audit.get("sourceRef"),
+                "tags", audit.getOrDefault("tags", List.of()),
+                "confidence", audit.getOrDefault("confidence", floatValue(failureSummary.get("confidence"), 0.0f)),
+                "classification", classification.name(),
+                "rootStep", stepId(analysis.rootCauseStep()),
+                "affectedSteps", analysis.affectedDownstreamSteps().stream().map(this::stepId).toList(),
+                "refinerySummary", audit.getOrDefault("refineryResultSummary", orderedMap(
+                    "refineryInvoked", audit.getOrDefault("refineryInvoked", false),
+                    "accepted", false,
+                    "rejectionReason", feedbackResult.rejectionReason()
+                )),
+                "writesLongTermMemory", audit.getOrDefault("writesLongTermMemory", feedbackResult.memoryId() != null),
+                "auditSummary", audit
+            );
+            return new ManualSuiteAgentSectionSummary(
+                "memory-feedback",
+                "Agent memory feedback result",
+                ManualSuiteAgentSectionSource.REAL,
+                feedbackResult.status().name(),
+                summary
+            );
+        } catch (RuntimeException exception) {
+            return new ManualSuiteAgentSectionSummary(
+                "memory-feedback",
+                "Agent memory feedback result",
+                ManualSuiteAgentSectionSource.REAL,
+                MemoryCandidateProcessingStatus.FAILED.name(),
+                orderedMap(
+                    "sourceMarker", "real",
+                    "phaseNote", "V3-6 AgentMemoryFeedbackApplicationService failed while processing failure-analysis output.",
+                    "status", MemoryCandidateProcessingStatus.FAILED.name(),
+                    "failedSection", "memory-feedback",
+                    "failureReason", RuntimeRedactor.redact(exception.getMessage(), "memoryFeedbackFailure"),
+                    "writesLongTermMemory", false
+                )
+            );
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private SuiteFailureAnalysis suiteFailureAnalysisFromSummary(
+        Map<String, Object> executionSummary,
+        Map<String, Object> failureSummary
+    ) {
+        var classification = failureClassificationValue(stringValue(failureSummary.get("classification")));
+        var steps = (List<Map<String, Object>>) executionSummary.getOrDefault("stepResults", List.of());
+        var rootStepId = stringValue(failureSummary.get("rootStep"));
+        var rootStep = steps.stream()
+            .filter(step -> rootStepId.equals(stringValue(step.get("stepId"))))
+            .findFirst()
+            .map(this::suiteFailureStep)
+            .orElseGet(() -> classification == FailureClassification.NONE
+                ? new SuiteFailureStep("suite-passed", "Suite passed", 0, null, "PASSED", null, "No failure follow-up is required.", null)
+                : null);
+        var affectedIds = ((List<Object>) failureSummary.getOrDefault("affectedDownstreamSteps", failureSummary.getOrDefault("affectedSteps", List.of())))
+            .stream()
+            .map(String::valueOf)
+            .toList();
+        var affectedSteps = steps.stream()
+            .filter(step -> affectedIds.contains(stringValue(step.get("stepId"))))
+            .map(this::suiteFailureStep)
+            .toList();
+        var variableFailure = variableFailureFromSummary(classification, failureSummary, rootStep);
+        return new SuiteFailureAnalysis(
+            true,
+            classification,
+            rootStep,
+            rootStep,
+            rootStep,
+            affectedSteps,
+            affectedSteps,
+            variableFailure,
+            variableFailure == null ? List.of() : List.of(variableFailure),
+            dependencyFailureFromSummary(classification, rootStep, affectedSteps),
+            intValue(executionSummary.get("stepCount")),
+            intValue(executionSummary.get("skipped")),
+            affectedSteps.size(),
+            stringValue(failureSummary.get("suiteFailureAnalysis")) + " " + stringValue(failureSummary.get("nextSuggestion"))
+        );
+    }
+
+    private FailureClassification failureClassificationValue(String value) {
+        try {
+            return FailureClassification.valueOf(value);
+        } catch (RuntimeException exception) {
+            return FailureClassification.UNKNOWN;
+        }
+    }
+
+    private SuiteFailureStep suiteFailureStep(Map<String, Object> step) {
+        return new SuiteFailureStep(
+            stringValue(step.get("stepId")),
+            stringValue(step.get("stepName")),
+            intValue(step.get("order")),
+            stringValue(step.get("apiSpecId")),
+            stringValue(step.get("status")),
+            step.get("statusCode") == null ? null : intValue(step.get("statusCode")),
+            stringValue(firstPresent(step, "message", "summary")),
+            stringValue(step.get("skipReason"))
+        );
+    }
+
+    @SuppressWarnings("unchecked")
+    private SuiteVariableFailure variableFailureFromSummary(
+        FailureClassification classification,
+        Map<String, Object> failureSummary,
+        SuiteFailureStep rootStep
+    ) {
+        if (!classification.name().startsWith("VARIABLE_")) {
+            return null;
+        }
+        var suiteFailureAnalysis = objectMap(failureSummary.get("suiteFailureAnalysis"));
+        var variable = objectMap(suiteFailureAnalysis.get("variableFailure"));
+        return new SuiteVariableFailure(
+            classification,
+            stringValue(firstPresent(variable, "stepId")),
+            stringValue(firstPresent(variable, "expression")),
+            stringValue(variable.get("location")),
+            stringValue(firstPresent(variable, "targetScope", "scope")),
+            stringValue(firstPresent(variable, "targetKey", "path")),
+            stringValue(variable.get("extractRuleId")),
+            stringValue(variable.get("sourceType")),
+            stringValue(variable.get("sourcePath")),
+            stringValue(firstPresent(variable, "targetScope", "scope")),
+            stringValue(firstPresent(variable, "targetKey", "path")),
+            "Suite variable failure at " + stepId(rootStep),
+            "Authorization: Bearer fixture-secret-token",
+            null
+        );
+    }
+
+    private SuiteDependencyFailure dependencyFailureFromSummary(
+        FailureClassification classification,
+        SuiteFailureStep rootStep,
+        List<SuiteFailureStep> affectedSteps
+    ) {
+        if (classification != FailureClassification.PREREQUISITE_STEP_FAILURE
+            && classification != FailureClassification.SUITE_PREREQUISITE_FAILURE
+            && classification != FailureClassification.DEPENDENCY_ORDER_FAILURE) {
+            return null;
+        }
+        var consumer = affectedSteps.isEmpty() ? null : affectedSteps.get(0);
+        return new SuiteDependencyFailure(
+            stepId(rootStep),
+            rootStep == null ? null : rootStep.order(),
+            stepId(consumer),
+            consumer == null ? null : consumer.order(),
+            "${suite.orderId}",
+            "suite",
+            "orderId",
+            "orderId",
+            "Prerequisite suite step blocked dependent downstream execution."
         );
     }
 
@@ -1447,6 +1664,20 @@ public class ManualSuiteAgentHarness {
         return Integer.parseInt(value.toString());
     }
 
+    private float floatValue(Object value, float fallback) {
+        if (value instanceof Number number) {
+            return number.floatValue();
+        }
+        if (value == null || value.toString().isBlank()) {
+            return fallback;
+        }
+        return Float.parseFloat(value.toString());
+    }
+
+    private String stepId(SuiteFailureStep step) {
+        return step == null ? null : step.stepId();
+    }
+
     private String stringValue(Object value) {
         return value == null ? "" : value.toString();
     }
@@ -1463,5 +1694,134 @@ public class ManualSuiteAgentHarness {
         List<ManualSuiteAgentSectionSummary> sections,
         Map<String, Object> metadata
     ) {
+    }
+
+    private record ManualSuiteAgentMemoryFeedbackRuntime(
+        AgentMemoryFeedbackApplicationService service,
+        TaskRepository tasks
+    ) {
+
+        static ManualSuiteAgentMemoryFeedbackRuntime create() {
+            var taskStore = new HashMap<String, Task>();
+            var candidateStore = new HashMap<String, MemoryCandidateRecord>();
+            var memoryStore = new HashMap<String, LongTermMemory>();
+            var tasks = repositoryProxy(TaskRepository.class, (proxy, method, args) -> {
+                if (objectMethod(proxy, method, args) != null) {
+                    return objectMethod(proxy, method, args);
+                }
+                return switch (method.getName()) {
+                    case "save" -> {
+                        var task = (Task) args[0];
+                        taskStore.put(task.getTaskId(), task);
+                        yield task;
+                    }
+                    case "findById" -> Optional.ofNullable(taskStore.get(String.valueOf(args[0])));
+                    default -> unsupported(method);
+                };
+            });
+            var candidates = repositoryProxy(MemoryCandidateRecordRepository.class, (proxy, method, args) -> {
+                if (objectMethod(proxy, method, args) != null) {
+                    return objectMethod(proxy, method, args);
+                }
+                return switch (method.getName()) {
+                    case "save" -> {
+                        var record = (MemoryCandidateRecord) args[0];
+                        candidateStore.put(record.getCandidateId(), record);
+                        yield record;
+                    }
+                    case "findById" -> Optional.ofNullable(candidateStore.get(String.valueOf(args[0])));
+                    case "findBySourceTypeAndSourceRefAndTaskId" -> candidateStore.values().stream()
+                        .filter(record -> record.getSourceType() == args[0])
+                        .filter(record -> stringEquals(record.getSourceRef(), args[1]))
+                        .filter(record -> stringEquals(record.getTaskId(), args[2]))
+                        .findFirst();
+                    default -> unsupported(method);
+                };
+            });
+            var memories = repositoryProxy(LongTermMemoryRepository.class, (proxy, method, args) -> {
+                if (objectMethod(proxy, method, args) != null) {
+                    return objectMethod(proxy, method, args);
+                }
+                return switch (method.getName()) {
+                    case "save" -> {
+                        var memory = (LongTermMemory) args[0];
+                        if (memory.getMemoryId() == null || memory.getMemoryId().isBlank()) {
+                            memory.setMemoryId(UUID.randomUUID().toString());
+                        }
+                        memoryStore.put(memory.getMemoryId(), memory);
+                        yield memory;
+                    }
+                    case "findById" -> Optional.ofNullable(memoryStore.get(String.valueOf(args[0])));
+                    case "findAllByStatusOrderByCreatedAtAscMemoryIdAsc" -> memoryStore.values().stream()
+                        .filter(memory -> memory.getStatus() == (MemoryStatus) args[0])
+                        .sorted(Comparator.comparing(LongTermMemory::getMemoryId))
+                        .toList();
+                    default -> unsupported(method);
+                };
+            });
+            var memoryFeedback = new AgentMemoryFeedbackApplicationService(
+                candidates,
+                tasks,
+                new MemoryFeedbackSanitizer(),
+                null,
+                new MemoryRefineryService(memories, new DeterministicEmbeddingService())
+            );
+            return new ManualSuiteAgentMemoryFeedbackRuntime(memoryFeedback, tasks);
+        }
+
+        void saveTask(Task task) {
+            tasks.save(task);
+        }
+
+        @SuppressWarnings("unchecked")
+        private static <T> T repositoryProxy(Class<T> type, InvocationHandler handler) {
+            return (T) Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[] {type}, handler);
+        }
+
+        private static Object objectMethod(Object proxy, java.lang.reflect.Method method, Object[] args) {
+            return switch (method.getName()) {
+                case "toString" -> "ManualSuiteAgentMemoryFeedbackRuntime." + proxy.getClass().getInterfaces()[0].getSimpleName();
+                case "hashCode" -> System.identityHashCode(proxy);
+                case "equals" -> proxy == args[0];
+                default -> null;
+            };
+        }
+
+        private static boolean stringEquals(String left, Object right) {
+            return left == null ? right == null : left.equals(String.valueOf(right));
+        }
+
+        private static Object unsupported(java.lang.reflect.Method method) {
+            throw new UnsupportedOperationException(
+                "ManualSuiteAgent in-memory repository does not support " + method.getName()
+            );
+        }
+    }
+
+    private static class DeterministicEmbeddingService implements EmbeddingService {
+
+        @Override
+        public float[] embedDocument(String text) {
+            return vector(text);
+        }
+
+        @Override
+        public float[] embedQuery(String text) {
+            return vector(text);
+        }
+
+        @Override
+        public int dimensions() {
+            return 8;
+        }
+
+        private float[] vector(String text) {
+            var vector = new float[dimensions()];
+            var normalized = text == null ? "" : text;
+            for (int i = 0; i < normalized.length(); i++) {
+                vector[i % vector.length] += normalized.charAt(i) / 1000.0f;
+            }
+            return vector;
+        }
     }
 }

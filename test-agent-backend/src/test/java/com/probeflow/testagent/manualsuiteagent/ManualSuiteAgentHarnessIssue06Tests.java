@@ -20,7 +20,7 @@ class ManualSuiteAgentHarnessIssue06Tests {
     private Path outputDir;
 
     @Test
-    void defaultHarnessRunStaysFakeOnlyAndKeepsLaterV3CapabilitiesAsSlots() throws Exception {
+    void defaultHarnessRunStaysFakeOnlyAndShowsRealMemoryFeedbackNoOp() throws Exception {
         var result = ManualSuiteAgentHarness.defaults()
             .run(ManualSuiteAgentRunRequest.fake("order-suite-demo", outputDir));
 
@@ -38,7 +38,17 @@ class ManualSuiteAgentHarnessIssue06Tests {
             .containsEntry("sourceMarker", "real")
             .containsEntry("classification", "NONE")
             .containsEntry("recoveryActionType", "NO_ACTION");
-        assertThat(section(result, "memory-feedback").source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
+        var memoryFeedback = section(result, "memory-feedback");
+        assertThat(memoryFeedback.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(memoryFeedback.summary())
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("candidateStatus", "REJECTED")
+            .containsEntry("classification", "NONE")
+            .containsEntry("writesLongTermMemory", false)
+            .containsEntry("rejectionReason", "suite-failure-not-learnable");
+        assertThat(result.metadata())
+            .containsEntry("memoryFeedbackStatus", "REJECTED")
+            .containsEntry("writesLongTermMemory", false);
         assertThat(section(result, "evaluation-comparison").source()).isEqualTo(ManualSuiteAgentSectionSource.NOT_RUN);
         assertThat(result.sections())
             .extracting(ManualSuiteAgentSectionSummary::sectionId)
@@ -60,6 +70,7 @@ class ManualSuiteAgentHarnessIssue06Tests {
         assertThat(json.at("/run/usesExternalHttp").asBoolean()).isFalse();
         assertThat(json.at("/metadata/executionSummary/gateway").asText()).isEqualTo("FAKE_HTTP");
         assertThat(json.at("/metadata/executionSummary/runtime").asText()).isEqualTo("ExecutionContext");
+        assertThat(json.at("/metadata/memoryFeedbackStatus").asText()).isEqualTo("REJECTED");
         assertThat(json.toString()).doesNotContain("PENDING_RUNTIME");
 
         var testConfig = Files.readString(PROJECT_ROOT.resolve("src/test/resources/application-test.yml"));
@@ -69,7 +80,55 @@ class ManualSuiteAgentHarnessIssue06Tests {
     }
 
     @Test
-    void v3Phase1DoesNotIntroduceConsoleControllerAutomationQueueDbDirectOrExternalProviderSurfaces() throws Exception {
+    void failurePathRunsRealMemoryFeedbackThroughApplicationServiceAndRefinery() throws Exception {
+        var result = ManualSuiteAgentHarness.defaults()
+            .run(ManualSuiteAgentRunRequest.fake("order-suite-variable-extraction-failure", outputDir));
+
+        var memoryFeedback = section(result, "memory-feedback");
+        assertThat(memoryFeedback.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(memoryFeedback.status()).isIn("ACCEPTED", "MERGED");
+        assertThat(memoryFeedback.summary())
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("candidateStatus", memoryFeedback.status())
+            .containsEntry("classification", "VARIABLE_EXTRACTION_FAILURE")
+            .containsEntry("rootStep", "create-order")
+            .containsEntry("writesLongTermMemory", true);
+        assertThat(memoryFeedback.summary().get("sourceRef").toString())
+            .startsWith("suite-failure-analysis:manual-suite-agent:order-suite-variable-extraction-failure");
+        assertThat(memoryFeedback.summary().get("tags").toString())
+            .contains("v3")
+            .contains("suite")
+            .contains("memory-feedback")
+            .contains("variable-extraction");
+        assertThat(memoryFeedback.summary().get("memoryId")).isNotNull();
+        assertThat(memoryFeedback.summary().get("refinerySummary").toString())
+            .contains("refineryInvoked=true")
+            .contains("accepted=true");
+
+        assertThat(result.metadata())
+            .containsEntry("memoryFeedbackStatus", memoryFeedback.status())
+            .containsEntry("writesLongTermMemory", true);
+        assertThat(result.metadata().get("candidateSourceRef").toString())
+            .contains("VARIABLE_EXTRACTION_FAILURE");
+
+        var jsonText = Files.readString(artifactPath(result, "JSON_REPORT"));
+        var markdown = Files.readString(artifactPath(result, "MARKDOWN_REPORT"));
+        assertThat(jsonText)
+            .contains("\"sectionId\" : \"memory-feedback\"")
+            .contains("\"source\" : \"REAL\"")
+            .contains("\"candidateStatus\" : \"" + memoryFeedback.status() + "\"")
+            .contains("\"writesLongTermMemory\" : true");
+        assertThat(markdown)
+            .contains("memory-feedback (REAL")
+            .contains("Candidate status: " + memoryFeedback.status())
+            .contains("Writes long-term memory: true")
+            .contains("Refinery summary:");
+        assertNoSensitiveValues(jsonText);
+        assertNoSensitiveValues(markdown);
+    }
+
+    @Test
+    void v3Phase6HarnessMemoryFeedbackDoesNotIntroduceConsoleAutomationQueueDbDirectOrExternalProviderSurfaces() throws Exception {
         var pom = Files.readString(PROJECT_ROOT.resolve("pom.xml"));
         var manualSources = sourceText(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/manualsuiteagent"));
         var mainSources = sourceText(PROJECT_ROOT.resolve("src/main/java"));
@@ -96,7 +155,6 @@ class ManualSuiteAgentHarnessIssue06Tests {
             "@RestController",
             "@Controller",
             "@RequestMapping",
-            "ApplicationService",
             "invokeService",
             "ServiceInvoker",
             "directInvocation",
@@ -105,7 +163,6 @@ class ManualSuiteAgentHarnessIssue06Tests {
             "JdbcTemplate",
             "EntityManager",
             "DataSource",
-            "Repository",
             "WebDriver",
             "Playwright",
             "Selenium",
@@ -123,13 +180,9 @@ class ManualSuiteAgentHarnessIssue06Tests {
             "HttpURLConnection",
             "OpenAI",
             "Anthropic",
-            "EmbeddingClient",
-            "EmbeddingService",
             "LlmApplicationService",
-            "com.probeflow.testagent.failureanalysis",
             "com.probeflow.testagent.replanning",
             "com.probeflow.testagent.humanintheloop",
-            "com.probeflow.testagent.agentmemoryfeedback",
             "com.probeflow.testagent.agentevaluation"
         ))).isEmpty();
         assertThat(presentTerms(pom, List.of(
@@ -209,7 +262,9 @@ class ManualSuiteAgentHarnessIssue06Tests {
             "provider safety diagnostics redaction",
             "src/test/java/com/probeflow/testagent/manualsuiteagent/ManualSuiteAgentHarnessIssue04Tests.java",
             "local run command artifact output",
-            "src/test/java/com/probeflow/testagent/manualsuiteagent/ManualSuiteAgentHarnessIssue05Tests.java"
+            "src/test/java/com/probeflow/testagent/manualsuiteagent/ManualSuiteAgentHarnessIssue05Tests.java",
+            "real memory feedback section",
+            "src/test/java/com/probeflow/testagent/manualsuiteagent/ManualSuiteAgentHarnessIssue06Tests.java"
         );
 
         for (var entry : requiredTests.entrySet()) {

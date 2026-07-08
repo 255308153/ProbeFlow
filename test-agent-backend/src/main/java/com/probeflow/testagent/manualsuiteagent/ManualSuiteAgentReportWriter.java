@@ -158,6 +158,9 @@ public class ManualSuiteAgentReportWriter {
             if ("failure-analysis".equals(section.sectionId())) {
                 appendFailureAnalysis(markdown, redactor.redactMap(section.summary()));
             }
+            if ("memory-feedback".equals(section.sectionId())) {
+                appendMemoryFeedback(markdown, redactor.redactMap(section.summary()));
+            }
         }
         markdown.append("\n");
 
@@ -260,6 +263,42 @@ public class ManualSuiteAgentReportWriter {
             appendRows(markdown, "Affected downstream", (List<Object>) typed.getOrDefault("affectedDownstreamSteps", List.of()),
                 List.of("stepId", "status", "statusCode", "message"));
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void appendMemoryFeedback(StringBuilder markdown, Map<String, Object> summary) {
+        markdown.append("  - Candidate status: ")
+            .append(summary.get("candidateStatus"))
+            .append("\n");
+        markdown.append("  - Classification/root step: ")
+            .append(summary.get("classification"))
+            .append(" / ")
+            .append(summary.get("rootStep"))
+            .append("\n");
+        markdown.append("  - Source ref: ")
+            .append(summary.get("sourceRef"))
+            .append("\n");
+        markdown.append("  - Tags/confidence: ")
+            .append(summary.getOrDefault("tags", List.of()))
+            .append(" / ")
+            .append(summary.get("confidence"))
+            .append("\n");
+        markdown.append("  - Writes long-term memory: ")
+            .append(summary.get("writesLongTermMemory"))
+            .append("\n");
+        markdown.append("  - Memory id: ")
+            .append(summary.get("memoryId"))
+            .append("\n");
+        markdown.append("  - Rejection reason: ")
+            .append(summary.get("rejectionReason"))
+            .append("\n");
+        var refinerySummary = summary.get("refinerySummary");
+        if (refinerySummary instanceof Map<?, ?> map) {
+            markdown.append("  - Refinery summary: ")
+                .append((Map<String, Object>) map)
+                .append("\n");
+        }
+        appendRows(markdown, "Memory blockers", (List<Object>) summary.getOrDefault("blockers", List.of()), List.of());
     }
 
     @SuppressWarnings("unchecked")
