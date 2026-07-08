@@ -28,6 +28,15 @@ public class MemoryRefineryService {
     private static final float MIN_CONFIDENCE = 0.55f;
     private static final int SUMMARY_LIMIT = 160;
     private static final int CONTENT_LIMIT = 280;
+    private static final List<IdentityHintGroup> IDENTITY_CONFLICT_FIELDS = List.of(
+        new IdentityHintGroup("systemName", List.of("systemName", "system", "serviceName")),
+        new IdentityHintGroup("module", List.of("module", "component")),
+        new IdentityHintGroup("apiPath", List.of("apiPath", "path", "endpoint")),
+        new IdentityHintGroup("httpMethod", List.of("httpMethod", "method")),
+        new IdentityHintGroup("errorCode", List.of("errorCode", "error", "code")),
+        new IdentityHintGroup("businessEntity", List.of("businessEntity", "businessObject", "entity", "entityName", "resource")),
+        new IdentityHintGroup("failureClassification", List.of("failureClassification", "failureType", "rootCauseClassification", "classification"))
+    );
 
     private final LongTermMemoryRepository longTermMemories;
     private final EmbeddingService embeddingService;
@@ -83,6 +92,11 @@ public class MemoryRefineryService {
         var confidence = fact.confidence();
         var importance = fact.importance();
         var successContribution = successContributionOf(scopeType, confidence);
+
+        var identityConflict = findIdentityConflictCandidate(scopeType, summary, content, fullContent, tags, normalized, metadata);
+        if (identityConflict.isPresent()) {
+            return new MemoryRefineryResult(false, false, false, "identity-conflict", null, identityConflict.get());
+        }
 
         var existing = findMergeCandidate(scopeType, summary, content, fullContent, tags, normalized, metadata);
         if (existing.isPresent()) {
@@ -205,6 +219,24 @@ public class MemoryRefineryService {
             .findFirst();
     }
 
+    private java.util.Optional<Map<String, Object>> findIdentityConflictCandidate(
+        MemoryScopeType scopeType,
+        String summary,
+        String content,
+        String fullContent,
+        List<String> tags,
+        MemoryCandidateRequest request,
+        Map<String, Object> metadata
+    ) {
+        return longTermMemories.findAllByStatusOrderByCreatedAtAscMemoryIdAsc(MemoryStatus.ACTIVE)
+            .stream()
+            .filter(memory -> memory.getScopeType() == scopeType)
+            .map(memory -> identityConflictAudit(memory, summary, content, fullContent, tags, request, metadata))
+            .filter(java.util.Optional::isPresent)
+            .map(java.util.Optional::get)
+            .findFirst();
+    }
+
     private boolean sameSource(LongTermMemory memory, MemoryCandidateRequest request) {
         return memory.getSourceType() == request.sourceType()
             && StringUtils.hasText(memory.getSourceRef())
@@ -269,6 +301,9 @@ public class MemoryRefineryService {
         MemoryCandidateRequest request,
         Map<String, Object> metadata
     ) {
+        if (!sameFactType(memory.getMetadata(), metadata)) {
+            return false;
+        }
         if (hasConflictingIdentityHint(memory.getMetadata(), metadata)) {
             return false;
         }
@@ -288,21 +323,150 @@ public class MemoryRefineryService {
     }
 
     private boolean hasConflictingIdentityHint(Map<String, Object> left, Map<String, Object> right) {
-        return metadataHintConflicts(left, right, "systemName")
-            || metadataHintConflicts(left, right, "module")
-            || metadataHintConflicts(left, right, "apiPath")
-            || metadataHintConflicts(left, right, "errorCode");
+        return !identityConflicts(left, right).isEmpty();
     }
 
-    private boolean metadataHintConflicts(Map<String, Object> left, Map<String, Object> right, String key) {
-        if (!left.containsKey(key) || !right.containsKey(key)) {
-            return false;
+    private java.util.Optional<Map<String, Object>> identityConflictAudit(
+        LongTermMemory memory,
+        String summary,
+        String content,
+        String fullContent,
+        List<String> tags,
+        MemoryCandidateRequest request,
+        Map<String, Object> metadata
+    ) {
+        if (!sameFactType(memory.getMetadata(), metadata)) {
+            return java.util.Optional.empty();
         }
-        var leftValue = String.valueOf(left.get(key)).trim();
-        var rightValue = String.valueOf(right.get(key)).trim();
+        var conflicts = identityConflicts(memory.getMetadata(), metadata);
+        if (conflicts.isEmpty() || !isComparableForIdentityConflict(memory, summary, content, fullContent, tags, request, metadata)) {
+            return java.util.Optional.empty();
+        }
+        if (conflicts.size() > 1 && !isStronglyComparableForIdentityConflict(memory, summary, content, fullContent, tags, request, metadata)) {
+            return java.util.Optional.empty();
+        }
+
+        var conflictEntries = conflicts.stream()
+            .map(conflict -> {
+                var entry = new LinkedHashMap<String, Object>();
+                entry.put("field", conflict.field());
+                entry.put("existingValue", conflict.existingValue());
+                entry.put("candidateValue", conflict.candidateValue());
+                return entry;
+            })
+            .toList();
+        var audit = new LinkedHashMap<String, Object>();
+        audit.put("reason", "identity-conflict");
+        audit.put("conflictCandidate", true);
+        audit.put("existingMemoryId", memory.getMemoryId());
+        audit.put("existingSourceRef", memory.getSourceRef());
+        audit.put("candidateSourceRef", request.sourceRef());
+        audit.put("conflictFields", conflicts.stream().map(IdentityConflict::field).toList());
+        audit.put("identityConflicts", conflictEntries);
+        return java.util.Optional.of(audit);
+    }
+
+    private boolean isComparableForIdentityConflict(
+        LongTermMemory memory,
+        String summary,
+        String content,
+        String fullContent,
+        List<String> tags,
+        MemoryCandidateRequest request,
+        Map<String, Object> metadata
+    ) {
+        if (sameSource(memory, request)
+            || sameFactFingerprint(memory, metadata)
+            || equivalent(memory, memory.getScopeType(), summary, content, tags, request.sourceType(), request.sourceRef())) {
+            return true;
+        }
+        var tagOverlap = overlapCount(memory.getTags(), tags);
+        var metadataHintMatch = sharesMetadataHint(memory.getMetadata(), metadata);
+        var textSimilarity = Math.max(
+            tokenSimilarity(memory.getSummary(), summary),
+            tokenSimilarity(memory.getContent(), content)
+        );
+        var evidenceContained = containsNormalized(memory.getFullContent(), fullContent)
+            || containsNormalized(fullContent, memory.getFullContent());
+
+        return evidenceContained
+            || (metadataHintMatch && tagOverlap >= 1)
+            || (metadataHintMatch && textSimilarity >= 0.30d)
+            || (tagOverlap >= 2 && textSimilarity >= 0.45d);
+    }
+
+    private boolean isStronglyComparableForIdentityConflict(
+        LongTermMemory memory,
+        String summary,
+        String content,
+        String fullContent,
+        List<String> tags,
+        MemoryCandidateRequest request,
+        Map<String, Object> metadata
+    ) {
+        if (sameSource(memory, request)
+            || sameFactFingerprint(memory, metadata)
+            || sameCoreFactText(memory, summary, content, request.sourceType())) {
+            return true;
+        }
+        return false;
+    }
+
+    private boolean sameCoreFactText(
+        LongTermMemory memory,
+        String summary,
+        String content,
+        MemorySourceType sourceType
+    ) {
+        return Objects.equals(memory.getSummary(), summary)
+            && Objects.equals(memory.getContent(), content)
+            && memory.getSourceType() == sourceType;
+    }
+
+    private List<IdentityConflict> identityConflicts(Map<String, Object> left, Map<String, Object> right) {
+        var conflicts = new ArrayList<IdentityConflict>();
+        for (var field : IDENTITY_CONFLICT_FIELDS) {
+            var leftValue = identityHintValue(left, field.keys());
+            var rightValue = identityHintValue(right, field.keys());
+            if (conflictingIdentityValues(leftValue, rightValue)) {
+                conflicts.add(new IdentityConflict(field.name(), leftValue, rightValue));
+            }
+        }
+        return conflicts;
+    }
+
+    private boolean conflictingIdentityValues(String leftValue, String rightValue) {
         return StringUtils.hasText(leftValue)
             && StringUtils.hasText(rightValue)
             && !leftValue.equalsIgnoreCase(rightValue);
+    }
+
+    private String identityHintValue(Map<String, Object> metadata, List<String> keys) {
+        for (var key : keys) {
+            var value = metadata.get(key);
+            if (value != null && StringUtils.hasText(value.toString())) {
+                return value.toString().trim();
+            }
+        }
+        var identityHints = metadata.get("identityHints");
+        if (identityHints instanceof Map<?, ?> nested) {
+            for (var key : keys) {
+                var value = nested.get(key);
+                if (value != null && StringUtils.hasText(value.toString())) {
+                    return value.toString().trim();
+                }
+            }
+        }
+        return "";
+    }
+
+    private boolean metadataHintConflicts(Map<String, Object> left, Map<String, Object> right, String key) {
+        var leftValue = metadataValue(left, key);
+        var rightValue = metadataValue(right, key);
+        if (!StringUtils.hasText(leftValue) || !StringUtils.hasText(rightValue)) {
+            return false;
+        }
+        return !leftValue.equalsIgnoreCase(rightValue);
     }
 
     private int overlapCount(List<String> left, List<String> right) {
@@ -329,6 +493,14 @@ public class MemoryRefineryService {
         return left.containsKey(key)
             && right.containsKey(key)
             && Objects.equals(String.valueOf(left.get(key)), String.valueOf(right.get(key)));
+    }
+
+    private boolean sameFactType(Map<String, Object> left, Map<String, Object> right) {
+        var leftFactType = metadataValue(left, "factType");
+        var rightFactType = metadataValue(right, "factType");
+        return !StringUtils.hasText(leftFactType)
+            || !StringUtils.hasText(rightFactType)
+            || leftFactType.equalsIgnoreCase(rightFactType);
     }
 
     private double tokenSimilarity(String left, String right) {
@@ -710,6 +882,12 @@ public class MemoryRefineryService {
             case PREFERENCE -> MemoryScopeType.PREFERENCE;
             case PROJECT_KNOWLEDGE -> MemoryScopeType.PROJECT_KNOWLEDGE;
         };
+    }
+
+    private record IdentityHintGroup(String name, List<String> keys) {
+    }
+
+    private record IdentityConflict(String field, String existingValue, String candidateValue) {
     }
 
     private String compactSummary(MemoryCandidateRequest request) {

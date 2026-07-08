@@ -390,9 +390,14 @@ class MemoryRefineryServiceTests {
         ));
 
         assertThat(first.created()).isTrue();
-        assertThat(second.created()).isTrue();
-        assertThat(second.memory().memoryId()).isNotEqualTo(first.memory().memoryId());
-        assertThat(second.memory().metadata()).containsEntry("errorCode", "MR_BRAVO");
+        assertThat(second.accepted()).isFalse();
+        assertThat(second.rejectionReason()).isEqualTo("identity-conflict");
+        assertThat(second.memory()).isNull();
+        assertThat(second.auditSummary())
+            .containsEntry("reason", "identity-conflict")
+            .containsEntry("existingMemoryId", first.memory().memoryId());
+        assertThat((List<String>) second.auditSummary().get("conflictFields"))
+            .contains("module", "apiPath", "errorCode");
     }
 
     @Test

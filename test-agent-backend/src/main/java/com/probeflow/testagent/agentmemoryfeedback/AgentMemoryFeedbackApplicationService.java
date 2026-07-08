@@ -427,6 +427,9 @@ public class AgentMemoryFeedbackApplicationService {
         summary.put("created", refineryResult.created());
         summary.put("merged", refineryResult.duplicateSuppressed());
         summary.put("rejectionReason", refineryResult.rejectionReason());
+        if (!refineryResult.auditSummary().isEmpty()) {
+            summary.put("auditSummary", refineryResult.auditSummary());
+        }
         if (refineryResult.memory() != null) {
             summary.put("memoryId", refineryResult.memory().memoryId());
             summary.put("scopeType", refineryResult.memory().scopeType().name());
