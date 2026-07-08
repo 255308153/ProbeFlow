@@ -11,10 +11,17 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 @Component
+@ConditionalOnProperty(
+    prefix = "probeflow.memory.fact-extractor",
+    name = "mode",
+    havingValue = "deterministic",
+    matchIfMissing = true
+)
 public class DeterministicMemoryFactExtractor implements MemoryFactExtractor {
 
     private static final int SUMMARY_LIMIT = 160;

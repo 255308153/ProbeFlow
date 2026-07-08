@@ -50,3 +50,9 @@ probeflow:
       timeout-ms: ${PROBEFLOW_LLM_MANUAL_REAL_TIMEOUT_MS:0}
       max-tokens: ${PROBEFLOW_LLM_MANUAL_REAL_MAX_TOKENS:0}
       cost-limit-cents: ${PROBEFLOW_LLM_MANUAL_REAL_COST_LIMIT_CENTS:0}
+  memory:
+    fact-extractor:
+      mode: ${PROBEFLOW_MEMORY_FACT_EXTRACTOR_MODE:deterministic}
+      provider: ${PROBEFLOW_MEMORY_FACT_EXTRACTOR_PROVIDER:fake}
+      model: ${PROBEFLOW_MEMORY_FACT_EXTRACTOR_MODEL:fake-model}
+      template-id: ${PROBEFLOW_MEMORY_FACT_EXTRACTOR_TEMPLATE_ID:v5.memory-fact-extraction.v1}

@@ -23,6 +23,15 @@ public class LlmAuditSanitizer {
     private static final Pattern SENSITIVE_HEADER = Pattern.compile(
         "(?i)\\b(cookie|set-cookie|proxy-authorization)\\b\\s*[:=]\\s*([^\\r\\n,;]+)"
     );
+    private static final Pattern TOKEN = Pattern.compile(
+        "(?i)\\b(access_token|refresh_token|token)\\b\\s*[:=]\\s*([^\\s,;]+)"
+    );
+    private static final Pattern PASSWORD = Pattern.compile(
+        "(?i)\\b(password|passwd|secret)\\b\\s*[:=]\\s*([^\\s,;]+)"
+    );
+    private static final Pattern BEARER = Pattern.compile(
+        "(?i)\\bbearer\\s+[^\\s,;]+"
+    );
 
     public String promptSummary(String prompt) {
         return sanitizeAndTruncate(prompt, MAX_PROMPT_SUMMARY_LENGTH);
@@ -53,7 +62,10 @@ public class LlmAuditSanitizer {
     private String redact(String value) {
         var redacted = CREDENTIAL_PATTERN.matcher(value).replaceAll("$1=[REDACTED]");
         redacted = AUTHORIZATION.matcher(redacted).replaceAll("$1: [REDACTED]");
-        return SENSITIVE_HEADER.matcher(redacted).replaceAll("$1: [REDACTED]");
+        redacted = SENSITIVE_HEADER.matcher(redacted).replaceAll("$1: [REDACTED]");
+        redacted = TOKEN.matcher(redacted).replaceAll("$1=[REDACTED]");
+        redacted = PASSWORD.matcher(redacted).replaceAll("$1=[REDACTED]");
+        return BEARER.matcher(redacted).replaceAll("Bearer [REDACTED]");
     }
 
     private String sha256(String value) {

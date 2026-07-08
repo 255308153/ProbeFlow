@@ -824,6 +824,7 @@ public class MemoryRefineryService {
     private Map<String, Object> buildMetadata(MemoryCandidateRequest request, MemoryFact fact, MemoryScopeType scopeType) {
         var metadata = new TreeMap<String, Object>();
         metadata.putAll(request.metadata());
+        metadata.putAll(fact.identityHints());
         metadata.put("refinedAt", Instant.now().toString());
         metadata.put("scopeType", scopeType.name());
         metadata.put("factType", fact.factType().metadataValue());

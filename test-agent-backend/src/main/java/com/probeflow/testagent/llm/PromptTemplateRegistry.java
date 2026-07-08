@@ -92,6 +92,21 @@ public class PromptTemplateRegistry {
                 "Return one question and no tool calls."
             ),
             new PromptTemplate(
+                "v5.memory-fact-extraction.v1",
+                "MEMORY_FACT_EXTRACTION",
+                "v1",
+                """
+                    Extract one reusable ProbeFlow memory fact from this sanitized candidate JSON:
+                    {{candidateJson}}
+                    """,
+                List.of("candidateJson"),
+                """
+                    Return JSON only with factType, summary, content, fullContent, applicability, trigger,
+                    tags, identityHints, evidence, confidence, importance, reuseScore, and optional fingerprint.
+                    Evidence must include at least summary and sanitizedEvidence. Do not include secrets.
+                    """
+            ),
+            new PromptTemplate(
                 "v2.controlled-planner.v1",
                 "CONTROLLED_PLANNER",
                 "v1",

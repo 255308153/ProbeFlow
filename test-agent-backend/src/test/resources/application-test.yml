@@ -27,3 +27,9 @@ probeflow:
     allowed-providers: fake
     manual-real:
       enabled: false
+  memory:
+    fact-extractor:
+      mode: deterministic
+      provider: fake
+      model: fake-model
+      template-id: v5.memory-fact-extraction.v1
