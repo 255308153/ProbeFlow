@@ -37,6 +37,12 @@ mvn test
 
 Automated startup tests use the `test` profile with an in-memory H2 database, so they do not require locally running containers.
 
+## V5-1 Real Embedding And pgvector
+
+V5-1 adds a real embedding manual profile, pgvector candidate retrieval for Knowledge RAG and Long-term Memory, embedding profile metadata, reindex guards, and semantic evidence propagation into Unified Context. Fake embedding remains the default for local tests and CI.
+
+See [docs/v5-1-real-embedding-pgvector.md](/Users/lqc/Downloads/ProbeFlow/test-agent-backend/docs/v5-1-real-embedding-pgvector.md) for Chinese setup notes, manual real profile verification, default test boundaries, pgvector behavior, and V5-1 scope limits.
+
 ## V4 Demo Console
 
 V4 adds a local Demo Run API and Demo Console over the existing Manual Suite Agent Harness. The default fake baseline is deterministic and does not require a real LLM key, real embedding, or real external HTTP.
