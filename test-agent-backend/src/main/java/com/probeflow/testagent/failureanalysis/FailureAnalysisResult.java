@@ -28,6 +28,7 @@ public record FailureAnalysisResult(
     String retryReason,
     List<String> taskMemoryIds,
     MemoryCandidateAnalysisResult memoryCandidate,
-    SuiteFailureSummary suiteFailure
+    SuiteFailureSummary suiteFailure,
+    SuiteFailureAnalysis suiteFailureAnalysis
 ) {
 }

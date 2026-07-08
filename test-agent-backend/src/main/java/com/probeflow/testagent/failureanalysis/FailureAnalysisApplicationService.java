@@ -72,6 +72,7 @@ public class FailureAnalysisApplicationService {
         var failedAssertions = failedAssertions(record);
         var suiteFailure = suiteFailure(record);
         var classification = classify(record, failedAssertions, suiteFailure);
+        var suiteFailureAnalysis = suiteFailureAnalysis(record, classification, suiteFailure);
         var riskLevel = riskLevel(record, classification, failedAssertions, suiteFailure);
         var summary = summary(record, classification, suiteFailure);
         var failureReason = failureReason(record, classification, failedAssertions, suiteFailure);
@@ -86,7 +87,7 @@ public class FailureAnalysisApplicationService {
             failureReason,
             nextSuggestion
         );
-        var evidence = evidence(record, failedAssertions, classification);
+        var evidence = evidence(record, failedAssertions, classification, suiteFailure, suiteFailureAnalysis);
         var taskMemoryIds = writeTaskMemoryIfUseful(
             record,
             classification,
@@ -131,7 +132,8 @@ public class FailureAnalysisApplicationService {
             retryReason,
             taskMemoryIds,
             memoryCandidate,
-            suiteFailure
+            suiteFailure,
+            suiteFailureAnalysis
         );
     }
 
@@ -251,7 +253,7 @@ public class FailureAnalysisApplicationService {
         if (suiteFailure.suiteExecution()
             && suiteFailure.failedStepId() != null
             && suiteFailure.dependentSkippedStepCount() > 0) {
-            return FailureClassification.SUITE_PREREQUISITE_FAILURE;
+            return FailureClassification.PREREQUISITE_STEP_FAILURE;
         }
         if (record.getOverallStatus() == OverallStatus.PASSED) {
             return FailureClassification.NONE;
@@ -328,7 +330,9 @@ public class FailureAnalysisApplicationService {
     private List<String> evidence(
         ExecutionRecord record,
         List<FailedAssertionSummary> failedAssertions,
-        FailureClassification classification
+        FailureClassification classification,
+        SuiteFailureSummary suiteFailure,
+        SuiteFailureAnalysis suiteFailureAnalysis
     ) {
         var evidence = new ArrayList<String>();
         evidence.add("overallStatus=" + record.getOverallStatus());
@@ -357,15 +361,21 @@ public class FailureAnalysisApplicationService {
                 + " actual=" + assertion.actual()
         ));
         evidence.add("classification=" + classification);
-        var suiteFailure = suiteFailure(record);
         if (suiteFailure.suiteExecution()) {
             evidence.add("suiteStepCount=" + suiteFailure.totalSteps());
             if (suiteFailure.failedStepId() != null) {
                 evidence.add("firstFailedStep=" + suiteFailure.failedStepId() + " order=" + suiteFailure.failedStepOrder());
+                evidence.add("failedStepId=" + suiteFailure.failedStepId());
+                evidence.add("failedStepOrder=" + suiteFailure.failedStepOrder());
             }
             if (!suiteFailure.dependentSkippedStepIds().isEmpty()) {
                 evidence.add("dependentSkippedSteps=" + suiteFailure.dependentSkippedStepIds());
             }
+            suiteFailureAnalysis.dependentSkippedSteps().stream()
+                .map(step -> step.skipReason() == null ? step.message() : step.skipReason())
+                .filter(reason -> reason != null && !reason.isBlank())
+                .distinct()
+                .forEach(reason -> evidence.add("skipReason=" + reason));
         }
         return List.copyOf(evidence);
     }
@@ -624,7 +634,8 @@ public class FailureAnalysisApplicationService {
             result.retryReason(),
             result.taskMemoryIds(),
             memoryCandidate,
-            result.suiteFailure()
+            result.suiteFailure(),
+            result.suiteFailureAnalysis()
         );
     }
 
@@ -682,7 +693,7 @@ public class FailureAnalysisApplicationService {
             case AUTH_ISSUE -> tags.add("auth");
             case ENVIRONMENT_ISSUE, BLOCKED_REQUEST, TIMEOUT, TRANSPORT_ERROR -> tags.add("environment");
             case VALIDATION_ISSUE -> tags.add("validation");
-            case SERVER_ERROR, SUITE_PREREQUISITE_FAILURE -> tags.add("regression-risk");
+            case SERVER_ERROR, PREREQUISITE_STEP_FAILURE, SUITE_PREREQUISITE_FAILURE -> tags.add("regression-risk");
             default -> {
             }
         }
@@ -982,7 +993,8 @@ public class FailureAnalysisApplicationService {
 
     private ObservationType observationType(FailureClassification classification) {
         return switch (classification) {
-            case AUTH_ISSUE, VALIDATION_ISSUE, SERVER_ERROR, DURATION_REGRESSION, SUITE_PREREQUISITE_FAILURE -> ObservationType.RISK_EVALUATION;
+            case AUTH_ISSUE, VALIDATION_ISSUE, SERVER_ERROR, DURATION_REGRESSION,
+                PREREQUISITE_STEP_FAILURE, SUITE_PREREQUISITE_FAILURE -> ObservationType.RISK_EVALUATION;
             case UNKNOWN, NONE, SKIPPED -> ObservationType.GENERAL_COMMENT;
             default -> ObservationType.ASSERTION_FAILURE_ANALYSIS;
         };
@@ -996,6 +1008,7 @@ public class FailureAnalysisApplicationService {
     ) {
         if (record.isCriticalFailed()
             || classification == FailureClassification.SERVER_ERROR
+            || classification == FailureClassification.PREREQUISITE_STEP_FAILURE
             || classification == FailureClassification.SUITE_PREREQUISITE_FAILURE
             || suiteFailure.dependentSkippedStepCount() > 0) {
             return ObservationRiskLevel.HIGH;
@@ -1035,7 +1048,8 @@ public class FailureAnalysisApplicationService {
         List<FailedAssertionSummary> failedAssertions,
         SuiteFailureSummary suiteFailure
     ) {
-        if (classification == FailureClassification.SUITE_PREREQUISITE_FAILURE) {
+        if (classification == FailureClassification.PREREQUISITE_STEP_FAILURE
+            || classification == FailureClassification.SUITE_PREREQUISITE_FAILURE) {
             return suiteFailure.impactSummary();
         }
         if (record.getErrorMessage() != null && !record.getErrorMessage().isBlank()) {
@@ -1091,7 +1105,7 @@ public class FailureAnalysisApplicationService {
             case DURATION_REGRESSION -> retryable
                 ? "Retry once to rule out transient latency, then investigate performance regression."
                 : "Investigate API latency and performance regression risk.";
-            case SUITE_PREREQUISITE_FAILURE -> "Inspect suite prerequisite step "
+            case PREREQUISITE_STEP_FAILURE, SUITE_PREREQUISITE_FAILURE -> "Inspect suite prerequisite step "
                 + suiteFailure.failedStepId()
                 + " before treating downstream skipped steps as independent failures.";
             case SKIPPED, NONE -> "No failure follow-up is required.";
@@ -1099,13 +1113,141 @@ public class FailureAnalysisApplicationService {
         };
     }
 
+    private SuiteFailureAnalysis suiteFailureAnalysis(
+        ExecutionRecord record,
+        FailureClassification classification,
+        SuiteFailureSummary suiteFailure
+    ) {
+        var response = safeMap(record.getResponseSnapshot());
+        var steps = suiteSteps(response);
+        if (!suiteFailure.suiteExecution() && steps.isEmpty()) {
+            return SuiteFailureAnalysis.none();
+        }
+        if (steps.isEmpty()) {
+            return new SuiteFailureAnalysis(
+                true,
+                classification,
+                null,
+                null,
+                null,
+                List.of(),
+                List.of(),
+                0,
+                0,
+                0,
+                suiteFailure.impactSummary()
+            );
+        }
+
+        var orderedSteps = steps.stream()
+            .sorted(Comparator.comparingInt(step -> intValue(step.get("order")) == null ? Integer.MAX_VALUE : intValue(step.get("order"))))
+            .toList();
+        var skipped = orderedSteps.stream()
+            .filter(this::skippedSuiteStep)
+            .toList();
+        Map<String, Object> firstFailed = null;
+        for (var step : orderedSteps) {
+            if (failedSuiteStep(step)) {
+                firstFailed = step;
+                break;
+            }
+        }
+        if (firstFailed == null) {
+            return new SuiteFailureAnalysis(
+                true,
+                classification,
+                null,
+                null,
+                null,
+                List.of(),
+                List.of(),
+                orderedSteps.size(),
+                skipped.size(),
+                0,
+                suiteFailure.impactSummary()
+            );
+        }
+
+        var failedStep = suiteFailureStep(firstFailed);
+        var failedOrder = failedStep.order();
+        var dependentSkipped = skipped.stream()
+            .filter(step -> afterFailedStep(step, failedOrder))
+            .filter(step -> prerequisiteSkip(step, failedStep.stepId()))
+            .map(this::suiteFailureStep)
+            .toList();
+        return new SuiteFailureAnalysis(
+            true,
+            classification,
+            failedStep,
+            failedStep,
+            failedStep,
+            dependentSkipped,
+            dependentSkipped,
+            orderedSteps.size(),
+            skipped.size(),
+            dependentSkipped.size(),
+            suiteFailure.impactSummary()
+        );
+    }
+
+    private boolean afterFailedStep(Map<String, Object> step, Integer failedOrder) {
+        var stepOrder = intValue(step.get("order"));
+        return failedOrder == null || stepOrder == null || stepOrder > failedOrder;
+    }
+
+    private boolean prerequisiteSkip(Map<String, Object> step, String failedStepId) {
+        var reason = skipReason(step);
+        return contains(reason, "prerequisite step failed") || contains(reason, failedStepId);
+    }
+
+    private SuiteFailureStep suiteFailureStep(Map<String, Object> step) {
+        var response = nestedMap(step.get("responseSnapshot"));
+        var status = stringValue(step.get("overallStatus"));
+        if (status == null) {
+            status = stringValue(step.get("status"));
+        }
+        return new SuiteFailureStep(
+            stringValue(step.get("stepId")),
+            stringValue(step.get("stepName")),
+            intValue(step.get("order")),
+            stringValue(step.get("apiSpecId")),
+            status,
+            intValue(step.get("statusCode")) == null ? intValue(response.get("statusCode")) : intValue(step.get("statusCode")),
+            stringValue(step.get("message")),
+            skipReason(step)
+        );
+    }
+
+    private String skipReason(Map<String, Object> step) {
+        var skipReason = stringValue(step.get("skipReason"));
+        return skipReason == null ? stringValue(step.get("message")) : skipReason;
+    }
+
+    private List<Map<String, Object>> suiteSteps(Map<String, Object> response) {
+        var rawSteps = response.get("steps");
+        if (!(rawSteps instanceof List<?>)) {
+            rawSteps = response.get("stepResults");
+        }
+        if (!(rawSteps instanceof List<?> steps)) {
+            return List.of();
+        }
+        return steps.stream()
+            .filter(Map.class::isInstance)
+            .map(item -> objectMap((Map<?, ?>) item))
+            .toList();
+    }
+
     private SuiteFailureSummary suiteFailure(ExecutionRecord record) {
         var response = safeMap(record.getResponseSnapshot());
-        if (!Boolean.TRUE.equals(response.get("suite")) || !(response.get("steps") instanceof List<?> rawSteps)) {
+        var rawSteps = response.get("steps");
+        if (!(rawSteps instanceof List<?>)) {
+            rawSteps = response.get("stepResults");
+        }
+        if (!Boolean.TRUE.equals(response.get("suite")) || !(rawSteps instanceof List<?>)) {
             return SuiteFailureSummary.none();
         }
 
-        var steps = rawSteps.stream()
+        var steps = ((List<?>) rawSteps).stream()
             .filter(Map.class::isInstance)
             .map(item -> objectMap((Map<?, ?>) item))
             .toList();
@@ -1255,6 +1397,6 @@ public class FailureAnalysisApplicationService {
     }
 
     private boolean contains(String value, String needle) {
-        return value != null && value.toLowerCase().contains(needle.toLowerCase());
+        return value != null && needle != null && value.toLowerCase().contains(needle.toLowerCase());
     }
 }

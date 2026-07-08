@@ -394,7 +394,7 @@ class FailureAnalysisApplicationServiceTests {
 
         var result = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
 
-        assertThat(result.classification()).isEqualTo(FailureClassification.SUITE_PREREQUISITE_FAILURE);
+        assertThat(result.classification()).isEqualTo(FailureClassification.PREREQUISITE_STEP_FAILURE);
         assertThat(result.riskLevel()).isEqualTo("HIGH");
         assertThat(result.suiteFailure().suiteExecution()).isTrue();
         assertThat(result.suiteFailure().failedStepId()).isEqualTo("create-order");
@@ -402,8 +402,28 @@ class FailureAnalysisApplicationServiceTests {
         assertThat(result.suiteFailure().failedStepApiSpecId()).isEqualTo("api-create");
         assertThat(result.suiteFailure().dependentSkippedStepIds()).containsExactly("read-order", "pay-order");
         assertThat(result.suiteFailure().impactSummary()).contains("Suite prerequisite step create-order");
+        assertThat(result.suiteFailureAnalysis().suiteExecution()).isTrue();
+        assertThat(result.suiteFailureAnalysis().classification()).isEqualTo(FailureClassification.PREREQUISITE_STEP_FAILURE);
+        assertThat(result.suiteFailureAnalysis().firstFailingStep().stepId()).isEqualTo("create-order");
+        assertThat(result.suiteFailureAnalysis().rootCauseStep().stepId()).isEqualTo("create-order");
+        assertThat(result.suiteFailureAnalysis().directlyFailedStep().stepId()).isEqualTo("create-order");
+        assertThat(result.suiteFailureAnalysis().affectedDownstreamSteps())
+            .extracting(SuiteFailureStep::stepId)
+            .containsExactly("read-order", "pay-order");
+        assertThat(result.suiteFailureAnalysis().dependentSkippedSteps())
+            .extracting(SuiteFailureStep::skipReason)
+            .containsExactly(
+                "Skipped because prerequisite step failed: create-order",
+                "Skipped because prerequisite step failed: create-order"
+            );
         assertThat(result.nextSuggestion()).contains("Inspect suite prerequisite step create-order");
-        assertThat(result.evidence()).contains("firstFailedStep=create-order order=1");
+        assertThat(result.evidence()).contains(
+            "firstFailedStep=create-order order=1",
+            "failedStepId=create-order",
+            "failedStepOrder=1",
+            "dependentSkippedSteps=[read-order, pay-order]",
+            "skipReason=Skipped because prerequisite step failed: create-order"
+        );
 
         var observation = observations.findById(result.observationIds().getFirst()).orElseThrow();
         assertThat(observation.getSummary()).contains("first failing suite step create-order");
@@ -438,10 +458,14 @@ class FailureAnalysisApplicationServiceTests {
         var middleResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(middleFailed.getExecutionId()));
         var skippedResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(allSkipped.getExecutionId()));
 
-        assertThat(middleResult.classification()).isEqualTo(FailureClassification.SUITE_PREREQUISITE_FAILURE);
+        assertThat(middleResult.classification()).isEqualTo(FailureClassification.PREREQUISITE_STEP_FAILURE);
         assertThat(middleResult.suiteFailure().failedStepId()).isEqualTo("read-order");
         assertThat(middleResult.suiteFailure().failedStepOrder()).isEqualTo(2);
         assertThat(middleResult.suiteFailure().dependentSkippedStepIds()).containsExactly("pay-order");
+        assertThat(middleResult.suiteFailureAnalysis().rootCauseStep().stepId()).isEqualTo("read-order");
+        assertThat(middleResult.suiteFailureAnalysis().dependentSkippedSteps())
+            .extracting(SuiteFailureStep::stepId)
+            .containsExactly("pay-order");
         assertThat(skippedResult.classification()).isEqualTo(FailureClassification.SKIPPED);
         assertThat(skippedResult.observationIds()).isEmpty();
         assertThat(skippedResult.suiteFailure().suiteExecution()).isTrue();
