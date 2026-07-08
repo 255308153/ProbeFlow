@@ -7,6 +7,14 @@ import com.probeflow.testagent.agentmemoryfeedback.MemoryCandidateRecord;
 import com.probeflow.testagent.agentmemoryfeedback.MemoryCandidateRecordRepository;
 import com.probeflow.testagent.agentmemoryfeedback.MemoryFeedbackSanitizer;
 import com.probeflow.testagent.agentmemoryfeedback.SuiteFailureMemoryFeedbackRequest;
+import com.probeflow.testagent.agentevaluation.AgentEvaluationApplicationService;
+import com.probeflow.testagent.agentevaluation.EvaluationDataset;
+import com.probeflow.testagent.agentevaluation.EvaluationDatasetRegistry;
+import com.probeflow.testagent.agentevaluation.EvaluationFixtureType;
+import com.probeflow.testagent.agentevaluation.EvaluationProviderMode;
+import com.probeflow.testagent.agentevaluation.EvaluationRunRequest;
+import com.probeflow.testagent.agentevaluation.GoldenTaskFixture;
+import com.probeflow.testagent.agentevaluation.V3SuiteAgentCapabilityEvaluator;
 import com.probeflow.testagent.apispec.ApiSpec;
 import com.probeflow.testagent.apispec.ApiSpecSourceType;
 import com.probeflow.testagent.apispec.HttpMethod;
@@ -257,6 +265,14 @@ public class ManualSuiteAgentHarness {
         var suiteDraftSummary = generatedSuiteDraftSummary(suiteDraftResult);
         var failureAnalysisSection = failureAnalysisSection(executionSummary, failureScenario);
         var memoryFeedbackSection = memoryFeedbackSection(request, fixture, task, testCase, executionSummary, failureAnalysisSection);
+        var evaluationComparisonSection = evaluationComparisonSection(
+            request,
+            fixture,
+            suiteDraftSummary,
+            executionSummary,
+            failureAnalysisSection,
+            memoryFeedbackSection
+        );
 
         var metadata = new LinkedHashMap<String, Object>();
         metadata.put("task", taskSummary(task));
@@ -270,6 +286,10 @@ public class ManualSuiteAgentHarness {
         metadata.put("memoryFeedbackStatus", memoryFeedbackSection.status());
         metadata.put("writesLongTermMemory", memoryFeedbackSection.summary().getOrDefault("writesLongTermMemory", false));
         metadata.put("candidateSourceRef", memoryFeedbackSection.summary().get("sourceRef"));
+        metadata.put("evaluationComparison", evaluationComparisonSection.summary());
+        metadata.put("evaluationDataset", evaluationComparisonSection.summary().get("dataset"));
+        metadata.put("evaluationRunStatus", evaluationComparisonSection.summary().get("runStatus"));
+        metadata.put("overallScore", evaluationComparisonSection.summary().get("overallScore"));
 
         var sections = new ArrayList<>(baseSections(request, fixture));
         sections.add(new ManualSuiteAgentSectionSummary(
@@ -310,7 +330,7 @@ public class ManualSuiteAgentHarness {
         sections.add(variableAuditSection(executionSummary));
         sections.add(failureAnalysisSection);
         sections.add(memoryFeedbackSection);
-        sections.addAll(v3StagedSections(request, fixture, testCase));
+        sections.add(evaluationComparisonSection);
         sections.add(new ManualSuiteAgentSectionSummary(
             "execution-result",
             "ExecutionContext runtime fake HTTP execution summary",
@@ -624,26 +644,230 @@ public class ManualSuiteAgentHarness {
             + " affected downstream steps " + affectedStepIds + ".";
     }
 
-    private List<ManualSuiteAgentSectionSummary> v3StagedSections(
+    @SuppressWarnings("unchecked")
+    private ManualSuiteAgentSectionSummary evaluationComparisonSection(
         ManualSuiteAgentRunRequest request,
         ManualSuiteAgentFixture fixture,
-        TestCase testCase
+        Map<String, Object> suiteDraftSummary,
+        Map<String, Object> executionSummary,
+        ManualSuiteAgentSectionSummary failureAnalysisSection,
+        ManualSuiteAgentSectionSummary memoryFeedbackSection
     ) {
-        return List.of(
-            new ManualSuiteAgentSectionSummary(
+        try {
+            var dataset = harnessEvaluationDataset(fixture, suiteDraftSummary, executionSummary, failureAnalysisSection, memoryFeedbackSection);
+            var service = new AgentEvaluationApplicationService(
+                new HarnessEvaluationDatasetRegistry(dataset),
+                List.of(new V3SuiteAgentCapabilityEvaluator())
+            );
+            var result = service.run(new EvaluationRunRequest(
+                dataset.name(),
+                request.runProfile(),
+                EvaluationProviderMode.DETERMINISTIC_FAKE
+            ));
+            var report = result.report();
+            var summary = orderedMap(
+                "sourceMarker", "real",
+                "phaseNote", "V3-6 AgentEvaluationApplicationService evaluated the current Manual Suite Agent harness run with deterministic fake fixtures.",
+                "dataset", result.run().datasetName(),
+                "datasetVersion", result.run().datasetVersion(),
+                "runId", result.run().runId(),
+                "runStatus", result.run().status().name(),
+                "overallScore", result.run().overallScore(),
+                "providerMode", result.run().providerMode().name(),
+                "usesRealProvider", false,
+                "usesExternalHttp", false,
+                "failedMetrics", report.failedMetrics(),
+                "recommendedFixes", report.recommendedFixes(),
+                "metricSummary", report.metricSummary(),
+                "caseSummary", report.caseSummary(),
+                "humanReadableSummary", report.humanReadableSummary()
+            );
+            return new ManualSuiteAgentSectionSummary(
                 "evaluation-comparison",
-                "Agent evaluation comparison integration slot",
-                ManualSuiteAgentSectionSource.NOT_RUN,
-                "NOT_RUN",
+                "Agent evaluation comparison",
+                ManualSuiteAgentSectionSource.REAL,
+                result.run().status().name(),
+                summary
+            );
+        } catch (RuntimeException exception) {
+            return new ManualSuiteAgentSectionSummary(
+                "evaluation-comparison",
+                "Agent evaluation comparison",
+                ManualSuiteAgentSectionSource.REAL,
+                "ERROR",
                 orderedMap(
-                    "sourceMarker", "not-run",
-                    "phaseNote", "V3 Agent Evaluation comparison awaits V3-6 and remains non-required for default CI.",
-                    "providerMode", request.providerMode().name(),
-                    "fixtureId", fixture.fixtureId(),
-                    "capabilityTags", fixture.capabilityTags(),
-                    "expectedMarkers", List.of("suite-draft-present", "fake-http-passed", "no-external-llm", "no-external-http")
+                    "sourceMarker", "real",
+                    "phaseNote", "V3-6 AgentEvaluationApplicationService failed while evaluating the harness run.",
+                    "failedSection", "evaluation-comparison",
+                    "failureReason", RuntimeRedactor.redact(exception.getMessage(), "evaluationComparisonFailure"),
+                    "dataset", EvaluationDatasetRegistry.V3_SUITE_AGENT_DATASET,
+                    "runStatus", "ERROR",
+                    "overallScore", 0.0d,
+                    "failedMetrics", List.of("evaluation-comparison"),
+                    "recommendedFixes", List.of("Inspect evaluation-comparison failure diagnostics.")
                 )
+            );
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private EvaluationDataset harnessEvaluationDataset(
+        ManualSuiteAgentFixture fixture,
+        Map<String, Object> suiteDraftSummary,
+        Map<String, Object> executionSummary,
+        ManualSuiteAgentSectionSummary failureAnalysisSection,
+        ManualSuiteAgentSectionSummary memoryFeedbackSection
+    ) {
+        var dependencyPairs = ((List<Map<String, Object>>) suiteDraftSummary.getOrDefault("dependencyLinks", List.of())).stream()
+            .map(link -> stringValue(link.get("producerStepId")) + "->" + stringValue(link.get("consumerStepId")))
+            .toList();
+        var extractRules = ((List<Map<String, Object>>) suiteDraftSummary.getOrDefault("extractRules", List.of())).stream()
+            .map(rule -> orderedMap(
+                "id", rule.get("ruleId"),
+                "stepId", rule.get("producerStepId"),
+                "type", rule.get("sourceType"),
+                "sourcePath", rule.get("sourcePath"),
+                "targetScope", rule.get("targetScope"),
+                "targetKey", rule.get("targetKey")
+            ))
+            .toList();
+        var variableReferences = ((List<Map<String, Object>>) suiteDraftSummary.getOrDefault("variableReferences", List.of())).stream()
+            .map(reference -> orderedMap(
+                "stepId", reference.get("consumerStepId"),
+                "expression", reference.get("referenceExpression"),
+                "producerStepId", reference.get("sourceDependencyId")
+            ))
+            .toList();
+        var auditSummary = objectMap(executionSummary.get("variableAuditSummary"));
+        var auditEvents = (List<Map<String, Object>>) auditSummary.getOrDefault("events", List.of());
+        var writes = auditEvents.stream()
+            .filter(event -> "PRODUCTION".equals(stringValue(event.get("eventType"))))
+            .map(event -> event.get("targetScope") + "." + event.get("targetKey"))
+            .distinct()
+            .toList();
+        var consumes = auditEvents.stream()
+            .filter(event -> "CONSUMPTION".equals(stringValue(event.get("eventType"))))
+            .map(event -> event.get("stepId") + ":" + event.get("expression"))
+            .distinct()
+            .toList();
+        var missingDiagnostics = ((List<Map<String, Object>>) executionSummary.getOrDefault("runtimeDiagnostics", List.of())).stream()
+            .map(diagnostic -> stringValue(diagnostic.get("code")))
+            .filter(code -> !code.isBlank())
+            .distinct()
+            .toList();
+        var failure = failureAnalysisSection.summary();
+        var memory = memoryFeedbackSection.summary();
+        var memoryTags = memory.get("tags") instanceof List<?> values && !values.isEmpty()
+            ? values
+            : List.of("v3", "suite", "memory-feedback", "not-learnable");
+        var memoryEvidence = List.of(
+            "classification=" + failure.get("classification"),
+            "rootStep=" + failure.get("rootStep"),
+            "status=" + memory.get("candidateStatus")
+        );
+        var sectionSources = orderedMap(
+            "generated-suite-draft", "REAL",
+            "execution-result", "REAL",
+            "variable-audit", "REAL",
+            "failure-analysis", "REAL",
+            "memory-feedback", memoryFeedbackSection.source().name(),
+            "evaluation-comparison", "REAL"
+        );
+        var expected = orderedMap(
+            "expectedDependencyPairs", dependencyPairs,
+            "expectedVariableWrites", writes,
+            "expectedVariableOverwrites", List.of(),
+            "expectedVariableConsumers", consumes,
+            "expectedMissingDiagnostics", missingDiagnostics,
+            "expectedFailureClassification", failure.get("classification"),
+            "expectedRootStep", failure.get("rootStep"),
+            "expectedAffectedDownstreamSteps", failure.getOrDefault("affectedDownstreamSteps", failure.getOrDefault("affectedSteps", List.of())),
+            "expectedNextSuggestionContains", failure.get("nextSuggestion"),
+            "expectedMemoryTags", memoryTags,
+            "expectedMemoryConfidenceMin", 0.0d,
+            "expectedMemoryEvidence", memoryEvidence,
+            "expectedHarnessSections", List.of(
+                "generated-suite-draft",
+                "execution-result",
+                "variable-audit",
+                "failure-analysis",
+                "memory-feedback",
+                "evaluation-comparison"
+            ),
+            "expectedHarnessRealSections", List.of(
+                "generated-suite-draft",
+                "execution-result",
+                "variable-audit",
+                "failure-analysis",
+                "memory-feedback",
+                "evaluation-comparison"
+            ),
+            "forbiddenSecrets", List.of("unredacted-fixture-secret")
+        );
+        expected.entrySet().removeIf(entry -> entry.getValue() == null);
+        var failureAnalysisSetup = orderedMap(
+            "classification", failure.get("classification"),
+            "rootStep", failure.get("rootStep"),
+            "affectedDownstreamSteps", failure.getOrDefault("affectedDownstreamSteps", failure.getOrDefault("affectedSteps", List.of())),
+            "nextSuggestion", failure.get("nextSuggestion")
+        );
+        failureAnalysisSetup.entrySet().removeIf(entry -> entry.getValue() == null);
+        var setup = orderedMap(
+            "suiteDraft", orderedMap(
+                "dependencyPairs", dependencyPairs,
+                "extractRules", extractRules,
+                "variableReferences", variableReferences
+            ),
+            "variableAudit", orderedMap(
+                "writes", writes,
+                "overwrites", List.of(),
+                "consumes", consumes,
+                "missingDiagnostics", missingDiagnostics
+            ),
+            "failureAnalysis", failureAnalysisSetup,
+            "memoryCandidate", orderedMap(
+                "sourceRef", stringValue(memory.get("sourceRef")).isBlank() ? "not-learnable:" + fixture.fixtureId() : memory.get("sourceRef"),
+                "tags", memoryTags,
+                "confidence", memory.getOrDefault("confidence", 0.0d),
+                "evidence", memoryEvidence,
+                "applicableWhen", "Reuse only when the same V3 suite failure classification and root step are present.",
+                "content", "Harness memory feedback candidate is redacted: Authorization=[REDACTED], token=[REDACTED], secret=[REDACTED]."
+            ),
+            "harness", orderedMap("sections", sectionSources),
+            "report", orderedMap(
+                "markdown", "Manual harness report redacts Authorization=[REDACTED], cookie=[REDACTED], secret=[REDACTED].",
+                "json", orderedMap("apiKey", "[REDACTED]", "token", "[REDACTED]")
             )
+        );
+        return new EvaluationDataset(
+            EvaluationDatasetRegistry.V3_SUITE_AGENT_DATASET,
+            "harness-current-run",
+            List.of(new GoldenTaskFixture(
+                "manual-suite-agent-" + fixture.fixtureId(),
+                List.of("v3", "suite", "manual-suite-agent", "evaluation-comparison"),
+                "Evaluate the current Manual Suite Agent harness run.",
+                EvaluationFixtureType.V3_SUITE_AGENT,
+                expected,
+                setup
+            )),
+            0.85d,
+            Map.of(
+                V3SuiteAgentCapabilityEvaluator.DEPENDENCY_COVERAGE_METRIC, 0.9d,
+                V3SuiteAgentCapabilityEvaluator.VARIABLE_AUDIT_METRIC, 0.9d,
+                V3SuiteAgentCapabilityEvaluator.FAILURE_ANALYSIS_METRIC, 0.9d,
+                V3SuiteAgentCapabilityEvaluator.MEMORY_CANDIDATE_METRIC, 0.9d,
+                V3SuiteAgentCapabilityEvaluator.HARNESS_COMPLETENESS_METRIC, 0.8d,
+                V3SuiteAgentCapabilityEvaluator.SECRET_REDACTION_METRIC, 1.0d
+            ),
+            Map.of(
+                V3SuiteAgentCapabilityEvaluator.DEPENDENCY_COVERAGE_METRIC, 1.8d,
+                V3SuiteAgentCapabilityEvaluator.VARIABLE_AUDIT_METRIC, 1.8d,
+                V3SuiteAgentCapabilityEvaluator.FAILURE_ANALYSIS_METRIC, 2.2d,
+                V3SuiteAgentCapabilityEvaluator.MEMORY_CANDIDATE_METRIC, 2.4d,
+                V3SuiteAgentCapabilityEvaluator.HARNESS_COMPLETENESS_METRIC, 1.0d,
+                V3SuiteAgentCapabilityEvaluator.SECRET_REDACTION_METRIC, 2.5d
+            ),
+            Map.of("manual-suite-agent-" + fixture.fixtureId(), 0.85d)
         );
     }
 
@@ -1795,6 +2019,20 @@ public class ManualSuiteAgentHarness {
             throw new UnsupportedOperationException(
                 "ManualSuiteAgent in-memory repository does not support " + method.getName()
             );
+        }
+    }
+
+    private static class HarnessEvaluationDatasetRegistry extends EvaluationDatasetRegistry {
+
+        private final EvaluationDataset dataset;
+
+        private HarnessEvaluationDatasetRegistry(EvaluationDataset dataset) {
+            this.dataset = dataset;
+        }
+
+        @Override
+        public EvaluationDataset load(String datasetName) {
+            return dataset;
         }
     }
 

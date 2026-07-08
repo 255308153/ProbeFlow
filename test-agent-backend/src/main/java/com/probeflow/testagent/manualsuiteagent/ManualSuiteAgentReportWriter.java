@@ -161,6 +161,9 @@ public class ManualSuiteAgentReportWriter {
             if ("memory-feedback".equals(section.sectionId())) {
                 appendMemoryFeedback(markdown, redactor.redactMap(section.summary()));
             }
+            if ("evaluation-comparison".equals(section.sectionId())) {
+                appendEvaluationComparison(markdown, redactor.redactMap(section.summary()));
+            }
         }
         markdown.append("\n");
 
@@ -299,6 +302,26 @@ public class ManualSuiteAgentReportWriter {
                 .append("\n");
         }
         appendRows(markdown, "Memory blockers", (List<Object>) summary.getOrDefault("blockers", List.of()), List.of());
+    }
+
+    @SuppressWarnings("unchecked")
+    private void appendEvaluationComparison(StringBuilder markdown, Map<String, Object> summary) {
+        markdown.append("  - Dataset: ")
+            .append(summary.get("dataset"))
+            .append(" / ")
+            .append(summary.get("datasetVersion"))
+            .append("\n");
+        markdown.append("  - Run status: ")
+            .append(summary.get("runStatus"))
+            .append(", score=")
+            .append(summary.get("overallScore"))
+            .append("\n");
+        markdown.append("  - Failed metrics: ")
+            .append(summary.getOrDefault("failedMetrics", List.of()))
+            .append("\n");
+        appendRows(markdown, "Recommended fixes", (List<Object>) summary.getOrDefault("recommendedFixes", List.of()), List.of());
+        appendRows(markdown, "Evaluation cases", (List<Object>) summary.getOrDefault("caseSummary", List.of()),
+            List.of("fixtureId", "status", "metricCount"));
     }
 
     @SuppressWarnings("unchecked")

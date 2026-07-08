@@ -110,8 +110,16 @@ class ManualSuiteAgentHarnessIssue07Tests {
             .containsEntry("affectedSteps", List.of())
             .containsEntry("nextSuggestion", "No failure follow-up is required.")
             .containsEntry("recoveryActionType", "NO_ACTION");
-        assertThat(section(result, "memory-feedback").source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
-        assertThat(section(result, "evaluation-comparison").source()).isEqualTo(ManualSuiteAgentSectionSource.NOT_RUN);
+        var memoryFeedback = section(result, "memory-feedback");
+        assertThat(memoryFeedback.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(memoryFeedback.status()).isEqualTo("REJECTED");
+        var evaluationComparison = section(result, "evaluation-comparison");
+        assertThat(evaluationComparison.source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(evaluationComparison.status()).isEqualTo("PASSED");
+        assertThat(evaluationComparison.summary())
+            .containsEntry("dataset", "v3-phase-6-suite-agent-capability")
+            .containsEntry("runStatus", "PASSED")
+            .containsEntry("overallScore", 1.0d);
         assertThat(jsonText).doesNotContain("PENDING_RUNTIME");
         assertThat(markdown).doesNotContain("PENDING_RUNTIME");
         assertThat(json.at("/sections/" + sectionIndex(json, "failure-analysis") + "/summary/suiteFailureAnalysis/classification").asText())
@@ -120,7 +128,14 @@ class ManualSuiteAgentHarnessIssue07Tests {
             .contains("failure-analysis (REAL, PASSED)")
             .contains("Classification: NONE")
             .contains("Root cause:")
-            .contains("No failure follow-up is required.");
+            .contains("No failure follow-up is required.")
+            .contains("evaluation-comparison (REAL, PASSED)")
+            .contains("Dataset: v3-phase-6-suite-agent-capability")
+            .contains("Run status: PASSED, score=1.0")
+            .contains("Failed metrics: []");
+        assertThat(json.at("/metadata/evaluationDataset").asText()).isEqualTo("v3-phase-6-suite-agent-capability");
+        assertThat(json.at("/metadata/evaluationRunStatus").asText()).isEqualTo("PASSED");
+        assertThat(json.at("/metadata/overallScore").asDouble()).isEqualTo(1.0d);
 
         assertNoSensitiveValues(jsonText);
         assertNoSensitiveValues(markdown);
