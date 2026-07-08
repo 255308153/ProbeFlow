@@ -434,6 +434,13 @@ public class AgentMemoryFeedbackApplicationService {
             summary.put("memoryId", refineryResult.memory().memoryId());
             summary.put("scopeType", refineryResult.memory().scopeType().name());
             summary.put("sourceType", refineryResult.memory().sourceType().name());
+            var memoryMetadata = refineryResult.memory().metadata();
+            copyIfPresent(summary, memoryMetadata, "factType");
+            copyIfPresent(summary, memoryMetadata, "factFingerprint");
+            copyIfPresent(summary, memoryMetadata, "qualityStatus");
+            copyIfPresent(summary, memoryMetadata, "evidenceCount");
+            copyIfPresent(summary, memoryMetadata, "mergeCount");
+            copyIfPresent(summary, memoryMetadata, "evidenceSummary");
         }
         record.setRefineryResultSummary(compact(summary));
         record.setRejectionReason(refineryResult.rejectionReason());
@@ -445,6 +452,12 @@ public class AgentMemoryFeedbackApplicationService {
         record.setStatus(refineryResult.created()
             ? MemoryCandidateProcessingStatus.ACCEPTED
             : MemoryCandidateProcessingStatus.MERGED);
+    }
+
+    private void copyIfPresent(Map<String, Object> target, Map<String, Object> source, String key) {
+        if (source.containsKey(key)) {
+            target.put(key, source.get(key));
+        }
     }
 
     private AgentMemoryCandidateIntakeRequest normalize(AgentMemoryCandidateIntakeRequest request) {
