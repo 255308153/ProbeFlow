@@ -3,6 +3,7 @@ package com.probeflow.testagent.memory;
 import com.probeflow.testagent.apispec.ApiSpec;
 import com.probeflow.testagent.apispec.ApiSpecRepository;
 import com.probeflow.testagent.knowledge.DocumentAuthority;
+import com.probeflow.testagent.knowledge.EmbeddingProfileMetadata;
 import com.probeflow.testagent.knowledge.KnowledgeContext;
 import com.probeflow.testagent.knowledge.KnowledgeContextEntry;
 import com.probeflow.testagent.knowledge.KnowledgeQuery;
@@ -250,6 +251,10 @@ public class UnifiedContextBuilder {
         LongTermMemoryRetrievalResult longTermMemory
     ) {
         var citations = new ArrayList<ContextCitation>();
+        var knowledgeHitsByChunkId = new LinkedHashMap<String, KnowledgeRetrievalHit>();
+        for (var hit : knowledge.hits()) {
+            knowledgeHitsByChunkId.putIfAbsent(hit.chunkId(), hit);
+        }
         for (var memory : sessionContext) {
             citations.add(new ContextCitation(
                 "session_memory",
@@ -274,7 +279,8 @@ public class UnifiedContextBuilder {
                 entry.chunkId(),
                 entry.sourceRef(),
                 null,
-                entry.score()
+                entry.score(),
+                knowledgeEvidence(entry, knowledgeHitsByChunkId.get(entry.chunkId()))
             ));
         }
         for (var hit : longTermMemory.hits()) {
@@ -283,10 +289,86 @@ public class UnifiedContextBuilder {
                 hit.memoryId(),
                 hit.sourceRef(),
                 asDouble(hit.confidence()),
-                hit.score()
+                hit.score(),
+                longTermMemoryEvidence(hit)
             ));
         }
         return List.copyOf(citations);
+    }
+
+    private Map<String, Object> knowledgeEvidence(KnowledgeContextEntry entry, KnowledgeRetrievalHit hit) {
+        var evidence = new LinkedHashMap<String, Object>();
+        putIfPresent(evidence, "documentId", entry.documentId());
+        putIfPresent(evidence, "documentRevisionId", entry.documentRevisionId());
+        putIfPresent(evidence, "evidenceType", entry.evidenceType());
+        evidence.put("lowConfidence", entry.lowConfidence());
+        var metadata = copyMetadata(entry.metadata());
+        if (!metadata.isEmpty()) {
+            evidence.put("metadata", metadata);
+            copySemanticEvidence(evidence, metadata);
+        }
+        var matchReasons = entry.matchReasons() == null ? List.<String>of() : List.copyOf(entry.matchReasons());
+        if (!matchReasons.isEmpty()) {
+            evidence.put("matchReasons", matchReasons);
+        }
+        if (hit != null && hit.componentScores() != null && !hit.componentScores().isEmpty()) {
+            evidence.put("componentScores", new LinkedHashMap<>(hit.componentScores()));
+        }
+        return evidence;
+    }
+
+    private Map<String, Object> longTermMemoryEvidence(LongTermMemoryRetrievalHit hit) {
+        var evidence = new LinkedHashMap<String, Object>();
+        evidence.put("memoryScopeType", hit.scopeType().name());
+        evidence.put("memorySourceType", hit.sourceType().name());
+        putIfPresent(evidence, "confidence", hit.confidence());
+        putIfPresent(evidence, "importance", hit.importance());
+        putIfPresent(evidence, "successContribution", hit.successContribution());
+        evidence.put("lowConfidence", hit.lowConfidence());
+        var metadata = copyMetadata(hit.metadata());
+        if (!metadata.isEmpty()) {
+            evidence.put("metadata", metadata);
+            copySemanticEvidence(evidence, metadata);
+        }
+        if (hit.componentScores() != null && !hit.componentScores().isEmpty()) {
+            evidence.put("componentScores", new LinkedHashMap<>(hit.componentScores()));
+        }
+        var matchReasons = hit.matchReasons() == null ? List.<String>of() : List.copyOf(hit.matchReasons());
+        if (!matchReasons.isEmpty()) {
+            evidence.put("matchReasons", matchReasons);
+        }
+        return evidence;
+    }
+
+    private Map<String, Object> copyMetadata(Map<String, Object> metadata) {
+        return metadata == null ? Map.of() : new LinkedHashMap<>(metadata);
+    }
+
+    private void copySemanticEvidence(Map<String, Object> evidence, Map<String, Object> metadata) {
+        copyMetadataValue(evidence, metadata, EmbeddingProfileMetadata.EMBEDDING_PROFILE);
+        copyMetadataValue(evidence, metadata, EmbeddingProfileMetadata.CURRENT_EMBEDDING_PROFILE);
+        copyMetadataValue(evidence, metadata, EmbeddingProfileMetadata.EMBEDDING_PROFILE_MISMATCH);
+        copyMetadataValue(evidence, metadata, EmbeddingProfileMetadata.REINDEX_REQUIRED);
+        copyMetadataValue(evidence, metadata, EmbeddingProfileMetadata.REINDEX_REASON);
+        copyMetadataValue(evidence, metadata, "retrievalChannel");
+        copyMetadataValue(evidence, metadata, "vectorDistance");
+        copyMetadataValue(evidence, metadata, "candidateRank");
+        copyMetadataValue(evidence, metadata, "lexicalScore");
+        copyMetadataValue(evidence, metadata, "metadataScore");
+        copyMetadataValue(evidence, metadata, "parentChunkId");
+        copyMetadataValue(evidence, metadata, "lowConfidenceReason");
+    }
+
+    private void copyMetadataValue(Map<String, Object> evidence, Map<String, Object> metadata, String key) {
+        if (metadata.containsKey(key)) {
+            evidence.put(key, metadata.get(key));
+        }
+    }
+
+    private void putIfPresent(Map<String, Object> values, String key, Object value) {
+        if (value != null) {
+            values.put(key, value);
+        }
     }
 
     private ContextBudget buildBudget(
