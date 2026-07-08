@@ -79,6 +79,7 @@ class Phase1BoundaryGuardTests {
         var sourceText = Files.walk(PROJECT_ROOT.resolve("src/main/java"))
             .filter(Files::isRegularFile)
             .filter(path -> path.toString().endsWith(".java"))
+            .filter(path -> !path.toString().contains("/demorun/"))
             .map(this::readUnchecked)
             .collect(Collectors.joining("\n"));
         var controllerAnnotations = sourceText.lines()

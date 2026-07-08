@@ -25,6 +25,7 @@ public record DemoRunResult(
     DemoRunSectionView failureAnalysis,
     DemoRunSectionView memoryFeedback,
     DemoRunSectionView evaluation,
+    DemoRunSectionView errors,
     List<DemoRunArtifactReference> artifacts,
     List<DemoRunDiagnosticView> diagnostics
 ) {

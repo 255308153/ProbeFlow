@@ -55,6 +55,7 @@ public class DemoRunApplicationService {
             mappedSection(harnessResult, "failure-analysis", "failure-analysis", "Failure Analysis"),
             mappedSection(harnessResult, "memory-feedback", "memory-feedback", "Memory Feedback"),
             mappedSection(harnessResult, "evaluation-comparison", "evaluation", "Evaluation"),
+            errorsSection(harnessResult),
             harnessResult.artifacts().stream().map(this::artifactView).toList(),
             harnessResult.diagnostics().stream().map(this::diagnosticView).toList()
         );
@@ -88,6 +89,9 @@ public class DemoRunApplicationService {
             result.usesRealProvider(),
             result.usesExternalHttp(),
             providerMode == DemoRunProviderMode.FAKE,
+            request.comparisonEnabled(),
+            request.allowMemoryWrite(),
+            request.outputFormats(),
             List.of(
                 "default demo run uses deterministic fake provider",
                 "default demo run does not require a real LLM key",
@@ -95,6 +99,44 @@ public class DemoRunApplicationService {
                 "default demo run uses fake HTTP gateway only"
             )
         );
+    }
+
+    private DemoRunSectionView errorsSection(ManualSuiteAgentRunResult result) {
+        var diagnostics = result.diagnostics().stream()
+            .map(diagnostic -> orderedMap(
+                "code", diagnostic.code(),
+                "category", diagnosticCategory(diagnostic.code()),
+                "severity", diagnostic.severity(),
+                "message", diagnostic.message(),
+                "metadata", sanitized(diagnostic.metadata())
+            ))
+            .toList();
+        return new DemoRunSectionView(
+            "errors",
+            "Errors",
+            DemoRunSectionSource.APPLICATION,
+            diagnostics.isEmpty() ? "NONE" : result.status().name(),
+            orderedMap(
+                "hasErrors", !diagnostics.isEmpty(),
+                "diagnostics", diagnostics
+            )
+        );
+    }
+
+    private String diagnosticCategory(String code) {
+        if (code == null || code.isBlank()) {
+            return "SYSTEM";
+        }
+        if (code.contains("FIXTURE")) {
+            return "FIXTURE";
+        }
+        if (code.contains("PROVIDER") || code.contains("LLM")) {
+            return "CONFIGURATION";
+        }
+        if (code.contains("POLICY")) {
+            return "POLICY";
+        }
+        return "SYSTEM";
     }
 
     private DemoRunSectionView planSection(ManualSuiteAgentRunResult result) {
@@ -106,7 +148,7 @@ public class DemoRunApplicationService {
             "providerMode", result.providerMode().name(),
             "fixtureId", result.fixtureId(),
             "runProfile", result.runProfile(),
-            "businessFlowDiscovery", discovery == null ? Map.of() : discovery.summary()
+            "businessFlowDiscovery", discovery == null ? Map.of() : sanitized(discovery.summary())
         );
         return new DemoRunSectionView("plan", "Plan", DemoRunSectionSource.APPLICATION, status(summary), summary);
     }
@@ -174,7 +216,7 @@ public class DemoRunApplicationService {
             "contextType", contextType,
             "sourceSectionId", section == null ? null : section.sectionId(),
             "status", section == null ? "NOT_RUN" : section.status(),
-            "summary", section == null ? Map.of() : section.summary()
+            "summary", section == null ? Map.of() : sanitized(section.summary())
         );
     }
 
@@ -211,7 +253,7 @@ public class DemoRunApplicationService {
             orderedMap(
                 "sourceSectionId", section.sectionId(),
                 "sourceTitle", section.title(),
-                "summary", section.summary()
+                "summary", sanitized(section.summary())
             )
         );
     }
@@ -256,7 +298,7 @@ public class DemoRunApplicationService {
             artifact.artifactType(),
             artifact.path(),
             artifact.mediaType(),
-            artifact.metadata()
+            sanitizedMap(artifact.metadata())
         );
     }
 
@@ -265,8 +307,53 @@ public class DemoRunApplicationService {
             diagnostic.code(),
             diagnostic.severity(),
             diagnostic.message(),
-            diagnostic.metadata()
+            sanitizedMap(diagnostic.metadata())
         );
+    }
+
+    private Object sanitized(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            var sanitized = new LinkedHashMap<String, Object>();
+            map.forEach((key, child) -> {
+                var keyText = String.valueOf(key);
+                sanitized.put(keyText, sensitiveKey(keyText) ? "[REDACTED]" : sanitized(child));
+            });
+            return sanitized;
+        }
+        if (value instanceof Iterable<?> values) {
+            var sanitized = new java.util.ArrayList<Object>();
+            values.forEach(child -> sanitized.add(sanitized(child)));
+            return sanitized;
+        }
+        if (value instanceof String text && sensitiveValue(text)) {
+            return "[REDACTED]";
+        }
+        return value;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> sanitizedMap(Map<String, Object> map) {
+        return (Map<String, Object>) sanitized(map == null ? Map.of() : map);
+    }
+
+    private boolean sensitiveKey(String key) {
+        var normalized = key.toLowerCase();
+        return normalized.contains("authorization")
+            || normalized.contains("token")
+            || normalized.contains("secret")
+            || normalized.contains("apikey")
+            || normalized.contains("api_key")
+            || normalized.contains("modelkey");
+    }
+
+    private boolean sensitiveValue(String value) {
+        var normalized = value.toLowerCase();
+        return normalized.contains("unredacted-fixture-secret")
+            || normalized.contains("authorization: bearer")
+            || normalized.contains("api_key=")
+            || normalized.contains("apikey=")
+            || normalized.startsWith("sk-")
+            || normalized.contains(" sk-");
     }
 
     private String status(Map<String, Object> summary) {

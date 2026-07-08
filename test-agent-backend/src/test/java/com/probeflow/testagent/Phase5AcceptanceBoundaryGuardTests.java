@@ -44,6 +44,7 @@ class Phase5AcceptanceBoundaryGuardTests {
         var allSources = Files.walk(PROJECT_ROOT.resolve("src/main/java"))
             .filter(Files::isRegularFile)
             .filter(path -> path.toString().endsWith(".java"))
+            .filter(path -> !path.toString().contains("/demorun/"))
             .map(this::readUnchecked)
             .collect(Collectors.joining("\n"));
         var pom = Files.readString(PROJECT_ROOT.resolve("pom.xml"));

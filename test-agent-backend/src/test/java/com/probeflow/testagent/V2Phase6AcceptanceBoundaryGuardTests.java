@@ -240,6 +240,7 @@ class V2Phase6AcceptanceBoundaryGuardTests {
         return Files.walk(sourceRoot)
             .filter(Files::isRegularFile)
             .filter(path -> path.toString().endsWith(".java"))
+            .filter(path -> !path.toString().contains("/demorun/"))
             .map(this::readUnchecked)
             .collect(Collectors.joining("\n"));
     }

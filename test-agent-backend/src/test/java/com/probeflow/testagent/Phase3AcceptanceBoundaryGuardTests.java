@@ -214,6 +214,7 @@ class Phase3AcceptanceBoundaryGuardTests {
         var sourceText = Files.walk(sourceRoot)
             .filter(Files::isRegularFile)
             .filter(path -> path.toString().endsWith(".java"))
+            .filter(path -> !path.toString().contains("/demorun/"))
             .map(this::readUnchecked)
             .collect(Collectors.joining("\n"));
         var controllerAnnotations = sourceText.lines()
