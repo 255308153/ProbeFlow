@@ -155,17 +155,19 @@ public class KnowledgeIngestApplicationService {
     private void persistChunks(String documentId, String revisionId, KnowledgeIngestRequest request) {
         var generatedChunks = chunkingService.chunk(documentId, revisionId, request);
         validateEmbeddingDimension("provider", embeddingService.dimensions());
+        var profile = embeddingService.profile();
         for (var chunk : generatedChunks) {
-            chunk.setEmbedding(embedDocumentChunk(chunk));
+            chunk.setEmbedding(embedDocumentChunk(chunk, profile));
+            chunk.setMetadata(EmbeddingProfileMetadata.withProfile(chunk.getMetadata(), profile));
         }
         chunks.saveAll(generatedChunks);
     }
 
-    private float[] embedDocumentChunk(KnowledgeChunk chunk) {
+    private float[] embedDocumentChunk(KnowledgeChunk chunk, EmbeddingProfile profile) {
         var embedding = embeddingService.embedDocument(chunk.getChunkContent());
         return EmbeddingValidation.requireVector(
             "document",
-            embeddingService.profile(),
+            profile,
             embedding,
             embeddingDimension
         );

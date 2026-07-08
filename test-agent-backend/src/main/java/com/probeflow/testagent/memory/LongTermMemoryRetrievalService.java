@@ -1,6 +1,7 @@
 package com.probeflow.testagent.memory;
 
 import com.probeflow.testagent.knowledge.EmbeddingService;
+import com.probeflow.testagent.knowledge.EmbeddingProfileMetadata;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -75,7 +76,9 @@ public class LongTermMemoryRetrievalService {
     ) {
         var structure = structureScore(memory, query);
         var tag = tagScore(memory, query);
-        var vector = semanticScore(memory, query, queryEmbedding);
+        var metadata = EmbeddingProfileMetadata.withReindexStatus(memory.getMetadata(), embeddingService.profile());
+        var profileCompatible = EmbeddingProfileMetadata.isCompatible(metadata, embeddingService.profile());
+        var vector = profileCompatible ? semanticScore(memory, query, queryEmbedding) : 0.0d;
         var importance = memory.getImportance();
         var confidence = memory.getConfidence();
         var success = memory.getSuccessContribution();
@@ -89,6 +92,7 @@ public class LongTermMemoryRetrievalService {
         addReason(reasons, tag >= 0.5d, "tag-match");
         addReason(reasons, vector >= 0.45d, "semantic-match");
         addReason(reasons, stageFit >= 0.9d, "stage-fit");
+        addReason(reasons, !profileCompatible, "reindex-required");
 
         return new LongTermMemoryRetrievalHit(
             memory.getMemoryId(),
@@ -104,12 +108,12 @@ public class LongTermMemoryRetrievalService {
             memory.getSuccessContribution(),
             memory.getHitCount(),
             memory.getLastUsedAt(),
-            new LinkedHashMap<>(memory.getMetadata()),
+            metadata,
             estimateTokens(memory),
             score,
             weighted,
             reasons,
-            score < 0.35d
+            !profileCompatible || score < 0.35d
         );
     }
 

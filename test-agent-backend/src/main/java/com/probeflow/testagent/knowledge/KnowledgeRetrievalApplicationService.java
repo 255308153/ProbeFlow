@@ -170,7 +170,7 @@ public class KnowledgeRetrievalApplicationService {
             document.getBizEntity(),
             List.copyOf(chunk.getTags()),
             List.copyOf(chunk.getApplicableStages()),
-            new LinkedHashMap<>(chunk.getMetadata()),
+            EmbeddingProfileMetadata.withReindexStatus(chunk.getMetadata(), embeddingService.profile()),
             chunk.getTokenCount(),
             0.0d,
             Map.of(),
@@ -208,7 +208,10 @@ public class KnowledgeRetrievalApplicationService {
         long oldestTimestamp
     ) {
         var keyword = keywordEvidence(hit, query);
-        var vector = Math.max(0.0d, cosineSimilarity(queryEmbedding, loadChunkEmbedding(hit)));
+        var profileCompatible = EmbeddingProfileMetadata.isCompatible(hit.metadata(), embeddingService.profile());
+        var vector = profileCompatible
+            ? Math.max(0.0d, cosineSimilarity(queryEmbedding, loadChunkEmbedding(hit)))
+            : 0.0d;
         var structure = structureScore(hit, query);
         var authority = authorityScore(hit.authority());
         var freshness = freshnessScore(hit.documentId(), newestTimestamp, oldestTimestamp);
@@ -228,6 +231,7 @@ public class KnowledgeRetrievalApplicationService {
         addReasonWhen(reasons, authority >= 1.0d, "high-authority");
         addReasonWhen(reasons, stageFit >= 1.0d, "stage-fit");
         addReasonWhen(reasons, vector >= 0.7d, "semantic-match");
+        addReasonWhen(reasons, !profileCompatible, "reindex-required");
 
         return new KnowledgeRetrievalHit(
             hit.chunkId(),
@@ -248,7 +252,7 @@ public class KnowledgeRetrievalApplicationService {
             finalScore,
             weightedScores,
             reasons,
-            finalScore < 0.30d || (keyword.score() < 0.20d && vector < 0.45d)
+            !profileCompatible || finalScore < 0.30d || (keyword.score() < 0.20d && vector < 0.45d)
         );
     }
 

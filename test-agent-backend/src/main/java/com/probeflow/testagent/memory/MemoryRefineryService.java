@@ -1,6 +1,8 @@
 package com.probeflow.testagent.memory;
 
 import com.probeflow.testagent.knowledge.EmbeddingService;
+import com.probeflow.testagent.knowledge.EmbeddingProfileMetadata;
+import com.probeflow.testagent.knowledge.EmbeddingValidation;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -14,6 +16,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -27,10 +31,21 @@ public class MemoryRefineryService {
 
     private final LongTermMemoryRepository longTermMemories;
     private final EmbeddingService embeddingService;
+    private final int embeddingDimension;
 
     public MemoryRefineryService(LongTermMemoryRepository longTermMemories, EmbeddingService embeddingService) {
+        this(longTermMemories, embeddingService, embeddingService == null ? 1024 : embeddingService.dimensions());
+    }
+
+    @Autowired
+    public MemoryRefineryService(
+        LongTermMemoryRepository longTermMemories,
+        EmbeddingService embeddingService,
+        @Value("${probeflow.embedding.dimension:1024}") int embeddingDimension
+    ) {
         this.longTermMemories = longTermMemories;
         this.embeddingService = embeddingService;
+        this.embeddingDimension = embeddingDimension;
     }
 
     @Transactional
@@ -86,8 +101,7 @@ public class MemoryRefineryService {
         memory.setHitCount(0);
         memory.setSuccessContribution(successContribution);
         memory.setStatus(MemoryStatus.ACTIVE);
-        memory.setMetadata(metadata);
-        memory.setEmbedding(embeddingService.embedDocument(summary + "\n" + content));
+        writeEmbedding(memory, metadata);
 
         var saved = longTermMemories.save(memory);
         return new MemoryRefineryResult(true, true, false, null, toView(saved));
@@ -199,9 +213,15 @@ public class MemoryRefineryService {
         existing.setImportance(reinforcedImportance(existing, request, tags, metadata, importance));
         existing.setSuccessContribution(reinforcedSuccessContribution(existing, request, tags, metadata, successContribution));
         existing.setHitCount(existing.getHitCount() + 1);
-        existing.setMetadata(mergeMetadata(existing, metadata, request));
-        existing.setEmbedding(embeddingService.embedDocument(existing.getSummary() + "\n" + existing.getContent()));
+        writeEmbedding(existing, mergeMetadata(existing, metadata, request));
         return longTermMemories.save(existing);
+    }
+
+    private void writeEmbedding(LongTermMemory memory, Map<String, Object> metadata) {
+        var profile = embeddingService.profile();
+        var embedding = embeddingService.embedDocument(memory.getSummary() + "\n" + memory.getContent());
+        memory.setEmbedding(EmbeddingValidation.requireVector("document", profile, embedding, embeddingDimension));
+        memory.setMetadata(EmbeddingProfileMetadata.withProfile(metadata, profile));
     }
 
     private boolean isSimilarCandidate(
