@@ -33,13 +33,15 @@ public class MemoryRefineryService {
     private final EmbeddingService embeddingService;
     private final int embeddingDimension;
     private final MemoryFactExtractor factExtractor;
+    private final MemoryFactQualityGate qualityGate;
 
     public MemoryRefineryService(LongTermMemoryRepository longTermMemories, EmbeddingService embeddingService) {
         this(
             longTermMemories,
             embeddingService,
             embeddingService == null ? 1024 : embeddingService.dimensions(),
-            new DeterministicMemoryFactExtractor()
+            new DeterministicMemoryFactExtractor(),
+            new MemoryFactQualityGate()
         );
     }
 
@@ -48,12 +50,14 @@ public class MemoryRefineryService {
         LongTermMemoryRepository longTermMemories,
         EmbeddingService embeddingService,
         @Value("${probeflow.embedding.dimension:1024}") int embeddingDimension,
-        MemoryFactExtractor factExtractor
+        MemoryFactExtractor factExtractor,
+        MemoryFactQualityGate qualityGate
     ) {
         this.longTermMemories = longTermMemories;
         this.embeddingService = embeddingService;
         this.embeddingDimension = embeddingDimension;
         this.factExtractor = factExtractor == null ? new DeterministicMemoryFactExtractor() : factExtractor;
+        this.qualityGate = qualityGate == null ? new MemoryFactQualityGate() : qualityGate;
     }
 
     @Transactional
@@ -66,6 +70,10 @@ public class MemoryRefineryService {
         }
 
         var fact = factExtractor.extract(normalized);
+        var qualityDecision = qualityGate.evaluate(normalized, fact);
+        if (!qualityDecision.isAccepted()) {
+            return new MemoryRefineryResult(false, false, false, qualityDecision.rejectionReason(), null);
+        }
         var scopeType = scopeType(fact.factType());
         var summary = fact.summary();
         var content = fact.content();
