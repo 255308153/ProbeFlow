@@ -48,6 +48,7 @@ class Phase1BoundaryGuardTests {
             "businessflowdiscovery",
             "changelog",
             "controlledplanner",
+            "demorun",
             "executionrecord",
             "failureanalysis",
             "humanintheloop",

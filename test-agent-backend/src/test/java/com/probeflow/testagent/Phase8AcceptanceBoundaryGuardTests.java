@@ -16,6 +16,7 @@ class Phase8AcceptanceBoundaryGuardTests {
         "/agentmemoryfeedback/",
         "/agentevaluation/",
         "/manualsuiteagent/",
+        "/demorun/",
         "/orchestration/"
     );
 

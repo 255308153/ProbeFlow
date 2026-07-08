@@ -15,7 +15,8 @@ class Phase9AcceptanceBoundaryGuardTests {
     private static final List<String> POST_PHASE9_PACKAGES = List.of(
         "/agentmemoryfeedback/",
         "/agentevaluation/",
-        "/manualsuiteagent/"
+        "/manualsuiteagent/",
+        "/demorun/"
     );
 
     @Test

@@ -28,6 +28,7 @@ class V2Phase2AcceptanceBoundaryGuardTests {
         "/agentmemoryfeedback/",
         "/agentevaluation/",
         "/manualsuiteagent/",
+        "/demorun/",
         "/orchestration/",
         "/report/"
     );

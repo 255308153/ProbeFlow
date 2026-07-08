@@ -309,6 +309,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             "ApiAnalysisApplicationService",
             "BusinessFlowDiscoveryService",
             "ControlledPlannerService",
+            "DemoRunApplicationService",
             "EmbeddingService",
             "ExecutableRequestBuilder",
             "FailureAnalysisApplicationService",

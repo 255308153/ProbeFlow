@@ -1,0 +1,284 @@
+package com.probeflow.testagent.demorun;
+
+import com.probeflow.testagent.manualsuiteagent.ManualSuiteAgentArtifactReference;
+import com.probeflow.testagent.manualsuiteagent.ManualSuiteAgentDiagnostic;
+import com.probeflow.testagent.manualsuiteagent.ManualSuiteAgentHarness;
+import com.probeflow.testagent.manualsuiteagent.ManualSuiteAgentProviderMode;
+import com.probeflow.testagent.manualsuiteagent.ManualSuiteAgentRunRequest;
+import com.probeflow.testagent.manualsuiteagent.ManualSuiteAgentRunResult;
+import com.probeflow.testagent.manualsuiteagent.ManualSuiteAgentRunStatus;
+import com.probeflow.testagent.manualsuiteagent.ManualSuiteAgentSectionSource;
+import com.probeflow.testagent.manualsuiteagent.ManualSuiteAgentSectionSummary;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import org.springframework.stereotype.Service;
+
+@Service
+public class DemoRunApplicationService {
+
+    private final ManualSuiteAgentHarness harness;
+
+    public DemoRunApplicationService() {
+        this(ManualSuiteAgentHarness.defaults());
+    }
+
+    public DemoRunApplicationService(ManualSuiteAgentHarness harness) {
+        this.harness = harness == null ? ManualSuiteAgentHarness.defaults() : harness;
+    }
+
+    public DemoRunResult run(DemoRunRequest request) {
+        var effectiveRequest = request == null
+            ? new DemoRunRequest(null, null, null, null)
+            : request;
+        var harnessResult = harness.run(toHarnessRequest(effectiveRequest));
+        var providerMode = toDemoProviderMode(harnessResult.providerMode());
+        return new DemoRunResult(
+            DemoRunResult.SCHEMA_VERSION,
+            harnessResult.runId(),
+            harnessResult.fixtureId(),
+            harnessResult.fixtureVersion(),
+            providerMode,
+            toDemoStatus(harnessResult.status()),
+            harnessResult.startedAt(),
+            harnessResult.completedAt(),
+            harnessResult.runProfile(),
+            harnessResult.usesRealProvider(),
+            harnessResult.usesExternalHttp(),
+            providerSummary(effectiveRequest, harnessResult, providerMode),
+            planSection(harnessResult),
+            contextSection(harnessResult),
+            toolsSection(harnessResult),
+            mappedSection(harnessResult, "generated-suite-draft", "suite", "Suite Draft"),
+            mappedSection(harnessResult, "execution-result", "execution", "Execution"),
+            mappedSection(harnessResult, "variable-audit", "variable-audit", "Variable Audit"),
+            mappedSection(harnessResult, "failure-analysis", "failure-analysis", "Failure Analysis"),
+            mappedSection(harnessResult, "memory-feedback", "memory-feedback", "Memory Feedback"),
+            mappedSection(harnessResult, "evaluation-comparison", "evaluation", "Evaluation"),
+            harnessResult.artifacts().stream().map(this::artifactView).toList(),
+            harnessResult.diagnostics().stream().map(this::diagnosticView).toList()
+        );
+    }
+
+    private ManualSuiteAgentRunRequest toHarnessRequest(DemoRunRequest request) {
+        var harnessProviderMode = request.providerMode() == DemoRunProviderMode.REAL
+            ? ManualSuiteAgentProviderMode.MANUAL_REAL_LLM
+            : ManualSuiteAgentProviderMode.DETERMINISTIC_FAKE;
+        return new ManualSuiteAgentRunRequest(
+            request.fixtureId(),
+            harnessProviderMode,
+            request.outputDirectory(),
+            false,
+            false,
+            request.runProfile(),
+            request.providerMode().name()
+        );
+    }
+
+    private DemoRunProviderSummary providerSummary(
+        DemoRunRequest request,
+        ManualSuiteAgentRunResult result,
+        DemoRunProviderMode providerMode
+    ) {
+        return new DemoRunProviderSummary(
+            providerMode,
+            result.providerMode().name(),
+            request.providerMode().name(),
+            result.runProfile(),
+            result.usesRealProvider(),
+            result.usesExternalHttp(),
+            providerMode == DemoRunProviderMode.FAKE,
+            List.of(
+                "default demo run uses deterministic fake provider",
+                "default demo run does not require a real LLM key",
+                "default demo run does not require real embedding",
+                "default demo run uses fake HTTP gateway only"
+            )
+        );
+    }
+
+    private DemoRunSectionView planSection(ManualSuiteAgentRunResult result) {
+        var discovery = section(result, "business-flow-discovery");
+        var summary = orderedMap(
+            "planner", "Manual Suite Agent Harness",
+            "sourceSectionId", discovery == null ? null : discovery.sectionId(),
+            "status", discovery == null ? result.status().name() : discovery.status(),
+            "providerMode", result.providerMode().name(),
+            "fixtureId", result.fixtureId(),
+            "runProfile", result.runProfile(),
+            "businessFlowDiscovery", discovery == null ? Map.of() : discovery.summary()
+        );
+        return new DemoRunSectionView("plan", "Plan", DemoRunSectionSource.APPLICATION, status(summary), summary);
+    }
+
+    private DemoRunSectionView contextSection(ManualSuiteAgentRunResult result) {
+        var taskContext = section(result, "task-context");
+        var apiSpecInput = section(result, "api-spec-input");
+        var variableAudit = section(result, "variable-audit");
+        var contextSources = List.of(
+            contextSource("TASK_MEMORY", taskContext),
+            contextSource("API_CONTEXT", apiSpecInput),
+            contextSource("RUNTIME_CONTEXT", variableAudit),
+            orderedMap(
+                "contextType", "KNOWLEDGE_RAG",
+                "sourceSectionId", "business-flow-discovery",
+                "status", sectionStatus(result, "business-flow-discovery"),
+                "note", "Fixture-backed knowledge context from the existing Manual Suite Agent Harness."
+            ),
+            orderedMap(
+                "contextType", "LONG_TERM_MEMORY",
+                "sourceSectionId", "business-flow-discovery",
+                "status", sectionStatus(result, "business-flow-discovery"),
+                "note", "Fixture-backed long-term memory context from the existing Manual Suite Agent Harness."
+            )
+        );
+        return new DemoRunSectionView(
+            "context",
+            "Context",
+            DemoRunSectionSource.APPLICATION,
+            "READY",
+            orderedMap(
+                "builder", "V4 demo view model over existing Manual Suite Agent Harness context",
+                "usesRealEmbedding", false,
+                "contextSources", contextSources
+            )
+        );
+    }
+
+    private DemoRunSectionView toolsSection(ManualSuiteAgentRunResult result) {
+        var toolCalls = List.of(
+            toolCall(result, "business-flow-discovery", "BusinessFlowDiscoveryService.discover"),
+            toolCall(result, "generated-suite-draft", "SuiteDraftGenerationService.generate"),
+            toolCall(result, "execution-result", "ExecutionContext + fake HTTP gateway"),
+            toolCall(result, "variable-audit", "ExecutionContext variable audit"),
+            toolCall(result, "failure-analysis", "Suite failure analysis"),
+            toolCall(result, "memory-feedback", "AgentMemoryFeedbackApplicationService"),
+            toolCall(result, "evaluation-comparison", "AgentEvaluationApplicationService")
+        );
+        return new DemoRunSectionView(
+            "tools",
+            "Tools",
+            DemoRunSectionSource.APPLICATION,
+            "READY",
+            orderedMap(
+                "orchestrator", "Manual Suite Agent Harness",
+                "reusedExistingHarness", true,
+                "usesExternalHttp", result.usesExternalHttp(),
+                "toolCalls", toolCalls
+            )
+        );
+    }
+
+    private Map<String, Object> contextSource(String contextType, ManualSuiteAgentSectionSummary section) {
+        return orderedMap(
+            "contextType", contextType,
+            "sourceSectionId", section == null ? null : section.sectionId(),
+            "status", section == null ? "NOT_RUN" : section.status(),
+            "summary", section == null ? Map.of() : section.summary()
+        );
+    }
+
+    private Map<String, Object> toolCall(
+        ManualSuiteAgentRunResult result,
+        String sourceSectionId,
+        String toolName
+    ) {
+        var section = section(result, sourceSectionId);
+        return orderedMap(
+            "toolName", toolName,
+            "sourceSectionId", sourceSectionId,
+            "status", section == null ? "NOT_RUN" : section.status(),
+            "source", section == null ? DemoRunSectionSource.NOT_RUN.name() : toDemoSource(section.source()).name(),
+            "usesExternalHttp", result.usesExternalHttp()
+        );
+    }
+
+    private DemoRunSectionView mappedSection(
+        ManualSuiteAgentRunResult result,
+        String harnessSectionId,
+        String demoSectionId,
+        String title
+    ) {
+        var section = section(result, harnessSectionId);
+        if (section == null) {
+            return DemoRunSectionView.notRun(demoSectionId, title);
+        }
+        return new DemoRunSectionView(
+            demoSectionId,
+            title,
+            toDemoSource(section.source()),
+            section.status(),
+            orderedMap(
+                "sourceSectionId", section.sectionId(),
+                "sourceTitle", section.title(),
+                "summary", section.summary()
+            )
+        );
+    }
+
+    private ManualSuiteAgentSectionSummary section(ManualSuiteAgentRunResult result, String sectionId) {
+        return result.sections().stream()
+            .filter(section -> section.sectionId().equals(sectionId))
+            .findFirst()
+            .orElse(null);
+    }
+
+    private String sectionStatus(ManualSuiteAgentRunResult result, String sectionId) {
+        var found = section(result, sectionId);
+        return found == null ? "NOT_RUN" : found.status();
+    }
+
+    private DemoRunProviderMode toDemoProviderMode(ManualSuiteAgentProviderMode providerMode) {
+        return providerMode == ManualSuiteAgentProviderMode.MANUAL_REAL_LLM
+            ? DemoRunProviderMode.REAL
+            : DemoRunProviderMode.FAKE;
+    }
+
+    private DemoRunStatus toDemoStatus(ManualSuiteAgentRunStatus status) {
+        return switch (status) {
+            case COMPLETED -> DemoRunStatus.COMPLETED;
+            case BLOCKED -> DemoRunStatus.REJECTED;
+            case FAILED -> DemoRunStatus.FAILED;
+        };
+    }
+
+    private DemoRunSectionSource toDemoSource(ManualSuiteAgentSectionSource source) {
+        return switch (source) {
+            case REAL -> DemoRunSectionSource.REAL_APPLICATION;
+            case FIXTURE -> DemoRunSectionSource.FIXTURE;
+            case STAGED -> DemoRunSectionSource.APPLICATION;
+            case PENDING_RUNTIME, NOT_RUN -> DemoRunSectionSource.NOT_RUN;
+        };
+    }
+
+    private DemoRunArtifactReference artifactView(ManualSuiteAgentArtifactReference artifact) {
+        return new DemoRunArtifactReference(
+            artifact.artifactType(),
+            artifact.path(),
+            artifact.mediaType(),
+            artifact.metadata()
+        );
+    }
+
+    private DemoRunDiagnosticView diagnosticView(ManualSuiteAgentDiagnostic diagnostic) {
+        return new DemoRunDiagnosticView(
+            diagnostic.code(),
+            diagnostic.severity(),
+            diagnostic.message(),
+            diagnostic.metadata()
+        );
+    }
+
+    private String status(Map<String, Object> summary) {
+        var status = summary.get("status");
+        return status == null ? "READY" : status.toString();
+    }
+
+    private Map<String, Object> orderedMap(Object... values) {
+        var map = new LinkedHashMap<String, Object>();
+        for (var index = 0; index < values.length; index += 2) {
+            map.put(values[index].toString(), values[index + 1]);
+        }
+        return map;
+    }
+}
