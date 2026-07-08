@@ -2,6 +2,11 @@ package com.probeflow.testagent.agentmemoryfeedback;
 
 import com.probeflow.testagent.agentpolicy.ToolRiskLevel;
 import com.probeflow.testagent.controlledplanner.PlanDecision;
+import com.probeflow.testagent.failureanalysis.FailureClassification;
+import com.probeflow.testagent.failureanalysis.SuiteDependencyFailure;
+import com.probeflow.testagent.failureanalysis.SuiteFailureAnalysis;
+import com.probeflow.testagent.failureanalysis.SuiteFailureStep;
+import com.probeflow.testagent.failureanalysis.SuiteVariableFailure;
 import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskRepository;
 import com.probeflow.testagent.task.TaskStatus;
@@ -22,6 +27,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -196,6 +202,51 @@ public class AgentMemoryFeedbackApplicationService {
             sanitizedCandidate.rawEvidence(),
             metadata
         ));
+    }
+
+    @Transactional
+    public AgentMemoryFeedbackResult refineSuiteFailureAnalysisCandidate(SuiteFailureMemoryFeedbackRequest request) {
+        var blockers = validateSuiteFailureRequest(request);
+        if (!blockers.isEmpty()) {
+            return AgentMemoryFeedbackResult.rejected(
+                "invalid-suite-failure-analysis-candidate",
+                blockers,
+                Map.of("blockers", blockers, "writesLongTermMemory", false, "refineryInvoked", false)
+            );
+        }
+
+        var analysis = request.suiteFailureAnalysis();
+        if (analysis.classification() == FailureClassification.NONE
+            || analysis.classification() == FailureClassification.SKIPPED) {
+            return AgentMemoryFeedbackResult.rejected(
+                "suite-failure-not-learnable",
+                List.of("Suite failure analysis has no learnable failure classification"),
+                Map.of(
+                    "taskId", request.taskId(),
+                    "executionId", request.executionId(),
+                    "classification", analysis.classification().name(),
+                    "writesLongTermMemory", false,
+                    "refineryInvoked", false
+                )
+            );
+        }
+
+        var candidate = suiteFailureCandidate(request);
+        var intake = new AgentMemoryCandidateIntakeRequest(
+            AgentMemoryCandidateSourceType.FAILURE_ANALYSIS,
+            candidate.sourceRef(),
+            candidate.taskId(),
+            candidate.summary(),
+            candidate.content(),
+            candidate.rawEvidence(),
+            candidate.tags(),
+            candidate.confidence(),
+            candidate.metadata()
+        );
+        if (request.requiresHumanReview() || highRiskSuiteRecovery(request) || candidate.confidence() < 0.55f) {
+            return submitCandidate(intake);
+        }
+        return submitAndRefine(intake, candidate);
     }
 
     @Transactional
@@ -523,6 +574,296 @@ public class AgentMemoryFeedbackApplicationService {
         metadata.put("candidateSourceType", candidateSourceType.name());
         metadata.put("writesLongTermMemory", true);
         return compact(metadata);
+    }
+
+    private MemoryCandidateRequest suiteFailureCandidate(SuiteFailureMemoryFeedbackRequest request) {
+        var analysis = request.suiteFailureAnalysis();
+        var classification = analysis.classification();
+        var sourceRef = suiteFailureSourceRef(request);
+        var tags = suiteFailureTags(analysis);
+        var metadata = suiteFailureMetadata(request, sourceRef);
+        return new MemoryCandidateRequest(
+            suiteFailureSummary(request, analysis),
+            suiteFailureContent(request, analysis),
+            MemorySourceType.EXECUTION_RESULT,
+            sourceRef,
+            request.taskId().trim(),
+            tags,
+            request.confidence(),
+            suiteFailureEvidence(request, analysis),
+            metadata
+        );
+    }
+
+    private List<String> validateSuiteFailureRequest(SuiteFailureMemoryFeedbackRequest request) {
+        var blockers = new ArrayList<String>();
+        if (request == null) {
+            return List.of("request is required");
+        }
+        if (!StringUtils.hasText(request.taskId())) {
+            blockers.add("taskId is required");
+        }
+        if (!StringUtils.hasText(request.executionId())) {
+            blockers.add("executionId is required");
+        }
+        if (request.suiteFailureAnalysis() == null) {
+            blockers.add("suiteFailureAnalysis is required");
+        } else {
+            if (request.suiteFailureAnalysis().classification() == null) {
+                blockers.add("failureClassification is required");
+            }
+            if (request.suiteFailureAnalysis().rootCauseStep() == null) {
+                blockers.add("root cause step evidence is required");
+            }
+            if (request.suiteFailureAnalysis().variableFailure() == null
+                && request.suiteFailureAnalysis().dependencyFailure() == null
+                && request.evidence().isEmpty()) {
+                blockers.add("suite failure evidence is required");
+            }
+        }
+        if (!StringUtils.hasText(request.nextSuggestion())) {
+            blockers.add("nextSuggestion is required");
+        }
+        if (request.confidence() == null || request.confidence() < 0.0f || request.confidence() > 1.0f) {
+            blockers.add("confidence must be between 0.0 and 1.0");
+        }
+        return List.copyOf(blockers);
+    }
+
+    private String suiteFailureSourceRef(SuiteFailureMemoryFeedbackRequest request) {
+        var analysis = request.suiteFailureAnalysis();
+        return "suite-failure-analysis:"
+            + request.executionId().trim()
+            + ":"
+            + analysis.classification().name()
+            + ":"
+            + suiteFailureFingerprint(analysis);
+    }
+
+    private String suiteFailureFingerprint(SuiteFailureAnalysis analysis) {
+        var parts = new ArrayList<String>();
+        parts.add(stepId(analysis.rootCauseStep()));
+        parts.add(analysis.classification().name());
+        if (analysis.variableFailure() != null) {
+            var variable = analysis.variableFailure();
+            parts.add(metadataString(variable.stepId()));
+            parts.add(metadataString(firstText(variable.targetKey(), variable.path(), variable.expression())));
+            parts.add(metadataString(variable.extractRuleId()));
+            parts.add(metadataString(variable.sourcePath()));
+        }
+        if (analysis.dependencyFailure() != null) {
+            var dependency = analysis.dependencyFailure();
+            parts.add(metadataString(dependency.producerStepId()));
+            parts.add(metadataString(dependency.consumerStepId()));
+            parts.add(metadataString(firstText(dependency.variableName(), dependency.path(), dependency.expression())));
+        }
+        analysis.affectedDownstreamSteps().stream().map(this::stepId).forEach(parts::add);
+        return Integer.toHexString(String.join("|", parts).hashCode());
+    }
+
+    private String suiteFailureSummary(SuiteFailureMemoryFeedbackRequest request, SuiteFailureAnalysis analysis) {
+        return "V3 SUITE " + analysis.classification().name()
+            + " at " + stepId(analysis.rootCauseStep())
+            + " affected " + analysis.affectedDownstreamSteps().stream().map(this::stepId).toList();
+    }
+
+    private String suiteFailureContent(SuiteFailureMemoryFeedbackRequest request, SuiteFailureAnalysis analysis) {
+        var classification = analysis.classification();
+        var variable = analysis.variableFailure();
+        var dependency = analysis.dependencyFailure();
+        var content = new StringBuilder();
+        content.append("Scenario: V3 SUITE execution ")
+            .append(nullToBlank(request.executionId()))
+            .append(" for case ")
+            .append(nullToBlank(request.caseId()))
+            .append(". Failure type: ")
+            .append(classification.name())
+            .append(". Root cause step: ")
+            .append(stepId(analysis.rootCauseStep()))
+            .append(". Affected downstream steps: ")
+            .append(analysis.affectedDownstreamSteps().stream().map(this::stepId).toList())
+            .append(". ");
+        if (variable != null) {
+            content.append("Variable evidence: failed variable ")
+                .append(firstText(variable.targetKey(), variable.path(), variable.expression()))
+                .append(" at ")
+                .append(nullToBlank(variable.location()))
+                .append(", extractRule ")
+                .append(nullToBlank(variable.extractRuleId()))
+                .append(" from ")
+                .append(nullToBlank(variable.sourceType()))
+                .append(" ")
+                .append(nullToBlank(variable.sourcePath()))
+                .append(". ");
+        }
+        if (dependency != null) {
+            content.append("Dependency evidence: producer ")
+                .append(nullToBlank(dependency.producerStepId()))
+                .append(" order ")
+                .append(dependency.producerOrder())
+                .append(", consumer ")
+                .append(nullToBlank(dependency.consumerStepId()))
+                .append(" order ")
+                .append(dependency.consumerOrder())
+                .append(", variable ")
+                .append(firstText(dependency.variableName(), dependency.path(), dependency.expression()))
+                .append(". ");
+        }
+        content.append("Root cause: ")
+            .append(rootCauseText(analysis))
+            .append(". Recommendation: ")
+            .append(request.nextSuggestion())
+            .append(". Later SUITE generation should reuse this only when the same variable, dependency, or business precondition evidence is present.");
+        return content.toString();
+    }
+
+    private String suiteFailureEvidence(SuiteFailureMemoryFeedbackRequest request, SuiteFailureAnalysis analysis) {
+        var evidence = new LinkedHashMap<String, Object>();
+        evidence.put("suiteId", request.suiteId());
+        evidence.put("caseId", request.caseId());
+        evidence.put("executionId", request.executionId());
+        evidence.put("classification", analysis.classification().name());
+        evidence.put("rootStep", suiteStepMap(analysis.rootCauseStep()));
+        evidence.put("firstFailingStep", suiteStepMap(analysis.firstFailingStep()));
+        evidence.put("directlyFailedStep", suiteStepMap(analysis.directlyFailedStep()));
+        evidence.put("affectedDownstreamSteps", analysis.affectedDownstreamSteps().stream().map(this::suiteStepMap).toList());
+        evidence.put("dependentSkippedSteps", analysis.dependentSkippedSteps().stream().map(this::suiteStepMap).toList());
+        evidence.put("variableFailure", suiteVariableMap(analysis.variableFailure()));
+        evidence.put("dependencyFailure", suiteDependencyMap(analysis.dependencyFailure()));
+        evidence.put("diagnosticEvidence", request.evidence());
+        evidence.put("nextSuggestion", request.nextSuggestion());
+        evidence.put("impactSummary", analysis.impactSummary());
+        return evidence.toString();
+    }
+
+    private Map<String, Object> suiteFailureMetadata(SuiteFailureMemoryFeedbackRequest request, String sourceRef) {
+        var analysis = request.suiteFailureAnalysis();
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.putAll(request.metadata());
+        metadata.put("phase", "V3_PHASE_6");
+        metadata.put("handoffType", "SUITE_FAILURE_ANALYSIS_MEMORY_FEEDBACK");
+        metadata.put("suiteId", request.suiteId());
+        metadata.put("caseId", request.caseId());
+        metadata.put("executionId", request.executionId());
+        metadata.put("sourceRef", sourceRef);
+        metadata.put("failureClassification", analysis.classification().name());
+        metadata.put("recoveryActionType", request.recoveryActionType());
+        metadata.put("requiresHumanReview", request.requiresHumanReview());
+        metadata.put("confidence", request.confidence());
+        metadata.put("rootStepId", stepId(analysis.rootCauseStep()));
+        metadata.put("affectedDownstreamStepIds", analysis.affectedDownstreamSteps().stream().map(this::stepId).toList());
+        metadata.put("variableFailure", suiteVariableMap(analysis.variableFailure()));
+        metadata.put("dependencyFailure", suiteDependencyMap(analysis.dependencyFailure()));
+        metadata.put("nextSuggestion", request.nextSuggestion());
+        metadata.put("writesLongTermMemory", !(request.requiresHumanReview() || highRiskSuiteRecovery(request) || request.confidence() < 0.55f));
+        return compact(metadata);
+    }
+
+    private List<String> suiteFailureTags(SuiteFailureAnalysis analysis) {
+        var tags = new LinkedHashSet<String>();
+        tags.add("v3");
+        tags.add("suite");
+        tags.add("failure-analysis");
+        tags.add("memory-feedback");
+        tags.add(analysis.classification().name().toLowerCase(Locale.ROOT).replace('_', '-'));
+        switch (analysis.classification()) {
+            case VARIABLE_EXTRACTION_FAILURE, INVALID_EXTRACT_RULE, UNSUPPORTED_EXTRACT_SOURCE -> tags.add("variable-extraction");
+            case VARIABLE_RESOLUTION_FAILURE, VARIABLE_WRITEBACK_FAILURE, VARIABLE_OVERWRITE_RISK -> tags.add("variable-resolution");
+            case DEPENDENCY_ORDER_FAILURE -> tags.add("dependency-order");
+            case BUSINESS_PRECONDITION_FAILURE, SUITE_PREREQUISITE_FAILURE, PREREQUISITE_STEP_FAILURE -> tags.add("business-precondition");
+            case DOWNSTREAM_API_FAILURE -> tags.add("downstream-api");
+            default -> tags.add("suite-failure");
+        }
+        return List.copyOf(tags);
+    }
+
+    private boolean highRiskSuiteRecovery(SuiteFailureMemoryFeedbackRequest request) {
+        var action = metadataString(request.recoveryActionType()).toUpperCase(Locale.ROOT);
+        return "WAIT_FOR_HUMAN".equals(action)
+            || "PROVIDE_INPUT".equals(action)
+            || Boolean.TRUE.equals(request.metadata().get("highRiskRecovery"));
+    }
+
+    private String rootCauseText(SuiteFailureAnalysis analysis) {
+        if (analysis.variableFailure() != null && StringUtils.hasText(analysis.variableFailure().failureReason())) {
+            return analysis.variableFailure().failureReason();
+        }
+        if (analysis.dependencyFailure() != null && StringUtils.hasText(analysis.dependencyFailure().failureReason())) {
+            return analysis.dependencyFailure().failureReason();
+        }
+        return StringUtils.hasText(analysis.impactSummary()) ? analysis.impactSummary() : analysis.classification().name();
+    }
+
+    private Map<String, Object> suiteStepMap(SuiteFailureStep step) {
+        if (step == null) {
+            return Map.of();
+        }
+        var map = new LinkedHashMap<String, Object>();
+        map.put("stepId", step.stepId());
+        map.put("stepName", step.stepName());
+        map.put("order", step.order());
+        map.put("apiSpecId", step.apiSpecId());
+        map.put("status", step.status());
+        map.put("statusCode", step.statusCode());
+        map.put("message", step.message());
+        map.put("skipReason", step.skipReason());
+        return compact(map);
+    }
+
+    private Map<String, Object> suiteVariableMap(SuiteVariableFailure variable) {
+        if (variable == null) {
+            return Map.of();
+        }
+        var map = new LinkedHashMap<String, Object>();
+        map.put("classification", variable.classification() == null ? null : variable.classification().name());
+        map.put("stepId", variable.stepId());
+        map.put("expression", variable.expression());
+        map.put("location", variable.location());
+        map.put("scope", variable.scope());
+        map.put("path", variable.path());
+        map.put("extractRuleId", variable.extractRuleId());
+        map.put("sourceType", variable.sourceType());
+        map.put("sourcePath", variable.sourcePath());
+        map.put("targetScope", variable.targetScope());
+        map.put("targetKey", variable.targetKey());
+        map.put("failureReason", variable.failureReason());
+        map.put("oldValueSummary", variable.oldValueSummary());
+        map.put("newValueSummary", variable.newValueSummary());
+        return compact(map);
+    }
+
+    private Map<String, Object> suiteDependencyMap(SuiteDependencyFailure dependency) {
+        if (dependency == null) {
+            return Map.of();
+        }
+        var map = new LinkedHashMap<String, Object>();
+        map.put("producerStepId", dependency.producerStepId());
+        map.put("producerOrder", dependency.producerOrder());
+        map.put("consumerStepId", dependency.consumerStepId());
+        map.put("consumerOrder", dependency.consumerOrder());
+        map.put("expression", dependency.expression());
+        map.put("scope", dependency.scope());
+        map.put("path", dependency.path());
+        map.put("variableName", dependency.variableName());
+        map.put("failureReason", dependency.failureReason());
+        return compact(map);
+    }
+
+    private String stepId(SuiteFailureStep step) {
+        return step == null ? "" : metadataString(step.stepId());
+    }
+
+    private String firstText(Object... values) {
+        for (var value : values) {
+            if (value != null && StringUtils.hasText(value.toString())) {
+                return value.toString().trim();
+            }
+        }
+        return "";
+    }
+
+    private String nullToBlank(Object value) {
+        return Objects.toString(value, "");
     }
 
     private Map<String, Object> stepOutcomeMetadata(
