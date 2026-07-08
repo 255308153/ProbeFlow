@@ -48,14 +48,30 @@ class KnowledgeIngestEmbeddingValidationTests {
         );
 
         assertThatThrownBy(() -> knowledgeIngest.ingest(request))
-            .isInstanceOf(IllegalStateException.class)
+            .isInstanceOf(EmbeddingException.class)
             .hasMessageContaining("embedding dimension mismatch")
             .hasMessageContaining("expected 1024")
-            .hasMessageContaining("but was 8");
+            .hasMessageContaining("but was 8")
+            .extracting("failureCode")
+            .isEqualTo(EmbeddingFailureCode.DIMENSION_MISMATCH);
 
         assertThat(documents.count()).isZero();
         assertThat(revisions.count()).isZero();
         assertThat(chunks.count()).isZero();
+    }
+
+    @Test
+    void rejectsEmptyEmbeddingVectorWithDomainError() {
+        assertThatThrownBy(() -> EmbeddingValidation.requireVector(
+            "document",
+            EmbeddingProfile.fake(1024),
+            new float[0],
+            1024
+        ))
+            .isInstanceOf(EmbeddingException.class)
+            .hasMessageContaining("document embedding vector must not be empty")
+            .extracting("failureCode")
+            .isEqualTo(EmbeddingFailureCode.EMPTY_VECTOR);
     }
 
     @TestConfiguration

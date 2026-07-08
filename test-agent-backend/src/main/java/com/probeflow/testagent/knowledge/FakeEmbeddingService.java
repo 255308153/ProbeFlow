@@ -9,30 +9,47 @@ import org.springframework.stereotype.Component;
 @Component
 public class FakeEmbeddingService implements EmbeddingService {
 
-    private static final String QUERY_PREFIX = "Represent this sentence for searching relevant passages: ";
-
     private final int dimension;
+    private final EmbeddingProfile profile;
 
     public FakeEmbeddingService(@Value("${probeflow.embedding.dimension:1024}") int dimension) {
         if (dimension <= 0) {
             throw new IllegalArgumentException("embedding dimension must be positive");
         }
         this.dimension = dimension;
+        this.profile = EmbeddingProfile.fake(dimension);
     }
 
     @Override
     public float[] embedDocument(String text) {
-        return embed("document", normalize(text));
+        var normalized = EmbeddingValidation.requireText("document", text, profile);
+        return EmbeddingValidation.requireVector(
+            "document",
+            profile,
+            embed("document", profile.documentPrefix() + normalized),
+            dimension
+        );
     }
 
     @Override
     public float[] embedQuery(String text) {
-        return embed("query", QUERY_PREFIX + normalize(text));
+        var normalized = EmbeddingValidation.requireText("query", text, profile);
+        return EmbeddingValidation.requireVector(
+            "query",
+            profile,
+            embed("query", profile.queryPrefix() + normalized),
+            dimension
+        );
     }
 
     @Override
     public int dimensions() {
         return dimension;
+    }
+
+    @Override
+    public EmbeddingProfile profile() {
+        return profile;
     }
 
     private float[] embed(String mode, String text) {
@@ -67,7 +84,4 @@ public class FakeEmbeddingService implements EmbeddingService {
         }
     }
 
-    private String normalize(String text) {
-        return text == null ? "" : text.trim();
-    }
 }

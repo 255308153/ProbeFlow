@@ -7,4 +7,8 @@ public interface EmbeddingService {
     float[] embedQuery(String text);
 
     int dimensions();
+
+    default EmbeddingProfile profile() {
+        return EmbeddingProfile.fake(dimensions());
+    }
 }

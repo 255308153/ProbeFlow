@@ -163,13 +163,19 @@ public class KnowledgeIngestApplicationService {
 
     private float[] embedDocumentChunk(KnowledgeChunk chunk) {
         var embedding = embeddingService.embedDocument(chunk.getChunkContent());
-        validateEmbeddingDimension("document", embedding == null ? -1 : embedding.length);
-        return embedding;
+        return EmbeddingValidation.requireVector(
+            "document",
+            embeddingService.profile(),
+            embedding,
+            embeddingDimension
+        );
     }
 
     private void validateEmbeddingDimension(String path, int actualDimension) {
         if (actualDimension != embeddingDimension) {
-            throw new IllegalStateException(
+            throw new EmbeddingException(
+                EmbeddingFailureCode.DIMENSION_MISMATCH,
+                embeddingService.profile().profileId(),
                 "embedding dimension mismatch for " + path
                     + ": expected " + embeddingDimension
                     + " but was " + actualDimension

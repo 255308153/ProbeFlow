@@ -430,14 +430,12 @@ public class KnowledgeRetrievalApplicationService {
     }
 
     private void validateEmbedding(float[] embedding) {
-        if (embedding == null || embedding.length != embeddingService.dimensions()) {
-            throw new IllegalStateException(
-                "query embedding dimension mismatch: expected "
-                    + embeddingService.dimensions()
-                    + " but was "
-                    + (embedding == null ? -1 : embedding.length)
-            );
-        }
+        EmbeddingValidation.requireVector(
+            "query",
+            embeddingService.profile(),
+            embedding,
+            embeddingService.dimensions()
+        );
     }
 
     private double cosineSimilarity(float[] left, float[] right) {
