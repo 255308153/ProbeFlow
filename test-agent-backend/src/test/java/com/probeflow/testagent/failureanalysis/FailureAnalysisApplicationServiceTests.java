@@ -1139,8 +1139,18 @@ class FailureAnalysisApplicationServiceTests {
             .containsEntry("VALIDATION_ISSUE", 1L)
             .containsEntry("NONE", 1L);
         assertThat(result.groupedFailures()).extracting(GroupedFailureSummary::classification)
-            .containsSubsequence(FailureClassification.SERVER_ERROR, FailureClassification.STATUS_MISMATCH)
+            .containsSubsequence(FailureClassification.STATUS_MISMATCH, FailureClassification.SERVER_ERROR)
             .contains(FailureClassification.DATA_QUALITY_ISSUE);
+        assertThat(result.summary())
+            .satisfies(summary -> {
+                assertThat(summary.highestRiskLevel()).isEqualTo("HIGH");
+                assertThat(summary.priorityClassification()).isEqualTo(FailureClassification.STATUS_MISMATCH);
+                assertThat(summary.summary()).contains("Highest risk task failure is STATUS_MISMATCH");
+                assertThat(summary.priorityExecutionIds()).containsExactlyInAnyOrder(
+                    duplicateOne.getExecutionId(),
+                    duplicateTwo.getExecutionId()
+                );
+            });
         assertThat(result.groupedFailures()).filteredOn(group -> group.classification() == FailureClassification.STATUS_MISMATCH)
             .singleElement()
             .satisfies(group -> {
@@ -1165,6 +1175,169 @@ class FailureAnalysisApplicationServiceTests {
         assertThat(subset.counts().totalExecutions()).isEqualTo(2);
         assertThat(subset.groupedFailures()).singleElement()
             .satisfies(group -> assertThat(group.executionIds()).containsExactly(duplicateOne.getExecutionId()));
+    }
+
+    @Test
+    void taskAnalysisAggregatesSuiteFailuresByRootCauseImpactAndKeepsObservationLifecycleIdempotent() {
+        var api = apiSpecs.save(newApiSpec("/api/orders"));
+        testCases.save(newTestCase("case-1", api.getApiSpecId()));
+        var extractionOne = executionRecords.save(variableExtractionSuiteFailure(
+            "extract-order",
+            List.of("pay-order", "query-order"),
+            api.getApiSpecId()
+        ));
+        var extractionTwo = executionRecords.save(variableExtractionSuiteFailure(
+            "reserve-order",
+            List.of("capture-payment"),
+            api.getApiSpecId()
+        ));
+        var downstream = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("suite", true, "stepCount", 3),
+            suiteResponse(
+                List.of(
+                    suiteStep("create-order", 1, api.getApiSpecId(), "PASSED", null, 201),
+                    suiteStep("pay-downstream", 2, api.getApiSpecId(), "FAILED", "Payment service returned 503", 503),
+                    suiteStep("notify-order", 3, api.getApiSpecId(), "SKIPPED", "Skipped because prerequisite step failed: pay-downstream", null)
+                ),
+                List.of(),
+                List.of(
+                    mapOf(
+                        "eventType", "PRODUCTION",
+                        "stepId", "create-order",
+                        "sourceType", "BODY_JSON",
+                        "sourcePath", "$.orderId",
+                        "targetScope", "suite",
+                        "targetKey", "orderId",
+                        "success", true
+                    ),
+                    mapOf(
+                        "eventType", "CONSUMPTION",
+                        "stepId", "pay-downstream",
+                        "location", "request.path",
+                        "expression", "${suite.orderId}",
+                        "scope", "suite",
+                        "path", "orderId",
+                        "resolved", true
+                    )
+                )
+            ),
+            List.of()
+        ));
+        var single = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("method", "POST", "path", "/api/orders", "apiSpecId", api.getApiSpecId()),
+            Map.of("statusCode", 400),
+            List.of()
+        ));
+        single.setStatusCode(400);
+        var originalExtractionOneResponse = extractionOne.getResponseSnapshot();
+        entityManager.flush();
+        entityManager.clear();
+
+        var first = failureAnalysis.analyzeTask(TaskFailureAnalysisRequest.basic("task-1"));
+        var second = failureAnalysis.analyzeTask(TaskFailureAnalysisRequest.basic("task-1"));
+
+        assertThat(first.counts().totalExecutions()).isEqualTo(4);
+        assertThat(first.counts().byClassification())
+            .containsEntry("VARIABLE_EXTRACTION_FAILURE", 2L)
+            .containsEntry("DOWNSTREAM_API_FAILURE", 1L)
+            .containsEntry("VALIDATION_ISSUE", 1L);
+        assertThat(first.groupedFailures()).extracting(GroupedFailureSummary::classification)
+            .containsSubsequence(
+                FailureClassification.VARIABLE_EXTRACTION_FAILURE,
+                FailureClassification.DOWNSTREAM_API_FAILURE,
+                FailureClassification.VALIDATION_ISSUE
+            );
+        assertThat(first.summary())
+            .satisfies(summary -> {
+                assertThat(summary.highestRiskLevel()).isEqualTo("HIGH");
+                assertThat(summary.priorityClassification()).isEqualTo(FailureClassification.VARIABLE_EXTRACTION_FAILURE);
+                assertThat(summary.priorityAction()).contains("response field path", "extractRule");
+                assertThat(summary.summary()).contains("Highest risk task failure is VARIABLE_EXTRACTION_FAILURE");
+                assertThat(summary.priorityExecutionIds()).containsExactlyInAnyOrder(
+                    extractionOne.getExecutionId(),
+                    extractionTwo.getExecutionId()
+                );
+            });
+        assertThat(first.groupedFailures()).filteredOn(group -> group.classification() == FailureClassification.VARIABLE_EXTRACTION_FAILURE)
+            .singleElement()
+            .satisfies(group -> {
+                assertThat(group.occurrenceCount()).isEqualTo(2);
+                assertThat(group.riskLevel()).isEqualTo("HIGH");
+                assertThat(group.executionIds()).containsExactlyInAnyOrder(
+                    extractionOne.getExecutionId(),
+                    extractionTwo.getExecutionId()
+                );
+                assertThat(group.rootCauseStepIds()).containsExactly("extract-order", "reserve-order");
+                assertThat(group.affectedDownstreamStepIds()).containsExactly("pay-order", "query-order", "capture-payment");
+                assertThat(group.impactSummaries()).allSatisfy(summary -> assertThat(summary)
+                    .contains("Suite prerequisite step", "Affected downstream step count"));
+                assertThat(group.priorityActions()).singleElement()
+                    .satisfies(action -> assertThat(action).contains("response field path", "extractRule"));
+                assertThat(group.summary()).contains(
+                    "VARIABLE_EXTRACTION_FAILURE",
+                    "rootCauseSteps [extract-order, reserve-order]",
+                    "affectedDownstreamSteps [pay-order, query-order, capture-payment]"
+                );
+            });
+        assertThat(first.groupedFailures()).filteredOn(group -> group.classification() == FailureClassification.DOWNSTREAM_API_FAILURE)
+            .singleElement()
+            .satisfies(group -> {
+                assertThat(group.rootCauseStepIds()).containsExactly("pay-downstream");
+                assertThat(group.affectedDownstreamStepIds()).containsExactly("notify-order");
+                assertThat(group.priorityActions()).singleElement()
+                    .satisfies(action -> assertThat(action).contains("downstream API"));
+            });
+        assertThat(first.executionResults()).filteredOn(result -> result.executionId().equals(single.getExecutionId()))
+            .singleElement()
+            .satisfies(result -> assertThat(result.classification()).isEqualTo(FailureClassification.VALIDATION_ISSUE));
+        assertThat(second.groupedFailures()).filteredOn(group -> group.classification() == FailureClassification.VARIABLE_EXTRACTION_FAILURE)
+            .singleElement()
+            .satisfies(group -> assertThat(group.executionIds()).containsExactlyInAnyOrder(
+                extractionOne.getExecutionId(),
+                extractionTwo.getExecutionId()
+            ));
+
+        assertThat(observations.findAllByExecutionIdAndAnalysisLevelOrderByCreatedAtAscObservationIdAsc(
+            extractionOne.getExecutionId(),
+            AnalysisLevel.BASIC
+        ))
+            .singleElement()
+            .satisfies(observation -> {
+                assertThat(observation.getSummary()).contains("VARIABLE_EXTRACTION_FAILURE", "impact", "extract-order");
+                assertThat(observation.getFailureReason()).contains("Suite variable failure VARIABLE_EXTRACTION_FAILURE", "extract-order");
+                assertThat(observation.getNextSuggestion()).contains("response field path", "extractRule");
+            });
+        assertThat(observations.findAllByExecutionIdAndAnalysisLevelOrderByCreatedAtAscObservationIdAsc(
+            downstream.getExecutionId(),
+            AnalysisLevel.BASIC
+        ))
+            .singleElement()
+            .satisfies(observation -> {
+                assertThat(observation.getSummary()).contains("DOWNSTREAM_API_FAILURE", "pay-downstream", "impact");
+                assertThat(observation.getFailureReason()).contains("Downstream suite step pay-downstream");
+                assertThat(observation.getNextSuggestion()).contains("downstream API");
+            });
+
+        entityManager.flush();
+        entityManager.clear();
+        var unchanged = executionRecords.findById(extractionOne.getExecutionId()).orElseThrow();
+        assertThat(unchanged.getResponseSnapshot())
+            .containsEntry("suite", originalExtractionOneResponse.get("suite"));
+        assertThat((List<Map<String, Object>>) unchanged.getResponseSnapshot().get("steps"))
+            .extracting(step -> step.get("stepId"), step -> step.get("overallStatus"), step -> step.get("message"))
+            .containsExactly(
+                org.assertj.core.groups.Tuple.tuple("extract-order", "BLOCKED", "Required variable extraction failed"),
+                org.assertj.core.groups.Tuple.tuple("pay-order", "SKIPPED", "Skipped because prerequisite step failed: extract-order"),
+                org.assertj.core.groups.Tuple.tuple("query-order", "SKIPPED", "Skipped because prerequisite step failed: extract-order")
+            );
+        assertThat((List<Map<String, Object>>) unchanged.getResponseSnapshot().get("runtimeDiagnostics"))
+            .singleElement()
+            .satisfies(diagnostic -> assertThat(diagnostic)
+                .containsEntry("code", "PATH_MISSING")
+                .containsEntry("stepId", "extract-order")
+                .containsEntry("targetKey", "orderId"));
     }
 
     @Test
@@ -1540,6 +1713,54 @@ class FailureAnalysisApplicationServiceTests {
                     "targetKey", "orderId",
                     "success", false,
                     "failureReason", code
+                ))
+            ),
+            List.of()
+        );
+    }
+
+    private ExecutionRecord variableExtractionSuiteFailure(
+        String producerStepId,
+        List<String> downstreamStepIds,
+        String apiSpecId
+    ) {
+        var steps = new java.util.ArrayList<Map<String, Object>>();
+        steps.add(suiteStep(producerStepId, 1, apiSpecId, "BLOCKED", "Required variable extraction failed", 201));
+        for (var index = 0; index < downstreamStepIds.size(); index++) {
+            var stepId = downstreamStepIds.get(index);
+            steps.add(suiteStep(
+                stepId,
+                index + 2,
+                apiSpecId,
+                "SKIPPED",
+                "Skipped because prerequisite step failed: " + producerStepId,
+                null
+            ));
+        }
+        return newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("suite", true, "stepCount", steps.size()),
+            suiteResponse(
+                steps,
+                List.of(mapOf(
+                    "code", "PATH_MISSING",
+                    "message", "Unable to extract response variable",
+                    "stepId", producerStepId,
+                    "ruleId", "extract-order-id",
+                    "sourceType", "BODY_JSON",
+                    "sourcePath", "$.data.orderId",
+                    "targetScope", "suite",
+                    "targetKey", "orderId"
+                )),
+                List.of(mapOf(
+                    "eventType", "PRODUCTION",
+                    "stepId", producerStepId,
+                    "sourceType", "BODY_JSON",
+                    "sourcePath", "$.data.orderId",
+                    "targetScope", "suite",
+                    "targetKey", "orderId",
+                    "success", false,
+                    "failureReason", "PATH_MISSING"
                 ))
             ),
             List.of()

@@ -184,6 +184,7 @@ public class FailureAnalysisApplicationService {
             normalized.taskId(),
             normalized.mode(),
             counts(enrichedResults),
+            taskSummary(groups),
             enrichedResults,
             groups
         );
@@ -1555,6 +1556,8 @@ public class FailureAnalysisApplicationService {
         dataQualityGroups(records).forEach(summaries::add);
         summaries.sort(
             Comparator.comparingInt((GroupedFailureSummary group) -> severityRank(group.riskLevel())).reversed()
+                .thenComparing((GroupedFailureSummary group) -> group.affectedDownstreamStepIds().size(), Comparator.reverseOrder())
+                .thenComparing(GroupedFailureSummary::occurrenceCount, Comparator.reverseOrder())
                 .thenComparing(group -> group.classification().name())
                 .thenComparing(GroupedFailureSummary::apiReference, Comparator.nullsLast(String::compareTo))
                 .thenComparing(GroupedFailureSummary::caseReference, Comparator.nullsLast(String::compareTo))
@@ -1565,6 +1568,11 @@ public class FailureAnalysisApplicationService {
     }
 
     private String groupingKey(FailureAnalysisResult result, ExecutionRecord record) {
+        if (result.suiteFailureAnalysis().suiteExecution()) {
+            return result.classification()
+                + "|suite|"
+                + suiteRootCauseSignature(result, record);
+        }
         return result.classification()
             + "|" + apiReference(result, record)
             + "|" + result.caseId()
@@ -1579,6 +1587,19 @@ public class FailureAnalysisApplicationService {
     ) {
         var first = group.getFirst();
         var record = recordById.get(first.executionId());
+        var rootCauseStepIds = distinct(group.stream()
+            .map(result -> rootCauseStepId(result.suiteFailureAnalysis()))
+            .toList());
+        var affectedDownstreamStepIds = distinct(group.stream()
+            .flatMap(result -> result.suiteFailureAnalysis().affectedDownstreamSteps().stream())
+            .map(SuiteFailureStep::stepId)
+            .toList());
+        var impactSummaries = distinct(group.stream()
+            .map(FailureAnalysisResult::impactSummary)
+            .toList());
+        var priorityActions = distinct(group.stream()
+            .map(FailureAnalysisResult::nextSuggestion)
+            .toList());
         return new GroupedFailureSummary(
             first.classification(),
             highestRisk(group),
@@ -1590,8 +1611,12 @@ public class FailureAnalysisApplicationService {
             first.response().errorType(),
             distinct(group.stream().map(FailureAnalysisResult::caseId).toList()),
             distinct(group.stream().map(FailureAnalysisResult::executionId).toList()),
+            rootCauseStepIds,
+            affectedDownstreamStepIds,
+            impactSummaries,
+            priorityActions,
             group.size(),
-            first.summary()
+            groupSummaryText(first, group, rootCauseStepIds, affectedDownstreamStepIds, priorityActions)
         );
     }
 
@@ -1614,6 +1639,10 @@ public class FailureAnalysisApplicationService {
                 responseFacts(record).errorType(),
                 List.of(record.getCaseId()),
                 List.of(record.getExecutionId()),
+                List.of(),
+                List.of(),
+                missing,
+                List.of("Repair missing linked records before trusting task-level aggregation."),
                 1,
                 "Execution " + record.getExecutionId() + " references missing linked records: " + missing
             ));
@@ -1687,6 +1716,91 @@ public class FailureAnalysisApplicationService {
                 .orElse(null);
         }
         return null;
+    }
+
+    private String suiteRootCauseSignature(FailureAnalysisResult result, ExecutionRecord record) {
+        var analysis = result.suiteFailureAnalysis();
+        if (analysis.dependencyFailure() != null) {
+            var failure = analysis.dependencyFailure();
+            return "dependency|"
+                + failure.producerStepId()
+                + "|" + failure.consumerStepId()
+                + "|" + failure.variableName()
+                + "|" + failure.failureReason();
+        }
+        if (analysis.variableFailure() != null) {
+            var failure = analysis.variableFailure();
+            return "variable|"
+                + failure.classification()
+                + "|" + failure.expression()
+                + "|" + failure.sourceType()
+                + "|" + failure.sourcePath()
+                + "|" + failure.targetScope()
+                + "|" + failure.targetKey()
+                + "|" + failure.failureReason();
+        }
+        if (result.classification() == FailureClassification.DOWNSTREAM_API_FAILURE) {
+            return "downstream|"
+                + apiReference(result, record)
+                + "|" + result.statusCode()
+                + "|" + rootCauseStepId(analysis);
+        }
+        return "step|"
+            + rootCauseStepId(analysis)
+            + "|" + apiReference(result, record)
+            + "|" + result.classification();
+    }
+
+    private String rootCauseStepId(SuiteFailureAnalysis analysis) {
+        if (analysis.rootCauseStep() != null) {
+            return analysis.rootCauseStep().stepId();
+        }
+        if (analysis.variableFailure() != null) {
+            return analysis.variableFailure().stepId();
+        }
+        if (analysis.dependencyFailure() != null) {
+            return analysis.dependencyFailure().consumerStepId();
+        }
+        return null;
+    }
+
+    private String groupSummaryText(
+        FailureAnalysisResult first,
+        List<FailureAnalysisResult> group,
+        List<String> rootCauseStepIds,
+        List<String> affectedDownstreamStepIds,
+        List<String> priorityActions
+    ) {
+        return "Task failure group " + first.classification()
+            + " risk " + highestRisk(group)
+            + " occurrences " + group.size()
+            + " rootCauseSteps " + rootCauseStepIds
+            + " affectedDownstreamSteps " + affectedDownstreamStepIds
+            + " priorityAction " + (priorityActions.isEmpty() ? first.nextSuggestion() : priorityActions.getFirst());
+    }
+
+    private TaskFailureAnalysisSummary taskSummary(List<GroupedFailureSummary> groups) {
+        var actionable = groups.stream()
+            .filter(group -> group.classification() != FailureClassification.NONE)
+            .filter(group -> group.classification() != FailureClassification.SKIPPED)
+            .toList();
+        if (actionable.isEmpty()) {
+            return TaskFailureAnalysisSummary.empty();
+        }
+        var priority = actionable.getFirst();
+        var priorityAction = priority.priorityActions().isEmpty()
+            ? "Review deterministic failure analysis evidence."
+            : priority.priorityActions().getFirst();
+        return new TaskFailureAnalysisSummary(
+            priority.riskLevel(),
+            priority.classification(),
+            priorityAction,
+            "Highest risk task failure is " + priority.classification()
+                + " at " + priority.riskLevel()
+                + " risk across " + priority.occurrenceCount()
+                + " execution(s). Prioritize: " + priorityAction,
+            priority.executionIds()
+        );
     }
 
     private List<String> distinct(List<String> values) {
@@ -1764,7 +1878,8 @@ public class FailureAnalysisApplicationService {
         if (suiteFailure.suiteExecution() && suiteFailure.failedStepId() != null) {
             summary += "; first failing suite step " + suiteFailure.failedStepId()
                 + " order " + suiteFailure.failedStepOrder()
-                + " apiSpecId " + suiteFailure.failedStepApiSpecId();
+                + " apiSpecId " + suiteFailure.failedStepApiSpecId()
+                + "; impact " + suiteFailure.impactSummary();
         }
         return summary;
     }
