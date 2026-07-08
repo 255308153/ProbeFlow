@@ -139,7 +139,11 @@ class V3Phase4AcceptanceBoundaryGuardTests {
             .containsEntry("consumptionEvents", 2L)
             .containsEntry("failureEvents", 0L);
 
-        assertThat(section(result, "failure-analysis").source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
+        assertThat(section(result, "failure-analysis").source()).isEqualTo(ManualSuiteAgentSectionSource.REAL);
+        assertThat(section(result, "failure-analysis").summary())
+            .containsEntry("sourceMarker", "real")
+            .containsEntry("classification", "NONE")
+            .containsEntry("recoveryActionType", "NO_ACTION");
         assertThat(section(result, "memory-feedback").source()).isEqualTo(ManualSuiteAgentSectionSource.STAGED);
         assertThat(section(result, "evaluation-comparison").source()).isEqualTo(ManualSuiteAgentSectionSource.NOT_RUN);
         assertThat(result.sections())
@@ -162,7 +166,8 @@ class V3Phase4AcceptanceBoundaryGuardTests {
         assertThat(markdown)
             .contains("variable-audit (REAL, PASSED)")
             .contains("Runtime: ExecutionContext")
-            .contains("failure-analysis (STAGED")
+            .contains("failure-analysis (REAL, PASSED)")
+            .contains("Classification: NONE")
             .contains("memory-feedback (STAGED")
             .contains("evaluation-comparison (NOT_RUN");
         assertThat(jsonText).doesNotContain("PENDING_RUNTIME");

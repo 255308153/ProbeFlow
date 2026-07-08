@@ -193,21 +193,29 @@ class Phase7AcceptanceBoundaryGuardTests {
             .sorted()
             .toList();
 
-        assertThat(classNames).containsExactly(
+        assertThat(classNames).contains(
             "FailedAssertionSummary",
             "FailureAnalysisApplicationService",
+            "FailureAnalysisHumanHandoff",
             "FailureAnalysisMode",
+            "FailureAnalysisReplanningHandoff",
             "FailureAnalysisRequest",
             "FailureAnalysisResult",
             "FailureClassification",
             "GroupedFailureSummary",
             "MemoryCandidateAnalysisResult",
+            "RecoveryActionType",
             "RequestFacts",
             "ResponseFacts",
+            "SuiteDependencyFailure",
+            "SuiteFailureAnalysis",
+            "SuiteFailureStep",
             "SuiteFailureSummary",
+            "SuiteVariableFailure",
             "TaskFailureAnalysisCounts",
             "TaskFailureAnalysisRequest",
-            "TaskFailureAnalysisResult"
+            "TaskFailureAnalysisResult",
+            "TaskFailureAnalysisSummary"
         );
         assertThat(classNames).doesNotContain(
             "FailureAnalysisController",

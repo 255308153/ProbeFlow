@@ -2031,8 +2031,8 @@ public class FailureAnalysisApplicationService {
             return value;
         }
         var redacted = value
-            .replaceAll("(?i)(bearer\\s+)[^\\s,}\\]]+", "$1[REDACTED]")
-            .replaceAll("(?i)(basic\\s+)[^\\s,}\\]]+", "$1[REDACTED]");
+            .replaceAll("(?i)\\b(bearer\\s+)[A-Za-z0-9._~+/-]{8,}", "$1[REDACTED]")
+            .replaceAll("(?i)\\b(basic\\s+)[A-Za-z0-9._~+/=-]{8,}", "$1[REDACTED]");
         redacted = redacted.replaceAll(
             "(?i)((?:authorization|cookie|password|secret|token|apikey|apiKey|credential)\\s*[=:]\\s*)[^\\s,}\\]]+",
             "$1[REDACTED]"
