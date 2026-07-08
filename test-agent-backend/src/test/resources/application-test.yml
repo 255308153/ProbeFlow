@@ -18,6 +18,10 @@ spring:
       port: 6379
 
 probeflow:
+  embedding:
+    dimension: 1024
+    manual-real:
+      enabled: false
   llm:
     allow-real-providers: false
     allowed-providers: fake
