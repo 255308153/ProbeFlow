@@ -10,6 +10,8 @@ public record SuiteFailureAnalysis(
     SuiteFailureStep directlyFailedStep,
     List<SuiteFailureStep> affectedDownstreamSteps,
     List<SuiteFailureStep> dependentSkippedSteps,
+    SuiteVariableFailure variableFailure,
+    List<SuiteVariableFailure> variableFindings,
     int totalSteps,
     int skippedStepCount,
     int dependentSkippedStepCount,
@@ -19,6 +21,7 @@ public record SuiteFailureAnalysis(
     public SuiteFailureAnalysis {
         affectedDownstreamSteps = affectedDownstreamSteps == null ? List.of() : List.copyOf(affectedDownstreamSteps);
         dependentSkippedSteps = dependentSkippedSteps == null ? List.of() : List.copyOf(dependentSkippedSteps);
+        variableFindings = variableFindings == null ? List.of() : List.copyOf(variableFindings);
     }
 
     public static SuiteFailureAnalysis none() {
@@ -29,6 +32,8 @@ public record SuiteFailureAnalysis(
             null,
             null,
             List.of(),
+            List.of(),
+            null,
             List.of(),
             0,
             0,

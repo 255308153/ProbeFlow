@@ -71,8 +71,9 @@ public class FailureAnalysisApplicationService {
 
         var failedAssertions = failedAssertions(record);
         var suiteFailure = suiteFailure(record);
-        var classification = classify(record, failedAssertions, suiteFailure);
-        var suiteFailureAnalysis = suiteFailureAnalysis(record, classification, suiteFailure);
+        var variableFindings = variableFailures(record);
+        var classification = classify(record, failedAssertions, suiteFailure, variableFindings);
+        var suiteFailureAnalysis = suiteFailureAnalysis(record, classification, suiteFailure, variableFindings);
         var riskLevel = riskLevel(record, classification, failedAssertions, suiteFailure);
         var summary = summary(record, classification, suiteFailure);
         var failureReason = failureReason(record, classification, failedAssertions, suiteFailure);
@@ -244,22 +245,27 @@ public class FailureAnalysisApplicationService {
     private FailureClassification classify(
         ExecutionRecord record,
         List<FailedAssertionSummary> failedAssertions,
-        SuiteFailureSummary suiteFailure
+        SuiteFailureSummary suiteFailure,
+        List<SuiteVariableFailure> variableFindings
     ) {
         var response = safeMap(record.getResponseSnapshot());
         var errorType = stringValue(response.get("errorType"));
         var statusCode = record.getStatusCode();
 
-        if (suiteFailure.suiteExecution()
-            && suiteFailure.failedStepId() != null
-            && suiteFailure.dependentSkippedStepCount() > 0) {
-            return FailureClassification.PREREQUISITE_STEP_FAILURE;
-        }
         if (record.getOverallStatus() == OverallStatus.PASSED) {
             return FailureClassification.NONE;
         }
         if (record.getOverallStatus() == OverallStatus.SKIPPED) {
             return FailureClassification.SKIPPED;
+        }
+        var variableRoot = rootVariableFailure(variableFindings);
+        if (variableRoot != null) {
+            return variableRoot.classification();
+        }
+        if (suiteFailure.suiteExecution()
+            && suiteFailure.failedStepId() != null
+            && suiteFailure.dependentSkippedStepCount() > 0) {
+            return FailureClassification.PREREQUISITE_STEP_FAILURE;
         }
         if (record.getOverallStatus() == OverallStatus.PASSED_WITH_WARNINGS) {
             return warningClassification(failedAssertions);
@@ -327,6 +333,176 @@ public class FailureAnalysisApplicationService {
         return FailureClassification.UNKNOWN;
     }
 
+    private List<SuiteVariableFailure> variableFailures(ExecutionRecord record) {
+        var findings = new LinkedHashMap<String, SuiteVariableFailure>();
+        runtimeDiagnostics(record).stream()
+            .map(this::variableFailureFromDiagnostic)
+            .filter(finding -> finding != null)
+            .forEach(finding -> findings.putIfAbsent(variableFailureKey(finding), finding));
+        variableAuditEvents(record).stream()
+            .map(this::variableFailureFromAuditEvent)
+            .filter(finding -> finding != null)
+            .forEach(finding -> findings.putIfAbsent(variableFailureKey(finding), finding));
+        return findings.values().stream()
+            .sorted(Comparator.comparingInt(this::variableFailurePriority)
+                .thenComparing(finding -> finding.stepId() == null ? "" : finding.stepId())
+                .thenComparing(finding -> finding.failureReason() == null ? "" : finding.failureReason()))
+            .toList();
+    }
+
+    private SuiteVariableFailure rootVariableFailure(List<SuiteVariableFailure> findings) {
+        return findings == null || findings.isEmpty() ? null : findings.getFirst();
+    }
+
+    private SuiteVariableFailure variableFailureFromDiagnostic(Map<String, Object> diagnostic) {
+        var code = stringValue(diagnostic.get("code"));
+        if (code == null) {
+            return null;
+        }
+        if (isVariableResolutionDiagnostic(diagnostic, code)) {
+            return variableFailure(
+                FailureClassification.VARIABLE_RESOLUTION_FAILURE,
+                diagnostic,
+                code
+            );
+        }
+        if ("INVALID_EXTRACT_RULE".equals(code)) {
+            return variableFailure(FailureClassification.INVALID_EXTRACT_RULE, diagnostic, code);
+        }
+        if ("UNSUPPORTED_EXTRACT_SOURCE".equals(code)) {
+            return variableFailure(FailureClassification.UNSUPPORTED_EXTRACT_SOURCE, diagnostic, code);
+        }
+        if ("UNSUPPORTED_WRITE_SCOPE".equals(code)) {
+            return variableFailure(FailureClassification.VARIABLE_WRITEBACK_FAILURE, diagnostic, code);
+        }
+        if (isVariableExtractionDiagnostic(diagnostic, code)) {
+            return variableFailure(FailureClassification.VARIABLE_EXTRACTION_FAILURE, diagnostic, code);
+        }
+        return null;
+    }
+
+    private SuiteVariableFailure variableFailureFromAuditEvent(Map<String, Object> event) {
+        var eventType = stringValue(event.get("eventType"));
+        if ("CONSUMPTION".equals(eventType) && Boolean.FALSE.equals(booleanValue(event.get("resolved")))) {
+            return variableFailure(FailureClassification.VARIABLE_RESOLUTION_FAILURE, event, stringValue(event.get("failureReason")));
+        }
+        if (!"PRODUCTION".equals(eventType)) {
+            return null;
+        }
+        if (Boolean.TRUE.equals(booleanValue(event.get("overwritten")))) {
+            return variableFailure(FailureClassification.VARIABLE_OVERWRITE_RISK, event, "VARIABLE_OVERWRITE_RISK");
+        }
+        if (!Boolean.FALSE.equals(booleanValue(event.get("success")))) {
+            return null;
+        }
+        var reason = stringValue(event.get("failureReason"));
+        if ("INVALID_EXTRACT_RULE".equals(reason)) {
+            return variableFailure(FailureClassification.INVALID_EXTRACT_RULE, event, reason);
+        }
+        if ("UNSUPPORTED_EXTRACT_SOURCE".equals(reason)) {
+            return variableFailure(FailureClassification.UNSUPPORTED_EXTRACT_SOURCE, event, reason);
+        }
+        if ("UNSUPPORTED_WRITE_SCOPE".equals(reason)) {
+            return variableFailure(FailureClassification.VARIABLE_WRITEBACK_FAILURE, event, reason);
+        }
+        return variableFailure(FailureClassification.VARIABLE_EXTRACTION_FAILURE, event, reason);
+    }
+
+    private SuiteVariableFailure variableFailure(
+        FailureClassification classification,
+        Map<String, Object> facts,
+        String failureReason
+    ) {
+        return new SuiteVariableFailure(
+            classification,
+            stringValue(facts.get("stepId")),
+            stringValue(facts.get("expression")),
+            stringValue(facts.get("location")),
+            stringValue(facts.get("scope")),
+            stringValue(facts.get("path")),
+            firstString(facts, "extractRuleId", "ruleId"),
+            stringValue(facts.get("sourceType")),
+            stringValue(facts.get("sourcePath")),
+            stringValue(facts.get("targetScope")),
+            stringValue(facts.get("targetKey")),
+            failureReason,
+            stringValue(facts.get("oldValueSummary")),
+            stringValue(facts.get("newValueSummary"))
+        );
+    }
+
+    private boolean isVariableResolutionDiagnostic(Map<String, Object> diagnostic, String code) {
+        return diagnostic.containsKey("expression")
+            || "UNSUPPORTED_VARIABLE_SCOPE".equals(code)
+            || "INVALID_VARIABLE_EXPRESSION".equals(code)
+            || "UNSUPPORTED_DYNAMIC_FUNCTION".equals(code);
+    }
+
+    private boolean isVariableExtractionDiagnostic(Map<String, Object> diagnostic, String code) {
+        return diagnostic.containsKey("sourceType")
+            || diagnostic.containsKey("sourcePath")
+            || diagnostic.containsKey("targetKey")
+            || "PATH_MISSING".equals(code)
+            || "HEADER_MISSING".equals(code)
+            || "INVALID_BODY_JSON_PATH".equals(code)
+            || "INVALID_HEADER_PATH".equals(code);
+    }
+
+    private List<Map<String, Object>> runtimeDiagnostics(ExecutionRecord record) {
+        var response = safeMap(record.getResponseSnapshot());
+        var diagnostics = new ArrayList<Map<String, Object>>();
+        diagnostics.addAll(mapList(response.get("runtimeDiagnostics")));
+        suiteSteps(response).forEach(step -> diagnostics.addAll(mapList(step.get("runtimeDiagnostics"))));
+        return distinctMaps(diagnostics);
+    }
+
+    private List<Map<String, Object>> variableAuditEvents(ExecutionRecord record) {
+        var response = safeMap(record.getResponseSnapshot());
+        var events = new ArrayList<Map<String, Object>>();
+        events.addAll(mapList(nestedMap(response.get("variableAuditSummary")).get("events")));
+        suiteSteps(response).forEach(step -> events.addAll(mapList(step.get("variableEvents"))));
+        return distinctMaps(events);
+    }
+
+    private List<Map<String, Object>> mapList(Object value) {
+        if (!(value instanceof List<?> list)) {
+            return List.of();
+        }
+        return list.stream()
+            .filter(Map.class::isInstance)
+            .map(item -> objectMap((Map<?, ?>) item))
+            .toList();
+    }
+
+    private List<Map<String, Object>> distinctMaps(List<Map<String, Object>> maps) {
+        var distinct = new LinkedHashMap<String, Map<String, Object>>();
+        maps.forEach(map -> distinct.putIfAbsent(map.toString(), map));
+        return List.copyOf(distinct.values());
+    }
+
+    private String variableFailureKey(SuiteVariableFailure finding) {
+        return finding.classification()
+            + "|" + finding.stepId()
+            + "|" + finding.expression()
+            + "|" + finding.sourceType()
+            + "|" + finding.sourcePath()
+            + "|" + finding.targetScope()
+            + "|" + finding.targetKey()
+            + "|" + finding.failureReason();
+    }
+
+    private int variableFailurePriority(SuiteVariableFailure finding) {
+        return switch (finding.classification()) {
+            case VARIABLE_RESOLUTION_FAILURE -> 10;
+            case INVALID_EXTRACT_RULE -> 20;
+            case UNSUPPORTED_EXTRACT_SOURCE -> 21;
+            case VARIABLE_EXTRACTION_FAILURE -> 22;
+            case VARIABLE_WRITEBACK_FAILURE -> 30;
+            case VARIABLE_OVERWRITE_RISK -> 90;
+            default -> 100;
+        };
+    }
+
     private List<String> evidence(
         ExecutionRecord record,
         List<FailedAssertionSummary> failedAssertions,
@@ -376,8 +552,34 @@ public class FailureAnalysisApplicationService {
                 .filter(reason -> reason != null && !reason.isBlank())
                 .distinct()
                 .forEach(reason -> evidence.add("skipReason=" + reason));
+            suiteFailureAnalysis.variableFindings().forEach(finding -> evidence.add(variableEvidence(finding)));
         }
         return List.copyOf(evidence);
+    }
+
+    private String variableEvidence(SuiteVariableFailure finding) {
+        var parts = new ArrayList<String>();
+        parts.add("variableFailure=" + finding.classification());
+        addEvidencePart(parts, "stepId", finding.stepId());
+        addEvidencePart(parts, "expression", finding.expression());
+        addEvidencePart(parts, "location", finding.location());
+        addEvidencePart(parts, "scope", finding.scope());
+        addEvidencePart(parts, "path", finding.path());
+        addEvidencePart(parts, "extractRuleId", finding.extractRuleId());
+        addEvidencePart(parts, "sourceType", finding.sourceType());
+        addEvidencePart(parts, "sourcePath", finding.sourcePath());
+        addEvidencePart(parts, "targetScope", finding.targetScope());
+        addEvidencePart(parts, "targetKey", finding.targetKey());
+        addEvidencePart(parts, "failureReason", finding.failureReason());
+        addEvidencePart(parts, "oldValueSummary", finding.oldValueSummary());
+        addEvidencePart(parts, "newValueSummary", finding.newValueSummary());
+        return String.join(" ", parts);
+    }
+
+    private void addEvidencePart(List<String> parts, String key, String value) {
+        if (value != null && !value.isBlank()) {
+            parts.add(key + "=" + value);
+        }
     }
 
     private List<String> writeObservationIfUseful(
@@ -994,6 +1196,8 @@ public class FailureAnalysisApplicationService {
     private ObservationType observationType(FailureClassification classification) {
         return switch (classification) {
             case AUTH_ISSUE, VALIDATION_ISSUE, SERVER_ERROR, DURATION_REGRESSION,
+                VARIABLE_EXTRACTION_FAILURE, VARIABLE_RESOLUTION_FAILURE, VARIABLE_WRITEBACK_FAILURE,
+                VARIABLE_OVERWRITE_RISK, INVALID_EXTRACT_RULE, UNSUPPORTED_EXTRACT_SOURCE,
                 PREREQUISITE_STEP_FAILURE, SUITE_PREREQUISITE_FAILURE -> ObservationType.RISK_EVALUATION;
             case UNKNOWN, NONE, SKIPPED -> ObservationType.GENERAL_COMMENT;
             default -> ObservationType.ASSERTION_FAILURE_ANALYSIS;
@@ -1010,8 +1214,16 @@ public class FailureAnalysisApplicationService {
             || classification == FailureClassification.SERVER_ERROR
             || classification == FailureClassification.PREREQUISITE_STEP_FAILURE
             || classification == FailureClassification.SUITE_PREREQUISITE_FAILURE
+            || classification == FailureClassification.VARIABLE_RESOLUTION_FAILURE
+            || classification == FailureClassification.VARIABLE_EXTRACTION_FAILURE
+            || classification == FailureClassification.VARIABLE_WRITEBACK_FAILURE
+            || classification == FailureClassification.INVALID_EXTRACT_RULE
+            || classification == FailureClassification.UNSUPPORTED_EXTRACT_SOURCE
             || suiteFailure.dependentSkippedStepCount() > 0) {
             return ObservationRiskLevel.HIGH;
+        }
+        if (classification == FailureClassification.VARIABLE_OVERWRITE_RISK) {
+            return ObservationRiskLevel.MEDIUM;
         }
         if (classification == FailureClassification.AUTH_ISSUE
             || classification == FailureClassification.ENVIRONMENT_ISSUE
@@ -1052,6 +1264,15 @@ public class FailureAnalysisApplicationService {
             || classification == FailureClassification.SUITE_PREREQUISITE_FAILURE) {
             return suiteFailure.impactSummary();
         }
+        if (variableClassification(classification)) {
+            var variableRoot = rootVariableFailure(variableFailures(record));
+            if (variableRoot != null) {
+                return "Suite variable failure " + variableRoot.classification()
+                    + " at step " + variableRoot.stepId()
+                    + variableFailureTarget(variableRoot)
+                    + " reason " + variableRoot.failureReason();
+            }
+        }
         if (record.getErrorMessage() != null && !record.getErrorMessage().isBlank()) {
             return record.getErrorMessage();
         }
@@ -1060,6 +1281,31 @@ public class FailureAnalysisApplicationService {
             return first.type() + " expected " + first.expected() + " but got " + first.actual();
         }
         return "Execution evidence indicates " + classification;
+    }
+
+    private boolean variableClassification(FailureClassification classification) {
+        return classification == FailureClassification.VARIABLE_EXTRACTION_FAILURE
+            || classification == FailureClassification.VARIABLE_RESOLUTION_FAILURE
+            || classification == FailureClassification.VARIABLE_WRITEBACK_FAILURE
+            || classification == FailureClassification.VARIABLE_OVERWRITE_RISK
+            || classification == FailureClassification.INVALID_EXTRACT_RULE
+            || classification == FailureClassification.UNSUPPORTED_EXTRACT_SOURCE;
+    }
+
+    private String variableFailureTarget(SuiteVariableFailure finding) {
+        if (finding.expression() != null) {
+            return " consuming " + finding.expression()
+                + " at " + finding.location()
+                + " scope " + finding.scope()
+                + " path " + finding.path();
+        }
+        if (finding.targetKey() != null) {
+            return " writing " + finding.targetScope()
+                + "." + finding.targetKey()
+                + " from " + finding.sourceType()
+                + " " + finding.sourcePath();
+        }
+        return "";
     }
 
     private boolean retryable(ExecutionRecord record, FailureClassification classification) {
@@ -1102,6 +1348,12 @@ public class FailureAnalysisApplicationService {
             case STATUS_MISMATCH, RESPONSE_SHAPE_MISMATCH, RESPONSE_VALUE_MISMATCH, BODY_PRESENCE_FAILURE -> assetDriftEvidence(record)
                 ? "Review API behavior change and update TestCase expectations if the change is intentional."
                 : "Investigate API behavior versus TestCase expectations.";
+            case VARIABLE_EXTRACTION_FAILURE -> "Check response field path, extractRule source mapping, and upstream response shape before rerunning downstream steps.";
+            case VARIABLE_RESOLUTION_FAILURE -> "Provide the missing variable, fix the variable reference, or move the producing suite step before this consumer.";
+            case VARIABLE_WRITEBACK_FAILURE -> "Check variable target scope, target key, and writeback policy before relying on downstream consumers.";
+            case INVALID_EXTRACT_RULE -> "Fix the extractRule target scope, target key, source type, or source path through replanning or manual review.";
+            case UNSUPPORTED_EXTRACT_SOURCE -> "Replace the unsupported extract source with BODY_JSON, HEADER, or STATUS_CODE through replanning or manual review.";
+            case VARIABLE_OVERWRITE_RISK -> "Review same-name variable overwrite before treating downstream values as stable.";
             case DURATION_REGRESSION -> retryable
                 ? "Retry once to rule out transient latency, then investigate performance regression."
                 : "Investigate API latency and performance regression risk.";
@@ -1116,10 +1368,12 @@ public class FailureAnalysisApplicationService {
     private SuiteFailureAnalysis suiteFailureAnalysis(
         ExecutionRecord record,
         FailureClassification classification,
-        SuiteFailureSummary suiteFailure
+        SuiteFailureSummary suiteFailure,
+        List<SuiteVariableFailure> variableFindings
     ) {
         var response = safeMap(record.getResponseSnapshot());
         var steps = suiteSteps(response);
+        var variableRoot = rootVariableFailure(variableFindings);
         if (!suiteFailure.suiteExecution() && steps.isEmpty()) {
             return SuiteFailureAnalysis.none();
         }
@@ -1132,6 +1386,8 @@ public class FailureAnalysisApplicationService {
                 null,
                 List.of(),
                 List.of(),
+                variableRoot,
+                variableFindings,
                 0,
                 0,
                 0,
@@ -1161,6 +1417,8 @@ public class FailureAnalysisApplicationService {
                 null,
                 List.of(),
                 List.of(),
+                variableRoot,
+                variableFindings,
                 orderedSteps.size(),
                 skipped.size(),
                 0,
@@ -1183,6 +1441,8 @@ public class FailureAnalysisApplicationService {
             failedStep,
             dependentSkipped,
             dependentSkipped,
+            variableRoot,
+            variableFindings,
             orderedSteps.size(),
             skipped.size(),
             dependentSkipped.size(),
@@ -1364,6 +1624,16 @@ public class FailureAnalysisApplicationService {
 
     private String stringValue(Object value) {
         return value == null ? null : String.valueOf(value);
+    }
+
+    private String firstString(Map<String, Object> map, String... keys) {
+        for (var key : keys) {
+            var value = stringValue(map.get(key));
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return null;
     }
 
     private Integer intValue(Object value) {

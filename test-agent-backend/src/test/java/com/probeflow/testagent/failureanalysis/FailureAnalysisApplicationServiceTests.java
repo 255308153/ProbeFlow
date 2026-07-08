@@ -474,6 +474,193 @@ class FailureAnalysisApplicationServiceTests {
     }
 
     @Test
+    void suiteAnalysisClassifiesVariableExtractionResolutionWritebackAndOverwriteFacts() {
+        var extractionDiagnostic = mapOf(
+            "code", "PATH_MISSING",
+            "message", "Unable to extract response variable",
+            "stepId", "create-order",
+            "ruleId", "extract-order-id",
+            "sourceType", "BODY_JSON",
+            "sourcePath", "$.data.orderId",
+            "targetScope", "suite",
+            "targetKey", "orderId",
+            "required", true
+        );
+        var extraction = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("suite", true, "stepCount", 2),
+            suiteResponse(
+                List.of(
+                    suiteStep("create-order", 1, "api-create", "BLOCKED", "Required variable extraction failed", 201),
+                    suiteStep("pay-order", 2, "api-pay", "SKIPPED", "Required variable extraction failed for suite step create-order", null)
+                ),
+                List.of(extractionDiagnostic),
+                List.of(mapOf(
+                    "eventType", "PRODUCTION",
+                    "stepId", "create-order",
+                    "sourceType", "BODY_JSON",
+                    "sourcePath", "$.data.orderId",
+                    "targetScope", "suite",
+                    "targetKey", "orderId",
+                    "success", false,
+                    "failureReason", "PATH_MISSING"
+                ))
+            ),
+            List.of()
+        ));
+        var resolution = executionRecords.save(newExecutionRecord(
+            OverallStatus.BLOCKED,
+            Map.of("suite", true, "stepCount", 2),
+            suiteResponse(
+                List.of(
+                    suiteStep("create-order", 1, "api-create", "PASSED", null, 201),
+                    suiteStep("pay-order", 2, "api-pay", "BLOCKED", "Variable resolution failed", null)
+                ),
+                List.of(mapOf(
+                    "code", "PATH_MISSING",
+                    "message", "Unable to resolve variable: ${suite.orderId}",
+                    "stepId", "pay-order",
+                    "location", "request.path",
+                    "scope", "suite",
+                    "path", "orderId",
+                    "expression", "${suite.orderId}"
+                )),
+                List.of(mapOf(
+                    "eventType", "CONSUMPTION",
+                    "stepId", "pay-order",
+                    "location", "request.path",
+                    "expression", "${suite.orderId}",
+                    "scope", "suite",
+                    "path", "orderId",
+                    "resolved", false,
+                    "failureReason", "PATH_MISSING"
+                ))
+            ),
+            List.of()
+        ));
+        var writeback = executionRecords.save(newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("suite", true, "stepCount", 1),
+            suiteResponse(
+                List.of(suiteStep("create-order", 1, "api-create", "BLOCKED", "Unsupported variable write scope", 201)),
+                List.of(mapOf(
+                    "code", "UNSUPPORTED_WRITE_SCOPE",
+                    "message", "Unsupported variable write scope: global",
+                    "stepId", "create-order",
+                    "targetScope", "global",
+                    "targetKey", "orderId"
+                )),
+                List.of(mapOf(
+                    "eventType", "PRODUCTION",
+                    "stepId", "create-order",
+                    "sourceType", "BODY_JSON",
+                    "sourcePath", "$.orderId",
+                    "targetScope", "global",
+                    "targetKey", "orderId",
+                    "success", false,
+                    "failureReason", "UNSUPPORTED_WRITE_SCOPE"
+                ))
+            ),
+            List.of()
+        ));
+        var overwrite = executionRecords.save(newExecutionRecord(
+            OverallStatus.PASSED_WITH_WARNINGS,
+            Map.of("suite", true, "stepCount", 2),
+            suiteResponse(
+                List.of(
+                    suiteStep("login", 1, "api-login", "PASSED", null, 200),
+                    suiteStep("refresh-login", 2, "api-refresh", "PASSED", null, 200)
+                ),
+                List.of(),
+                List.of(mapOf(
+                    "eventType", "PRODUCTION",
+                    "stepId", "refresh-login",
+                    "sourceType", "HEADER",
+                    "sourcePath", "Authorization",
+                    "targetScope", "suite",
+                    "targetKey", "authToken",
+                    "success", true,
+                    "overwritten", true,
+                    "oldValueSummary", "[REDACTED]",
+                    "newValueSummary", "[REDACTED]"
+                ))
+            ),
+            List.of()
+        ));
+        entityManager.flush();
+        entityManager.clear();
+
+        var extractionResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(extraction.getExecutionId()));
+        var resolutionResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(resolution.getExecutionId()));
+        var writebackResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(writeback.getExecutionId()));
+        var overwriteResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(overwrite.getExecutionId()));
+
+        assertVariableFailure(
+            extractionResult,
+            FailureClassification.VARIABLE_EXTRACTION_FAILURE,
+            "create-order",
+            "extract-order-id",
+            "BODY_JSON",
+            "$.data.orderId",
+            "suite",
+            "orderId",
+            "PATH_MISSING"
+        );
+        assertThat(extractionResult.nextSuggestion()).contains("response field path", "extractRule");
+        assertThat(resolutionResult.classification()).isEqualTo(FailureClassification.VARIABLE_RESOLUTION_FAILURE);
+        assertThat(resolutionResult.suiteFailureAnalysis().variableFailure())
+            .satisfies(finding -> {
+                assertThat(finding.stepId()).isEqualTo("pay-order");
+                assertThat(finding.expression()).isEqualTo("${suite.orderId}");
+                assertThat(finding.location()).isEqualTo("request.path");
+                assertThat(finding.scope()).isEqualTo("suite");
+                assertThat(finding.path()).isEqualTo("orderId");
+            });
+        assertThat(resolutionResult.nextSuggestion()).contains("Provide the missing variable");
+        assertVariableFailure(
+            writebackResult,
+            FailureClassification.VARIABLE_WRITEBACK_FAILURE,
+            "create-order",
+            null,
+            null,
+            null,
+            "global",
+            "orderId",
+            "UNSUPPORTED_WRITE_SCOPE"
+        );
+        assertThat(writebackResult.nextSuggestion()).contains("target scope", "target key");
+        assertThat(overwriteResult.classification()).isEqualTo(FailureClassification.VARIABLE_OVERWRITE_RISK);
+        assertThat(overwriteResult.suiteFailureAnalysis().variableFailure())
+            .satisfies(finding -> {
+                assertThat(finding.stepId()).isEqualTo("refresh-login");
+                assertThat(finding.targetKey()).isEqualTo("authToken");
+                assertThat(finding.oldValueSummary()).isEqualTo("[REDACTED]");
+                assertThat(finding.newValueSummary()).isEqualTo("[REDACTED]");
+            });
+        assertThat(overwriteResult.evidence()).anySatisfy(item -> assertThat(item)
+            .contains("variableFailure=VARIABLE_OVERWRITE_RISK", "oldValueSummary=[REDACTED]", "newValueSummary=[REDACTED]")
+            .doesNotContain("secret-old", "secret-new"));
+    }
+
+    @Test
+    void suiteAnalysisClassifiesInvalidAndUnsupportedExtractRules() {
+        var invalid = executionRecords.save(variableRuleFailure("INVALID_EXTRACT_RULE", "ExtractRule targetKey is required", "BODY_JSON"));
+        var unsupported = executionRecords.save(variableRuleFailure("UNSUPPORTED_EXTRACT_SOURCE", "Unsupported extract source type: XML", "XML"));
+        entityManager.flush();
+        entityManager.clear();
+
+        var invalidResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(invalid.getExecutionId()));
+        var unsupportedResult = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(unsupported.getExecutionId()));
+
+        assertThat(invalidResult.classification()).isEqualTo(FailureClassification.INVALID_EXTRACT_RULE);
+        assertThat(invalidResult.suiteFailureAnalysis().variableFailure().targetScope()).isEqualTo("suite");
+        assertThat(invalidResult.nextSuggestion()).contains("Fix the extractRule");
+        assertThat(unsupportedResult.classification()).isEqualTo(FailureClassification.UNSUPPORTED_EXTRACT_SOURCE);
+        assertThat(unsupportedResult.suiteFailureAnalysis().variableFailure().sourceType()).isEqualTo("XML");
+        assertThat(unsupportedResult.nextSuggestion()).contains("BODY_JSON", "HEADER", "STATUS_CODE");
+    }
+
+    @Test
     void taskAnalysisAggregatesDeduplicatesOrdersAndFlagsMissingLinkedRecords() {
         var api = apiSpecs.save(newApiSpec("/api/orders"));
         var caseOne = testCases.save(newTestCase("case-one", api.getApiSpecId()));
@@ -887,6 +1074,94 @@ class FailureAnalysisApplicationServiceTests {
         step.put("responseSnapshot", statusCode == null ? Map.of() : Map.of("statusCode", statusCode));
         step.put("assertionResults", List.of());
         return step;
+    }
+
+    private Map<String, Object> suiteResponse(
+        List<Map<String, Object>> steps,
+        List<Map<String, Object>> runtimeDiagnostics,
+        List<Map<String, Object>> auditEvents
+    ) {
+        return mapOf(
+            "suite", true,
+            "steps", steps,
+            "runtimeDiagnostics", runtimeDiagnostics,
+            "variableAuditSummary", mapOf(
+                "totalEvents", auditEvents.size(),
+                "failureEvents", auditEvents.stream()
+                    .filter(event -> Boolean.FALSE.equals(event.get("success")) || Boolean.FALSE.equals(event.get("resolved")))
+                    .count(),
+                "events", auditEvents
+            )
+        );
+    }
+
+    private ExecutionRecord variableRuleFailure(String code, String message, String sourceType) {
+        return newExecutionRecord(
+            OverallStatus.FAILED,
+            Map.of("suite", true, "stepCount", 1),
+            suiteResponse(
+                List.of(suiteStep("create-order", 1, "api-create", "BLOCKED", message, 201)),
+                List.of(mapOf(
+                    "code", code,
+                    "message", message,
+                    "stepId", "create-order",
+                    "ruleId", "extract-order-id",
+                    "sourceType", sourceType,
+                    "sourcePath", "$.data.orderId",
+                    "targetScope", "suite",
+                    "targetKey", "orderId"
+                )),
+                List.of(mapOf(
+                    "eventType", "PRODUCTION",
+                    "stepId", "create-order",
+                    "sourceType", sourceType,
+                    "sourcePath", "$.data.orderId",
+                    "targetScope", "suite",
+                    "targetKey", "orderId",
+                    "success", false,
+                    "failureReason", code
+                ))
+            ),
+            List.of()
+        );
+    }
+
+    private void assertVariableFailure(
+        FailureAnalysisResult result,
+        FailureClassification classification,
+        String stepId,
+        String extractRuleId,
+        String sourceType,
+        String sourcePath,
+        String targetScope,
+        String targetKey,
+        String failureReason
+    ) {
+        assertThat(result.classification()).isEqualTo(classification);
+        assertThat(result.suiteFailureAnalysis().variableFailure())
+            .satisfies(finding -> {
+                assertThat(finding.classification()).isEqualTo(classification);
+                assertThat(finding.stepId()).isEqualTo(stepId);
+                assertThat(finding.extractRuleId()).isEqualTo(extractRuleId);
+                assertThat(finding.sourceType()).isEqualTo(sourceType);
+                assertThat(finding.sourcePath()).isEqualTo(sourcePath);
+                assertThat(finding.targetScope()).isEqualTo(targetScope);
+                assertThat(finding.targetKey()).isEqualTo(targetKey);
+                assertThat(finding.failureReason()).isEqualTo(failureReason);
+            });
+        assertThat(result.evidence()).anySatisfy(item -> assertThat(item)
+            .contains("variableFailure=" + classification)
+            .contains("stepId=" + stepId)
+            .contains("targetKey=" + targetKey)
+            .contains("failureReason=" + failureReason));
+    }
+
+    private Map<String, Object> mapOf(Object... keyValues) {
+        var map = new java.util.LinkedHashMap<String, Object>();
+        for (int index = 0; index < keyValues.length; index += 2) {
+            map.put(String.valueOf(keyValues[index]), keyValues[index + 1]);
+        }
+        return map;
     }
 
     private void assertRecommendation(
