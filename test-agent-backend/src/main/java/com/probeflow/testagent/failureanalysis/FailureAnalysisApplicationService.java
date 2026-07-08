@@ -76,11 +76,16 @@ public class FailureAnalysisApplicationService {
         var classification = classify(record, failedAssertions, suiteFailure, variableFindings, dependencyFailure);
         var suiteFailureAnalysis = suiteFailureAnalysis(record, classification, suiteFailure, variableFindings, dependencyFailure);
         var riskLevel = riskLevel(record, classification, failedAssertions, suiteFailure);
-        var summary = summary(record, classification, suiteFailure);
-        var failureReason = failureReason(record, classification, failedAssertions, suiteFailure);
         var retryable = retryable(record, classification);
-        var retryReason = retryReason(record, classification, retryable);
-        var nextSuggestion = nextSuggestion(record, classification, retryable, suiteFailure);
+        var evidence = redacted(evidence(record, failedAssertions, classification, suiteFailure, suiteFailureAnalysis));
+        var summary = redact(summary(record, classification, suiteFailure));
+        var failureReason = redact(failureReason(record, classification, failedAssertions, suiteFailure));
+        var retryReason = redact(retryReason(record, classification, retryable));
+        var nextSuggestion = redact(nextSuggestion(record, classification, retryable, suiteFailure));
+        var confidence = confidence(record, classification, failedAssertions, suiteFailure, suiteFailureAnalysis, evidence);
+        var requiresHumanReview = requiresHumanReview(record, classification, suiteFailureAnalysis, evidence, confidence);
+        var impactSummary = redact(impactSummary(record, suiteFailure, suiteFailureAnalysis));
+        var recoveryActionType = recoveryActionType(classification, requiresHumanReview, confidence);
         var observationIds = writeObservationIfUseful(
             record,
             classification,
@@ -89,7 +94,6 @@ public class FailureAnalysisApplicationService {
             failureReason,
             nextSuggestion
         );
-        var evidence = evidence(record, failedAssertions, classification, suiteFailure, suiteFailureAnalysis);
         var taskMemoryIds = writeTaskMemoryIfUseful(
             record,
             classification,
@@ -130,6 +134,10 @@ public class FailureAnalysisApplicationService {
             summary,
             failureReason,
             nextSuggestion,
+            confidence,
+            requiresHumanReview,
+            impactSummary,
+            recoveryActionType,
             retryable,
             retryReason,
             taskMemoryIds,
@@ -850,6 +858,8 @@ public class FailureAnalysisApplicationService {
             evidence.add("durationMs=" + record.getDurationMs());
         }
         var response = safeMap(record.getResponseSnapshot());
+        snapshotEvidence("requestSnapshot", safeMap(record.getRequestSnapshot())).forEach(evidence::add);
+        snapshotEvidence("responseSnapshot", response).forEach(evidence::add);
         var failureType = stringValue(response.get("failureType"));
         if (failureType != null) {
             evidence.add("failureType=" + failureType);
@@ -871,10 +881,14 @@ public class FailureAnalysisApplicationService {
         if (suiteFailure.suiteExecution()) {
             evidence.add("suiteStepCount=" + suiteFailure.totalSteps());
             suiteSteps(response).stream()
+                .sorted(Comparator.comparingInt(step -> intValue(step.get("order")) == null ? Integer.MAX_VALUE : intValue(step.get("order"))))
                 .map(this::suiteStepEvidence)
                 .forEach(evidence::add);
             runtimeDiagnostics(record).stream()
                 .map(this::runtimeDiagnosticEvidence)
+                .forEach(evidence::add);
+            variableAuditEvents(record).stream()
+                .map(this::variableAuditEvidence)
                 .forEach(evidence::add);
             if (suiteFailure.failedStepId() != null) {
                 evidence.add("firstFailedStep=" + suiteFailure.failedStepId() + " order=" + suiteFailure.failedStepOrder());
@@ -900,9 +914,56 @@ public class FailureAnalysisApplicationService {
         return List.copyOf(evidence);
     }
 
+    private List<String> snapshotEvidence(String prefix, Map<String, Object> snapshot) {
+        if (snapshot.isEmpty()) {
+            return List.of(prefix + "=empty");
+        }
+        var keys = List.of(
+            "method",
+            "path",
+            "url",
+            "apiSpecId",
+            "headers",
+            "statusCode",
+            "failureType",
+            "errorType",
+            "bodyType",
+            "bodySizeBytes",
+            "bodyTruncated",
+            "message",
+            "skipReason"
+        );
+        var parts = new ArrayList<String>();
+        for (var key : keys) {
+            if (snapshot.containsKey(key)) {
+                parts.add(key + "=" + summarizeValue(snapshot.get(key)));
+            }
+        }
+        return parts.isEmpty()
+            ? List.of(prefix + "=present")
+            : List.of(prefix + " " + String.join(" ", parts));
+    }
+
+    private String summarizeValue(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            var parts = new ArrayList<String>();
+            new TreeMap<>(objectMap(map)).forEach((key, item) -> parts.add(key + "=" + summarizeScalar(item)));
+            return "{" + String.join(",", parts) + "}";
+        }
+        if (value instanceof List<?> list) {
+            return "list(size=" + list.size() + ")";
+        }
+        return summarizeScalar(value);
+    }
+
+    private String summarizeScalar(Object value) {
+        return value == null ? "null" : String.valueOf(value);
+    }
+
     private String suiteStepEvidence(Map<String, Object> step) {
         var parts = new ArrayList<String>();
         parts.add("suiteStep=" + stringValue(step.get("stepId")));
+        addEvidencePart(parts, "stepName", stringValue(step.get("stepName")));
         addEvidencePart(parts, "order", stringValue(step.get("order")));
         addEvidencePart(parts, "status", firstNonBlank(stringValue(step.get("overallStatus")), stringValue(step.get("status"))));
         addEvidencePart(parts, "apiSpecId", stringValue(step.get("apiSpecId")));
@@ -918,10 +979,35 @@ public class FailureAnalysisApplicationService {
         addEvidencePart(parts, "message", stringValue(diagnostic.get("message")));
         addEvidencePart(parts, "producerStepId", firstString(diagnostic, "producerStepId", "producerStep"));
         addEvidencePart(parts, "consumerStepId", firstString(diagnostic, "consumerStepId", "consumerStep"));
+        addEvidencePart(parts, "expression", stringValue(diagnostic.get("expression")));
+        addEvidencePart(parts, "location", stringValue(diagnostic.get("location")));
         addEvidencePart(parts, "scope", variableScope(diagnostic));
         addEvidencePart(parts, "path", variablePath(diagnostic));
+        addEvidencePart(parts, "sourceType", stringValue(diagnostic.get("sourceType")));
+        addEvidencePart(parts, "sourcePath", stringValue(diagnostic.get("sourcePath")));
+        addEvidencePart(parts, "targetScope", stringValue(diagnostic.get("targetScope")));
+        addEvidencePart(parts, "targetKey", stringValue(diagnostic.get("targetKey")));
         return String.join(" ", parts);
     }
+
+    private String variableAuditEvidence(Map<String, Object> event) {
+        var parts = new ArrayList<String>();
+        parts.add("variableAuditEvent=" + stringValue(event.get("eventType")));
+        addEvidencePart(parts, "stepId", stringValue(event.get("stepId")));
+        addEvidencePart(parts, "expression", stringValue(event.get("expression")));
+        addEvidencePart(parts, "location", stringValue(event.get("location")));
+        addEvidencePart(parts, "scope", variableScope(event));
+        addEvidencePart(parts, "path", variablePath(event));
+        addEvidencePart(parts, "sourceType", stringValue(event.get("sourceType")));
+        addEvidencePart(parts, "sourcePath", stringValue(event.get("sourcePath")));
+        addEvidencePart(parts, "targetScope", stringValue(event.get("targetScope")));
+        addEvidencePart(parts, "targetKey", stringValue(event.get("targetKey")));
+        addEvidencePart(parts, "resolved", stringValue(event.get("resolved")));
+        addEvidencePart(parts, "success", stringValue(event.get("success")));
+        addEvidencePart(parts, "failureReason", stringValue(event.get("failureReason")));
+        return String.join(" ", parts);
+    }
+
 
     private String dependencyEvidence(SuiteDependencyFailure failure) {
         var parts = new ArrayList<String>();
@@ -1228,6 +1314,10 @@ public class FailureAnalysisApplicationService {
             result.summary(),
             result.failureReason(),
             result.nextSuggestion(),
+            result.confidence(),
+            result.requiresHumanReview(),
+            result.impactSummary(),
+            result.recoveryActionType(),
             result.retryable(),
             result.retryReason(),
             result.taskMemoryIds(),
@@ -1788,6 +1878,149 @@ public class FailureAnalysisApplicationService {
             case SKIPPED, NONE -> "No failure follow-up is required.";
             default -> "Review deterministic failure analysis evidence.";
         };
+    }
+
+    private List<String> redacted(List<String> values) {
+        return values.stream()
+            .map(this::redact)
+            .toList();
+    }
+
+    private String redact(String value) {
+        if (value == null || value.isBlank()) {
+            return value;
+        }
+        var redacted = value
+            .replaceAll("(?i)(bearer\\s+)[^\\s,}\\]]+", "$1[REDACTED]")
+            .replaceAll("(?i)(basic\\s+)[^\\s,}\\]]+", "$1[REDACTED]");
+        redacted = redacted.replaceAll(
+            "(?i)((?:authorization|cookie|password|secret|token|apikey|apiKey|credential)\\s*[=:]\\s*)[^\\s,}\\]]+",
+            "$1[REDACTED]"
+        );
+        redacted = redacted.replaceAll(
+            "(?i)((?:authorization|cookie|password|secret|token|apikey|apiKey|credential)\\s+)[^\\s,}\\]]+",
+            "$1[REDACTED]"
+        );
+        return redacted;
+    }
+
+    private double confidence(
+        ExecutionRecord record,
+        FailureClassification classification,
+        List<FailedAssertionSummary> failedAssertions,
+        SuiteFailureSummary suiteFailure,
+        SuiteFailureAnalysis suiteFailureAnalysis,
+        List<String> evidence
+    ) {
+        var confidence = switch (classification) {
+            case NONE, SKIPPED -> 1.0d;
+            case VARIABLE_RESOLUTION_FAILURE, VARIABLE_EXTRACTION_FAILURE, VARIABLE_WRITEBACK_FAILURE,
+                DEPENDENCY_ORDER_FAILURE, BUSINESS_PRECONDITION_FAILURE, DOWNSTREAM_API_FAILURE,
+                PREREQUISITE_STEP_FAILURE, SUITE_PREREQUISITE_FAILURE -> 0.90d;
+            case INVALID_EXTRACT_RULE, UNSUPPORTED_EXTRACT_SOURCE -> 0.84d;
+            case VARIABLE_OVERWRITE_RISK -> 0.78d;
+            case AUTH_ISSUE, ENVIRONMENT_ISSUE, BLOCKED_REQUEST, TIMEOUT, TRANSPORT_ERROR -> 0.82d;
+            case SERVER_ERROR, STATUS_MISMATCH, RESPONSE_SHAPE_MISMATCH, RESPONSE_VALUE_MISMATCH,
+                BODY_PRESENCE_FAILURE, DURATION_REGRESSION, VALIDATION_ISSUE -> 0.80d;
+            case UNKNOWN -> 0.35d;
+            default -> 0.65d;
+        };
+        if (evidence.size() < 3 && classification != FailureClassification.NONE && classification != FailureClassification.SKIPPED) {
+            confidence -= 0.10d;
+        }
+        if (rootCauseCandidateCount(suiteFailureAnalysis) > 1) {
+            confidence -= 0.15d;
+        }
+        if (failedAssertions.size() > 1 && !suiteFailure.suiteExecution()) {
+            confidence -= 0.05d;
+        }
+        if (record.getErrorMessage() != null && !record.getErrorMessage().isBlank()) {
+            confidence += 0.03d;
+        }
+        return Math.round(clamp(confidence, 0.0d, 1.0d) * 100.0d) / 100.0d;
+    }
+
+    private boolean requiresHumanReview(
+        ExecutionRecord record,
+        FailureClassification classification,
+        SuiteFailureAnalysis suiteFailureAnalysis,
+        List<String> evidence,
+        double confidence
+    ) {
+        if (confidence < 0.65d || evidence.size() < 3 || classification == FailureClassification.UNKNOWN) {
+            return true;
+        }
+        if (rootCauseCandidateCount(suiteFailureAnalysis) > 1) {
+            return true;
+        }
+        return classification == FailureClassification.DEPENDENCY_ORDER_FAILURE
+            || classification == FailureClassification.BUSINESS_PRECONDITION_FAILURE
+            || classification == FailureClassification.INVALID_EXTRACT_RULE
+            || classification == FailureClassification.UNSUPPORTED_EXTRACT_SOURCE
+            || (record.isCriticalFailed() && confidence < 0.75d);
+    }
+
+    private String impactSummary(
+        ExecutionRecord record,
+        SuiteFailureSummary suiteFailure,
+        SuiteFailureAnalysis suiteFailureAnalysis
+    ) {
+        if (suiteFailureAnalysis.suiteExecution()) {
+            var impact = suiteFailureAnalysis.impactSummary();
+            if (suiteFailureAnalysis.affectedDownstreamSteps().size() > 0) {
+                return impact + " Affected downstream step count: " + suiteFailureAnalysis.affectedDownstreamSteps().size() + ".";
+            }
+            return impact;
+        }
+        return "Single execution impact is limited to execution " + record.getExecutionId()
+            + " for case " + record.getCaseId() + ".";
+    }
+
+    private RecoveryActionType recoveryActionType(
+        FailureClassification classification,
+        boolean requiresHumanReview,
+        double confidence
+    ) {
+        if (confidence < 0.50d || classification == FailureClassification.UNKNOWN) {
+            return RecoveryActionType.WAIT_FOR_HUMAN;
+        }
+        return switch (classification) {
+            case VARIABLE_EXTRACTION_FAILURE, INVALID_EXTRACT_RULE, UNSUPPORTED_EXTRACT_SOURCE -> RecoveryActionType.FIX_EXTRACT_RULE;
+            case VARIABLE_RESOLUTION_FAILURE, VARIABLE_WRITEBACK_FAILURE, AUTH_ISSUE, ENVIRONMENT_ISSUE,
+                VALIDATION_ISSUE -> RecoveryActionType.PROVIDE_INPUT;
+            case DEPENDENCY_ORDER_FAILURE -> RecoveryActionType.REORDER_STEPS;
+            case DOWNSTREAM_API_FAILURE, SERVER_ERROR -> RecoveryActionType.CHECK_DOWNSTREAM_API;
+            case TIMEOUT, TRANSPORT_ERROR -> RecoveryActionType.RETRY;
+            case STATUS_MISMATCH, RESPONSE_SHAPE_MISMATCH, RESPONSE_VALUE_MISMATCH, BODY_PRESENCE_FAILURE,
+                DURATION_REGRESSION, ASSERTION_FAILURE -> RecoveryActionType.REVIEW_ASSERTION;
+            case BUSINESS_PRECONDITION_FAILURE, BLOCKED_REQUEST -> RecoveryActionType.WAIT_FOR_HUMAN;
+            case VARIABLE_OVERWRITE_RISK, PREREQUISITE_STEP_FAILURE, SUITE_PREREQUISITE_FAILURE -> requiresHumanReview
+                ? RecoveryActionType.WAIT_FOR_HUMAN
+                : RecoveryActionType.REVIEW_ASSERTION;
+            case NONE, SKIPPED, PASSED_WITH_WARNING -> RecoveryActionType.NOOP;
+            default -> RecoveryActionType.NOOP;
+        };
+    }
+
+    private int rootCauseCandidateCount(SuiteFailureAnalysis suiteFailureAnalysis) {
+        if (suiteFailureAnalysis == null) {
+            return 0;
+        }
+        var count = 0;
+        if (suiteFailureAnalysis.rootCauseStep() != null) {
+            count++;
+        }
+        if (suiteFailureAnalysis.variableFailure() != null) {
+            count++;
+        }
+        if (suiteFailureAnalysis.dependencyFailure() != null) {
+            count++;
+        }
+        return count;
+    }
+
+    private double clamp(double value, double min, double max) {
+        return Math.max(min, Math.min(max, value));
     }
 
     private SuiteFailureAnalysis suiteFailureAnalysis(

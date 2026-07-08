@@ -865,6 +865,106 @@ class FailureAnalysisApplicationServiceTests {
     }
 
     @Test
+    void analysisBuildsStableRedactedEvidenceConfidenceImpactAndRecoveryPolicy() {
+        var createStep = suiteStep("create-order", 1, "api-create", "BLOCKED", "Required variable extraction failed", 201);
+        createStep.put("stepName", "Create order");
+        var payStep = suiteStep("pay-order", 2, "api-pay", "SKIPPED", "Skipped because prerequisite step failed: create-order", null);
+        payStep.put("stepName", "Pay order");
+        var response = suiteResponse(
+            List.of(payStep, createStep),
+            List.of(mapOf(
+                "code", "PATH_MISSING",
+                "message", "Unable to extract order id with authorization=Bearer raw-runtime-token",
+                "stepId", "create-order",
+                "ruleId", "extract-order-id",
+                "sourceType", "BODY_JSON",
+                "sourcePath", "$.data.orderId",
+                "targetScope", "suite",
+                "targetKey", "orderId"
+            )),
+            List.of(mapOf(
+                "eventType", "PRODUCTION",
+                "stepId", "create-order",
+                "sourceType", "BODY_JSON",
+                "sourcePath", "$.data.orderId",
+                "targetScope", "suite",
+                "targetKey", "orderId",
+                "success", false,
+                "failureReason", "PATH_MISSING"
+            ))
+        );
+        response.put("message", "password=raw-password Cookie=raw-cookie apiKey=raw-api-key");
+        var record = newExecutionRecord(
+            OverallStatus.FAILED,
+            mapOf(
+                "method", "POST",
+                "path", "/api/orders",
+                "url", "https://api.test.example/api/orders",
+                "headers", mapOf(
+                    "Authorization", "Bearer raw-auth-token",
+                    "Cookie", "session=raw-cookie",
+                    "X-ApiKey", "raw-api-key"
+                )
+            ),
+            response,
+            List.of(Map.of(
+                "name", "order id extracted",
+                "type", "JSON_FIELD_EXISTS",
+                "path", "$.data.orderId",
+                "expected", true,
+                "actual", false,
+                "status", "FAILED",
+                "stepId", "create-order"
+            ))
+        );
+        record.setErrorMessage("Transport details included Bearer raw-error-token and secret=raw-secret");
+        record = executionRecords.save(record);
+        entityManager.flush();
+        entityManager.clear();
+
+        var result = failureAnalysis.analyzeExecution(FailureAnalysisRequest.basic(record.getExecutionId()));
+
+        assertThat(result.classification()).isEqualTo(FailureClassification.VARIABLE_EXTRACTION_FAILURE);
+        assertThat(result.riskLevel()).isEqualTo("HIGH");
+        assertThat(result.confidence()).isGreaterThanOrEqualTo(0.70d).isLessThan(0.95d);
+        assertThat(result.requiresHumanReview()).isTrue();
+        assertThat(result.recoveryActionType()).isEqualTo(RecoveryActionType.FIX_EXTRACT_RULE);
+        assertThat(result.impactSummary()).contains("Affected downstream step count: 1");
+        assertThat(result.nextSuggestion()).contains("response field path", "extractRule");
+        assertThat(result.evidence()).containsSubsequence(
+            "overallStatus=FAILED",
+            "durationMs=123"
+        );
+        assertThat(indexOfEvidence(result.evidence(), "requestSnapshot")).isLessThan(indexOfEvidence(result.evidence(), "responseSnapshot"));
+        assertThat(indexOfEvidence(result.evidence(), "suiteStep=create-order"))
+            .isLessThan(indexOfEvidence(result.evidence(), "suiteStep=pay-order"));
+        assertThat(result.evidence()).anySatisfy(item -> assertThat(item)
+            .contains("runtimeDiagnostic=PATH_MISSING")
+            .contains("stepId=create-order")
+            .contains("sourceType=BODY_JSON")
+            .contains("sourcePath=$.data.orderId")
+            .contains("targetScope=suite")
+            .contains("targetKey=orderId"));
+        assertThat(result.evidence()).anySatisfy(item -> assertThat(item)
+            .contains("variableAuditEvent=PRODUCTION")
+            .contains("sourceType=BODY_JSON")
+            .contains("targetScope=suite")
+            .contains("targetKey=orderId"));
+        assertThat(result.evidence()).anySatisfy(item -> assertThat(item)
+            .contains("variableFailure=VARIABLE_EXTRACTION_FAILURE")
+            .contains("extractRuleId=extract-order-id"));
+
+        var rendered = String.join("\n", result.evidence())
+            + "\n" + result.summary()
+            + "\n" + result.failureReason()
+            + "\n" + result.nextSuggestion()
+            + "\n" + result.impactSummary();
+        assertThat(rendered)
+            .contains("[REDACTED]")
+            .doesNotContain("raw-auth-token", "raw-runtime-token", "raw-error-token", "raw-secret", "raw-password", "raw-cookie", "raw-api-key");
+    }
+
+    @Test
     void taskAnalysisAggregatesDeduplicatesOrdersAndFlagsMissingLinkedRecords() {
         var api = apiSpecs.save(newApiSpec("/api/orders"));
         var caseOne = testCases.save(newTestCase("case-one", api.getApiSpecId()));
@@ -1366,6 +1466,15 @@ class FailureAnalysisApplicationServiceTests {
             map.put(String.valueOf(keyValues[index]), keyValues[index + 1]);
         }
         return map;
+    }
+
+    private int indexOfEvidence(List<String> evidence, String prefix) {
+        for (int index = 0; index < evidence.size(); index++) {
+            if (evidence.get(index).startsWith(prefix)) {
+                return index;
+            }
+        }
+        return -1;
     }
 
     private void assertRecommendation(
