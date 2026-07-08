@@ -536,9 +536,15 @@ public class AgentMemoryFeedbackApplicationService {
     ) {
         var metadata = new LinkedHashMap<String, Object>();
         metadata.putAll(candidateMetadata == null ? Map.of() : candidateMetadata);
-        metadata.put("originPhase", metadata.getOrDefault("phase", "V2_PHASE_6"));
-        metadata.put("phase", "V2_PHASE_7");
-        metadata.put("handoffType", "AGENT_MEMORY_FEEDBACK_REFINERY");
+        var originPhase = metadata.getOrDefault("phase", "V2_PHASE_6");
+        metadata.put("originPhase", originPhase);
+        if ("V3_PHASE_6".equals(originPhase)) {
+            metadata.put("phase", "V3_PHASE_6");
+            metadata.put("handoffType", "SUITE_HUMAN_CORRECTION_MEMORY_FEEDBACK_REFINERY");
+        } else {
+            metadata.put("phase", "V2_PHASE_7");
+            metadata.put("handoffType", "AGENT_MEMORY_FEEDBACK_REFINERY");
+        }
         metadata.put("writesLongTermMemory", true);
         metadata.put("phase6HandoffAudit", sanitizer.sanitizeMap(phase6Audit));
         return compact(metadata);

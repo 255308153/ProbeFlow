@@ -905,6 +905,12 @@ public class HumanInTheLoopApplicationService {
     }
 
     private boolean memoryCandidateSupported(HumanReviewRequest request, HumanDecisionRecord decision) {
+        if (isSuiteReviewCorrection(request)) {
+            return request.getRequestType() == HumanRequestType.DRAFT_REVIEW
+                && (decision.getDecisionType() == HumanDecisionType.REQUEST_CHANGES
+                    || decision.getDecisionType() == HumanDecisionType.PROVIDE_INPUT
+                    || decision.getDecisionType() == HumanDecisionType.REJECT);
+        }
         return switch (request.getRequestType()) {
             case DRAFT_REVIEW -> decision.getDecisionType() == HumanDecisionType.PROMOTE_DRAFT
                 || decision.getDecisionType() == HumanDecisionType.DISCARD_DRAFT
@@ -924,8 +930,10 @@ public class HumanInTheLoopApplicationService {
     ) {
         var sanitizedRequestMetadata = sanitizeMap(request.getMetadata());
         var metadata = new LinkedHashMap<String, Object>();
-        metadata.put("phase", "V2_PHASE_6");
-        metadata.put("handoffType", "HUMAN_FEEDBACK_MEMORY_CANDIDATE");
+        metadata.put("phase", isSuiteReviewCorrection(request) ? "V3_PHASE_6" : "V2_PHASE_6");
+        metadata.put("handoffType", isSuiteReviewCorrection(request)
+            ? "SUITE_HUMAN_CORRECTION_MEMORY_CANDIDATE"
+            : "HUMAN_FEEDBACK_MEMORY_CANDIDATE");
         metadata.put("writesLongTermMemory", false);
         metadata.put("taskId", task.getTaskId());
         metadata.put("taskStatus", task.getStatus().name());
@@ -942,6 +950,13 @@ public class HumanInTheLoopApplicationService {
         metadata.put("policyReason", request.getPolicyReason());
         metadata.put("sanitizedSummary", decision.getSanitizedPayloadSummary());
         metadata.put("requestMetadataSummary", sanitizedRequestMetadata);
+        if (isSuiteReviewCorrection(request)) {
+            metadata.put("suiteCorrectionType", suiteCorrectionType(request));
+            metadata.put("suiteId", firstMetadata(request, decision, "suiteId"));
+            metadata.put("caseId", firstMetadata(request, decision, "caseId"));
+            metadata.put("reviewerIntent", firstMetadata(request, decision, "reviewerIntent"));
+            metadata.put("replanningContext", firstMetadata(request, decision, "replanningContext"));
+        }
 
         return new MemoryCandidateRequest(
             memoryCandidateSummary(request, decision),
@@ -957,6 +972,10 @@ public class HumanInTheLoopApplicationService {
     }
 
     private String memoryCandidateSummary(HumanReviewRequest request, HumanDecisionRecord decision) {
+        if (isSuiteReviewCorrection(request)) {
+            return "V3 SUITE human " + suiteCorrectionType(request)
+                + " correction from decision " + decision.getDecisionId();
+        }
         return "Human "
             + decision.getDecisionType().name()
             + " feedback for "
@@ -970,6 +989,9 @@ public class HumanInTheLoopApplicationService {
         HumanDecisionRecord decision,
         Map<String, Object> sanitizedRequestMetadata
     ) {
+        if (isSuiteReviewCorrection(request)) {
+            return suiteCorrectionContent(request, decision, sanitizedRequestMetadata);
+        }
         return "requestType=" + request.getRequestType().name()
             + "; decisionType=" + decision.getDecisionType().name()
             + "; actor=" + decision.getActor()
@@ -984,6 +1006,14 @@ public class HumanInTheLoopApplicationService {
         HumanDecisionRecord decision,
         Map<String, Object> sanitizedRequestMetadata
     ) {
+        if (isSuiteReviewCorrection(request)) {
+            return "SuiteHumanCorrection requestId=" + request.getRequestId()
+                + " decisionId=" + decision.getDecisionId()
+                + " correctionType=" + suiteCorrectionType(request)
+                + " reviewerIntent=" + firstMetadata(request, decision, "reviewerIntent")
+                + " payload={" + metadataDescription(decision.getSanitizedPayloadSummary()) + "}"
+                + " requestMetadata={" + metadataDescription(sanitizedRequestMetadata) + "}";
+        }
         return "HumanReviewRequest(" + request.getRequestId() + ") "
             + "HumanDecisionRecord(" + decision.getDecisionId() + ") "
             + "task=" + decision.getTaskId()
@@ -996,6 +1026,18 @@ public class HumanInTheLoopApplicationService {
     private List<String> memoryCandidateTags(HumanReviewRequest request, HumanDecisionRecord decision) {
         var tags = new LinkedHashSet<String>();
         tags.add("human-feedback");
+        if (isSuiteReviewCorrection(request)) {
+            tags.add("v3");
+            tags.add("suite");
+            tags.add("suite-review");
+            tags.add("suite-human-correction");
+            tags.add("human-confirmed");
+            tags.add(tagName(suiteCorrectionType(request)));
+            if (decision.getDecisionType() == HumanDecisionType.REJECT) {
+                tags.add("rejected-candidate");
+            }
+            return List.copyOf(tags);
+        }
         tags.add(tagName(request.getRequestType().name()));
         tags.add(tagName(decision.getDecisionType().name()));
         if (request.getRequestType() == HumanRequestType.HIGH_RISK_APPROVAL) {
@@ -1009,6 +1051,96 @@ public class HumanInTheLoopApplicationService {
             tags.add("blocker-resolution");
         }
         return List.copyOf(tags);
+    }
+
+    private boolean isSuiteReviewCorrection(HumanReviewRequest request) {
+        return request != null
+            && request.getRequestType() == HumanRequestType.DRAFT_REVIEW
+            && !suiteCorrectionType(request).isBlank();
+    }
+
+    private String suiteCorrectionType(HumanReviewRequest request) {
+        return tagName(metadataString(request.getMetadata().get("suiteCorrectionType")));
+    }
+
+    private String suiteCorrectionContent(
+        HumanReviewRequest request,
+        HumanDecisionRecord decision,
+        Map<String, Object> sanitizedRequestMetadata
+    ) {
+        var correctionType = suiteCorrectionType(request);
+        var payload = decision.getSanitizedPayloadSummary();
+        var content = new StringBuilder();
+        content.append("V3 SUITE human correction type=").append(correctionType)
+            .append("; decisionId=").append(decision.getDecisionId())
+            .append("; reviewId=").append(request.getRequestId())
+            .append("; reviewerIntent=").append(firstMetadata(request, decision, "reviewerIntent"))
+            .append("; reason=").append(metadataString(decision.getReason()))
+            .append("; sourceStep=").append(firstMetadata(request, decision, "sourceStepId"))
+            .append("; applicableWhen=").append(firstMetadata(request, decision, "applicableWhen"))
+            .append(". ");
+        switch (correctionType) {
+            case "extract-rule" -> content.append("ExtractRule correction: old sourcePath ")
+                .append(metadataString(payload.get("oldSourcePath")))
+                .append(", new sourcePath ")
+                .append(metadataString(payload.get("newSourcePath")))
+                .append(", targetScope ")
+                .append(firstMetadata(request, decision, "targetScope"))
+                .append(", targetKey ")
+                .append(firstMetadata(request, decision, "targetKey"))
+                .append(", producer step ")
+                .append(firstMetadata(request, decision, "producerStepId"))
+                .append(". ");
+            case "variable-reference" -> content.append("Variable reference correction: old expression ")
+                .append(metadataString(payload.get("oldExpression")))
+                .append(", new expression ")
+                .append(metadataString(payload.get("newExpression")))
+                .append(", consumer step ")
+                .append(firstMetadata(request, decision, "consumerStepId"))
+                .append(", producer step ")
+                .append(firstMetadata(request, decision, "producerStepId"))
+                .append(", scope/path ")
+                .append(firstMetadata(request, decision, "scope"))
+                .append("/")
+                .append(firstMetadata(request, decision, "path"))
+                .append(". ");
+            case "step-order" -> content.append("Step order correction: old order ")
+                .append(metadataString(payload.get("oldOrder")))
+                .append(", new order ")
+                .append(metadataString(payload.get("newOrder")))
+                .append(", producer/consumer ")
+                .append(firstMetadata(request, decision, "producerStepId"))
+                .append(" -> ")
+                .append(firstMetadata(request, decision, "consumerStepId"))
+                .append(", business reason ")
+                .append(firstMetadata(request, decision, "businessReason"))
+                .append(". ");
+            case "business-precondition" -> content.append("Business precondition correction: prerequisite state ")
+                .append(firstMetadata(request, decision, "prerequisiteState"))
+                .append(", prerequisite step ")
+                .append(firstMetadata(request, decision, "prerequisiteStepId"))
+                .append(", test data requirement ")
+                .append(firstMetadata(request, decision, "testDataRequirement"))
+                .append(", business flow ")
+                .append(firstMetadata(request, decision, "businessFlow"))
+                .append(". ");
+            case "candidate-rejection" -> content.append("Rejected suite memory candidate: candidate ")
+                .append(firstMetadata(request, decision, "candidateSourceRef"))
+                .append(", rejection reason ")
+                .append(firstMetadata(request, decision, "rejectionReason"))
+                .append(". Future similar low-quality candidates should stay pending or be rejected before long-term memory write. ");
+            default -> content.append("Payload summary={").append(metadataDescription(payload)).append("}. ");
+        }
+        content.append("Request metadata={").append(metadataDescription(sanitizedRequestMetadata)).append("}.");
+        return content.toString();
+    }
+
+    private Object firstMetadata(HumanReviewRequest request, HumanDecisionRecord decision, String key) {
+        var payloadValue = decision.getSanitizedPayloadSummary().get(key);
+        if (payloadValue != null) {
+            return payloadValue;
+        }
+        return request.getMetadata().get(key);
     }
 
     private Map<String, Object> recordMemoryCandidateAudit(
