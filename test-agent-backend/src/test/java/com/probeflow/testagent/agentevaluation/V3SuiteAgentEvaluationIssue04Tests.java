@@ -27,7 +27,10 @@ class V3SuiteAgentEvaluationIssue04Tests {
 
         assertThat(dataset.name()).isEqualTo("v3-phase-6-suite-agent-capability");
         assertThat(dataset.version()).isEqualTo("2026-07-08");
-        assertThat(dataset.fixtures()).singleElement().satisfies(fixture -> {
+        assertThat(dataset.fixtures())
+            .filteredOn(fixture -> fixture.fixtureId().equals("v3-suite-agent-order-payment-loop"))
+            .singleElement()
+            .satisfies(fixture -> {
             assertThat(fixture.fixtureType()).isEqualTo(EvaluationFixtureType.V3_SUITE_AGENT);
             assertThat(fixture.capabilityTags()).contains(
                 "suite-dependency",
@@ -47,7 +50,8 @@ class V3SuiteAgentEvaluationIssue04Tests {
             V3SuiteAgentCapabilityEvaluator.FAILURE_ANALYSIS_METRIC,
             V3SuiteAgentCapabilityEvaluator.MEMORY_CANDIDATE_METRIC,
             V3SuiteAgentCapabilityEvaluator.HARNESS_COMPLETENESS_METRIC,
-            V3SuiteAgentCapabilityEvaluator.SECRET_REDACTION_METRIC
+            V3SuiteAgentCapabilityEvaluator.SECRET_REDACTION_METRIC,
+            MemoryReuseClosedLoopEvaluator.V3_SUITE_METRIC_NAME
         );
         assertThat(dataset.metricWeights().get(V3SuiteAgentCapabilityEvaluator.FAILURE_ANALYSIS_METRIC))
             .isGreaterThan(dataset.metricWeights().get(V3SuiteAgentCapabilityEvaluator.HARNESS_COMPLETENESS_METRIC));
@@ -79,11 +83,15 @@ class V3SuiteAgentEvaluationIssue04Tests {
             V3SuiteAgentCapabilityEvaluator.FAILURE_ANALYSIS_METRIC,
             V3SuiteAgentCapabilityEvaluator.MEMORY_CANDIDATE_METRIC,
             V3SuiteAgentCapabilityEvaluator.HARNESS_COMPLETENESS_METRIC,
-            V3SuiteAgentCapabilityEvaluator.SECRET_REDACTION_METRIC
+            V3SuiteAgentCapabilityEvaluator.SECRET_REDACTION_METRIC,
+            MemoryReuseClosedLoopEvaluator.V3_SUITE_METRIC_NAME
         );
-        assertThat(result.report().caseSummary()).singleElement().satisfies(summary -> assertThat(summary)
-            .containsEntry("fixtureId", "v3-suite-agent-order-payment-loop")
-            .containsEntry("status", EvaluationCaseStatus.PASSED.name()));
+        assertThat(result.report().caseSummary())
+            .extracting(summary -> summary.get("fixtureId"))
+            .containsExactly("v3-suite-agent-order-payment-loop", "v3-suite-memory-reuse-order-payment-loop");
+        assertThat(result.report().caseSummary())
+            .extracting(summary -> summary.get("status"))
+            .containsOnly(EvaluationCaseStatus.PASSED.name());
         assertThat(result.toString())
             .doesNotContain("Bearer real-secret-token")
             .doesNotContain("sk_live_order_secret")

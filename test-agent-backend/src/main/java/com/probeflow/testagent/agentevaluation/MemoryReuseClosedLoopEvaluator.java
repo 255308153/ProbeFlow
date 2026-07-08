@@ -45,6 +45,7 @@ import org.springframework.transaction.annotation.Transactional;
 public class MemoryReuseClosedLoopEvaluator implements AgentEvaluationEvaluator {
 
     public static final String METRIC_NAME = "memory-reuse";
+    public static final String V3_SUITE_METRIC_NAME = "v3-suite-memory-reuse-closed-loop";
 
     private final AgentMemoryFeedbackApplicationService memoryFeedback;
     private final UnifiedContextBuilder contextBuilder;
@@ -82,7 +83,8 @@ public class MemoryReuseClosedLoopEvaluator implements AgentEvaluationEvaluator 
 
     @Override
     public boolean supports(GoldenTaskFixture fixture) {
-        return fixture.fixtureType() == EvaluationFixtureType.MEMORY_REUSE;
+        return fixture.fixtureType() == EvaluationFixtureType.MEMORY_REUSE
+            || fixture.fixtureType() == EvaluationFixtureType.V3_SUITE_MEMORY_REUSE;
     }
 
     @Override
@@ -92,6 +94,10 @@ public class MemoryReuseClosedLoopEvaluator implements AgentEvaluationEvaluator 
         GoldenTaskFixture fixture,
         EvaluationRunContext context
     ) {
+        var metricName = metricName(fixture);
+        if (suiteMemoryReuse(fixture) && context.providerMode() == EvaluationProviderMode.MANUAL_REAL_EXPERIMENT) {
+            return manualRealBoundaryResult(dataset, fixture, context, metricName);
+        }
         var scenario = scenario(fixture, context);
         var diagnostics = new ArrayList<String>();
         seedApiSpec(scenario);
@@ -111,16 +117,23 @@ public class MemoryReuseClosedLoopEvaluator implements AgentEvaluationEvaluator 
 
         var memoryId = memoryId(firstStage);
         var afterMerge = memory(memoryId);
-        var positiveBundle = contextBuilder.build(query(
-            scenario,
-            scenario.positiveTaskId(),
-            scenario.positiveUsageSourceRef(),
-            "payment auth failed with " + scenario.errorCode() + " and tenant bootstrap symptoms"
-        ));
-        flushAndClear();
-        var recalledByPositiveTask = recalled(positiveBundle, memoryId);
-        var citedByPositiveTask = cited(positiveBundle, memoryId);
-        var positiveUsage = usageFor(scenario.positiveTaskId(), memoryId, scenario.positiveUsageSourceRef());
+        var skipReuseAfterLearning = bool(fixture.setupMetadata().get("skipReuseAfterLearning"), false);
+        ContextBundle positiveBundle = null;
+        MemoryUsageRecord positiveUsage = null;
+        var recalledByPositiveTask = false;
+        var citedByPositiveTask = false;
+        if (!skipReuseAfterLearning) {
+            positiveBundle = contextBuilder.build(query(
+                scenario,
+                scenario.positiveTaskId(),
+                scenario.positiveUsageSourceRef(),
+                "payment auth failed with " + scenario.errorCode() + " and tenant bootstrap symptoms"
+            ));
+            flushAndClear();
+            recalledByPositiveTask = recalled(positiveBundle, memoryId);
+            citedByPositiveTask = cited(positiveBundle, memoryId);
+            positiveUsage = usageFor(scenario.positiveTaskId(), memoryId, scenario.positiveUsageSourceRef());
+        }
         var beforePositive = scores(memory(memoryId));
         var positiveStatus = submitFeedback(
             positiveUsage,
@@ -131,16 +144,22 @@ public class MemoryReuseClosedLoopEvaluator implements AgentEvaluationEvaluator 
         flushAndClear();
         var afterPositive = scores(memory(memoryId));
 
-        var negativeBundle = contextBuilder.build(query(
-            scenario,
-            scenario.negativeTaskId(),
-            scenario.negativeUsageSourceRef(),
-            "payment " + scenario.errorCode() + " investigation but human says tenant bootstrap memory was misleading"
-        ));
-        flushAndClear();
-        var recalledByNegativeTask = recalled(negativeBundle, memoryId);
-        var citedByNegativeTask = cited(negativeBundle, memoryId);
-        var negativeUsage = usageFor(scenario.negativeTaskId(), memoryId, scenario.negativeUsageSourceRef());
+        ContextBundle negativeBundle = null;
+        MemoryUsageRecord negativeUsage = null;
+        var recalledByNegativeTask = false;
+        var citedByNegativeTask = false;
+        if (!skipReuseAfterLearning) {
+            negativeBundle = contextBuilder.build(query(
+                scenario,
+                scenario.negativeTaskId(),
+                scenario.negativeUsageSourceRef(),
+                "payment " + scenario.errorCode() + " investigation but human says tenant bootstrap memory was misleading"
+            ));
+            flushAndClear();
+            recalledByNegativeTask = recalled(negativeBundle, memoryId);
+            citedByNegativeTask = cited(negativeBundle, memoryId);
+            negativeUsage = usageFor(scenario.negativeTaskId(), memoryId, scenario.negativeUsageSourceRef());
+        }
         var beforeNegative = scores(memory(memoryId));
         var negativeStatus = submitFeedback(
             negativeUsage,
@@ -190,12 +209,12 @@ public class MemoryReuseClosedLoopEvaluator implements AgentEvaluationEvaluator 
         );
         var expected = fixture.expectedResults();
         var score = score(diagnostics);
-        var passed = diagnostics.isEmpty() && score >= dataset.thresholdFor(METRIC_NAME);
+        var passed = diagnostics.isEmpty() && score >= dataset.thresholdFor(metricName);
         var metric = new EvaluationMetricResult(
-            METRIC_NAME,
+            metricName,
             score,
-            dataset.thresholdFor(METRIC_NAME),
-            dataset.weightFor(METRIC_NAME),
+            dataset.thresholdFor(metricName),
+            dataset.weightFor(metricName),
             passed,
             actual,
             expected,
@@ -224,17 +243,21 @@ public class MemoryReuseClosedLoopEvaluator implements AgentEvaluationEvaluator 
 
     private AgentMemoryFeedbackResult refineFailureCandidate(MemoryScenario scenario, String taskId, String suffix) {
         var fingerprint = scenario.isolationFingerprint();
+        var v3 = scenario.suiteMemoryReuse();
         return memoryFeedback.refineFailureAnalysisCandidate(
             AgentMemoryCandidateSourceType.FAILURE_ANALYSIS,
             new MemoryCandidateRequest(
-                scenario.errorCode() + " isolated failure fingerprint " + fingerprint,
-                "Failure analysis learned fingerprint " + fingerprint
+                (v3 ? "V3 SUITE " : "") + scenario.errorCode() + " isolated failure fingerprint " + fingerprint,
+                (v3 ? "V3 SUITE failure analysis learned " : "Failure analysis learned ")
+                    + "fingerprint " + fingerprint
                     + " for " + scenario.errorCode()
                     + ": tenant bootstrap was skipped before auth in this payment namespace.",
                 MemorySourceType.EXECUTION_RESULT,
                 scenario.sourceRef(suffix),
                 taskId,
-                List.of("phase8", "memory-reuse", "payment", "auth", "tenant", scenario.errorCode()),
+                v3
+                    ? List.of("v3", "suite", "memory-reuse", "closed-loop", "payment", "auth", "tenant", scenario.errorCode())
+                    : List.of("phase8", "memory-reuse", "payment", "auth", "tenant", scenario.errorCode()),
                 0.88f,
                 "ExecutionRecord fingerprint " + fingerprint + " showed " + scenario.errorCode()
                     + " disappears after tenant bootstrap is restored. suffix=" + suffix,
@@ -245,7 +268,7 @@ public class MemoryReuseClosedLoopEvaluator implements AgentEvaluationEvaluator 
                     "errorCode", scenario.errorCode(),
                     "riskLevel", "HIGH",
                     "retryable", true,
-                    "phase", "V2_PHASE_8",
+                    "phase", v3 ? "V3_PHASE_6" : "V2_PHASE_8",
                     "fixtureId", scenario.fixtureId()
                 )
             )
@@ -318,6 +341,13 @@ public class MemoryReuseClosedLoopEvaluator implements AgentEvaluationEvaluator 
         actual.put("apiSpecId", scenario.apiSpecId());
         actual.put("errorCode", scenario.errorCode());
         actual.put("memoryId", memoryId);
+        actual.put("sourceRef", scenario.sourceRef("initial"));
+        actual.put("reuseSignal", recalled(positiveBundle, memoryId) ? scenario.positiveUsageSourceRef() : null);
+        actual.put("providerMode", scenario.providerMode().name());
+        actual.put("usesRealProvider", scenario.providerMode() == EvaluationProviderMode.MANUAL_REAL_EXPERIMENT);
+        actual.put("includedInCiRegression", scenario.providerMode() == EvaluationProviderMode.DETERMINISTIC_FAKE);
+        actual.put("writesLongTermMemory", learned(firstStage) && memoryId != null);
+        actual.put("requiresHumanConfirmedMemoryFeedback", false);
         actual.put("firstStageStatus", status(firstStage));
         actual.put("repeatedFailureStatus", status(repeatedFailure));
         actual.put("mergeCount", mergeCount(afterMerge));
@@ -418,7 +448,7 @@ public class MemoryReuseClosedLoopEvaluator implements AgentEvaluationEvaluator 
         task.setMemoryRefinementStatus(MemoryRefinementStatus.PENDING);
         task.setPriority(TaskPriority.HIGH);
         task.setCreator("phase8-agent-evaluation");
-        task.setMetadata(Map.of("fixtureId", fixture.fixtureId(), "capability", METRIC_NAME, "stage", stage));
+        task.setMetadata(Map.of("fixtureId", fixture.fixtureId(), "capability", metricName(fixture), "stage", stage));
         tasks.save(task);
     }
 
@@ -586,8 +616,54 @@ public class MemoryReuseClosedLoopEvaluator implements AgentEvaluationEvaluator 
             text(fixture.setupMetadata(), "systemName", "order-platform"),
             moduleName,
             apiPath,
-            code
+            code,
+            suiteMemoryReuse(fixture),
+            context.providerMode()
         );
+    }
+
+    private EvaluationCaseResult manualRealBoundaryResult(
+        EvaluationDataset dataset,
+        GoldenTaskFixture fixture,
+        EvaluationRunContext context,
+        String metricName
+    ) {
+        var actual = new LinkedHashMap<String, Object>();
+        actual.put("providerMode", context.providerMode().name());
+        actual.put("usesRealProvider", true);
+        actual.put("includedInCiRegression", false);
+        actual.put("writesLongTermMemory", false);
+        actual.put("requiresHumanConfirmedMemoryFeedback", true);
+        actual.put("memoryId", null);
+        actual.put("sourceRef", "manual-real-experiment:" + fixture.fixtureId());
+        actual.put("reuseSignal", "manual-real-output-redacted-and-isolated");
+        actual.put(
+            "comparisonSummary",
+            "Manual real experiment is isolated from deterministic fake regression and does not write long-term memory by default."
+        );
+        var metric = EvaluationMetricResult.passed(
+            metricName,
+            dataset.thresholdFor(metricName),
+            dataset.weightFor(metricName),
+            "Manual real experiment boundary held: explicit providerMode, usesRealProvider=true, CI-isolated, no default long-term memory write.",
+            actual,
+            fixture.expectedResults()
+        );
+        return EvaluationCaseResult.passed(
+            fixture.fixtureId(),
+            fixture.capabilityTags(),
+            "Manual real experiment output is redacted, marked usesRealProvider=true and excluded from stable CI scoring.",
+            fixture.expectedResults().toString(),
+            List.of(metric)
+        );
+    }
+
+    private boolean suiteMemoryReuse(GoldenTaskFixture fixture) {
+        return fixture.fixtureType() == EvaluationFixtureType.V3_SUITE_MEMORY_REUSE;
+    }
+
+    private String metricName(GoldenTaskFixture fixture) {
+        return suiteMemoryReuse(fixture) ? V3_SUITE_METRIC_NAME : METRIC_NAME;
     }
 
     private String id(EvaluationRunContext context, GoldenTaskFixture fixture, String suffix) {
@@ -621,11 +697,14 @@ public class MemoryReuseClosedLoopEvaluator implements AgentEvaluationEvaluator 
         String systemName,
         String moduleName,
         String apiPath,
-        String errorCode
+        String errorCode,
+        boolean suiteMemoryReuse,
+        EvaluationProviderMode providerMode
     ) {
 
         String sourceRef(String suffix) {
-            return "phase8-memory-reuse:" + runId + ":" + fixtureId + ":" + suffix;
+            return (suiteMemoryReuse ? "v3-suite-memory-reuse:" : "phase8-memory-reuse:")
+                + runId + ":" + fixtureId + ":" + suffix;
         }
 
         String positiveUsageSourceRef() {

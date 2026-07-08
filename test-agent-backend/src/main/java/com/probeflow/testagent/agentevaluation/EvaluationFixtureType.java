@@ -9,5 +9,6 @@ public enum EvaluationFixtureType {
     TEST_CASE_COVERAGE,
     REPORT_USEFULNESS,
     MEMORY_REUSE,
-    V3_SUITE_AGENT
+    V3_SUITE_AGENT,
+    V3_SUITE_MEMORY_REUSE
 }

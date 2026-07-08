@@ -744,7 +744,7 @@ public class EvaluationDatasetRegistry {
         return new EvaluationDataset(
             V3_SUITE_AGENT_DATASET,
             "2026-07-08",
-            List.of(v3SuiteAgentFixture()),
+            List.of(v3SuiteAgentFixture(), v3SuiteMemoryReuseFixture()),
             0.85d,
             Map.of(
                 V3SuiteAgentCapabilityEvaluator.DEPENDENCY_COVERAGE_METRIC, 0.9d,
@@ -752,7 +752,8 @@ public class EvaluationDatasetRegistry {
                 V3SuiteAgentCapabilityEvaluator.FAILURE_ANALYSIS_METRIC, 0.9d,
                 V3SuiteAgentCapabilityEvaluator.MEMORY_CANDIDATE_METRIC, 0.9d,
                 V3SuiteAgentCapabilityEvaluator.HARNESS_COMPLETENESS_METRIC, 0.8d,
-                V3SuiteAgentCapabilityEvaluator.SECRET_REDACTION_METRIC, 1.0d
+                V3SuiteAgentCapabilityEvaluator.SECRET_REDACTION_METRIC, 1.0d,
+                MemoryReuseClosedLoopEvaluator.V3_SUITE_METRIC_NAME, 0.85d
             ),
             Map.of(
                 V3SuiteAgentCapabilityEvaluator.DEPENDENCY_COVERAGE_METRIC, 1.8d,
@@ -760,9 +761,13 @@ public class EvaluationDatasetRegistry {
                 V3SuiteAgentCapabilityEvaluator.FAILURE_ANALYSIS_METRIC, 2.2d,
                 V3SuiteAgentCapabilityEvaluator.MEMORY_CANDIDATE_METRIC, 2.4d,
                 V3SuiteAgentCapabilityEvaluator.HARNESS_COMPLETENESS_METRIC, 1.0d,
-                V3SuiteAgentCapabilityEvaluator.SECRET_REDACTION_METRIC, 2.5d
+                V3SuiteAgentCapabilityEvaluator.SECRET_REDACTION_METRIC, 2.5d,
+                MemoryReuseClosedLoopEvaluator.V3_SUITE_METRIC_NAME, 2.3d
             ),
-            Map.of("v3-suite-agent-order-payment-loop", 0.85d)
+            Map.of(
+                "v3-suite-agent-order-payment-loop", 0.85d,
+                "v3-suite-memory-reuse-order-payment-loop", 0.85d
+            )
         );
     }
 
@@ -862,6 +867,33 @@ public class EvaluationDatasetRegistry {
                     "markdown", "V3 suite report uses Authorization=[REDACTED], cookie=[REDACTED], secret=[REDACTED].",
                     "json", Map.of("apiKey", "[REDACTED]", "token", "[REDACTED]")
                 )
+            )
+        );
+    }
+
+    private GoldenTaskFixture v3SuiteMemoryReuseFixture() {
+        return new GoldenTaskFixture(
+            "v3-suite-memory-reuse-order-payment-loop",
+            List.of("v3", "suite", "memory-reuse", "closed-loop", "manual-real-boundary", "redaction"),
+            "Evaluate V3 SUITE memory learning, later reuse signal and manual real experiment boundary.",
+            EvaluationFixtureType.V3_SUITE_MEMORY_REUSE,
+            Map.of(
+                "expectedFirstStageLearning", true,
+                "expectedRepeatedFailureMerge", true,
+                "expectedRecall", true,
+                "expectedCitation", true,
+                "expectedUsageRecord", true,
+                "expectedConsumer", "AGENT_EVALUATION",
+                "expectedUsesRealProviderByDefault", false,
+                "expectedManualRealWritesLongTermMemoryByDefault", false
+            ),
+            Map.of(
+                "systemName", "order-platform",
+                "moduleName", "v3-suite-payment-memory",
+                "providerMode", EvaluationProviderMode.DETERMINISTIC_FAKE.name(),
+                "uses_real_llm", false,
+                "uses_real_embedding", false,
+                "uses_external_http", false
             )
         );
     }

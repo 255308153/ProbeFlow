@@ -33,6 +33,14 @@ public record EvaluationReport(
         runSummary.put("datasetVersion", run.datasetVersion());
         runSummary.put("profile", run.profile());
         runSummary.put("providerMode", run.providerMode().name());
+        runSummary.put("usesRealProvider", run.providerMode() == EvaluationProviderMode.MANUAL_REAL_EXPERIMENT);
+        runSummary.put("stableRegression", run.providerMode() == EvaluationProviderMode.DETERMINISTIC_FAKE);
+        runSummary.put(
+            "comparisonSummary",
+            run.providerMode() == EvaluationProviderMode.MANUAL_REAL_EXPERIMENT
+                ? "Manual real experiment is reported for local comparison only and is isolated from deterministic CI regression."
+                : "Deterministic fake baseline is the stable CI regression signal."
+        );
         runSummary.put("status", run.status().name());
         runSummary.put("overallScore", run.overallScore());
         runSummary.put("startedAt", run.startedAt());
