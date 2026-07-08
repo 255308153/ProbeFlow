@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ProbeFlow V4 Demo Console</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17202a;
+      --muted: #667085;
+      --line: #d9e2ec;
+      --panel: #ffffff;
+      --page: #f5f7fb;
+      --accent: #0f766e;
+      --accent-2: #b42318;
+      --accent-3: #7a5af8;
+      --soft: #ecfdf3;
+      --soft-2: #fff4ed;
+      --soft-3: #f4f3ff;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    main {
+      width: min(1440px, 100%);
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(28px, 4vw, 44px);
+      line-height: 1;
+      font-weight: 780;
+    }
+
+    h2, h3 {
+      margin: 0;
+      line-height: 1.1;
+    }
+
+    h2 {
+      font-size: 18px;
+    }
+
+    h3 {
+      font-size: 15px;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 10px 30px rgba(15, 23, 42, 0.05);
+    }
+
+    .controls {
+      position: sticky;
+      top: 16px;
+      padding: 18px;
+    }
+
+    .field {
+      display: grid;
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    select, button {
+      width: 100%;
+      min-height: 42px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--ink);
+      font: inherit;
+    }
+
+    select {
+      padding: 0 12px;
+    }
+
+    button {
+      margin-top: 18px;
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fff;
+      font-weight: 760;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      cursor: progress;
+      opacity: 0.7;
+    }
+
+    .status {
+      display: grid;
+      gap: 8px;
+      margin-top: 18px;
+      padding: 14px;
+      border-radius: 8px;
+      background: #f8fafc;
+      border: 1px solid var(--line);
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 0 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 720;
+      white-space: nowrap;
+    }
+
+    .pill.fake {
+      border-color: #a6f4c5;
+      background: var(--soft);
+      color: #027a48;
+    }
+
+    .pill.real {
+      border-color: #fedf89;
+      background: var(--soft-2);
+      color: #b54708;
+    }
+
+    .pill.comparison {
+      border-color: #d9d6fe;
+      background: var(--soft-3);
+      color: #5925dc;
+    }
+
+    .results {
+      display: grid;
+      gap: 12px;
+    }
+
+    .summary {
+      padding: 18px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    section {
+      padding: 16px;
+    }
+
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+
+    .section-body {
+      display: grid;
+      gap: 10px;
+      color: #344054;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    dl {
+      display: grid;
+      grid-template-columns: 132px minmax(0, 1fr);
+      gap: 8px 12px;
+      margin: 0;
+    }
+
+    dt {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 720;
+      text-transform: uppercase;
+    }
+
+    dd {
+      margin: 0;
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    details {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfe;
+      overflow: hidden;
+    }
+
+    summary {
+      cursor: pointer;
+      padding: 10px 12px;
+      font-weight: 720;
+    }
+
+    pre {
+      margin: 0;
+      padding: 12px;
+      max-height: 280px;
+      overflow: auto;
+      border-top: 1px solid var(--line);
+      color: #182230;
+      background: #fff;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .empty {
+      min-height: 420px;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      border: 1px dashed #cbd5e1;
+      border-radius: 8px;
+      background: #fff;
+    }
+
+    .error {
+      color: var(--accent-2);
+    }
+
+    @media (max-width: 920px) {
+      main {
+        padding: 16px;
+      }
+
+      header, .shell {
+        display: grid;
+      }
+
+      .controls {
+        position: static;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>ProbeFlow V4 Demo Console</h1>
+      <div class="meta" aria-label="provider source legend">
+        <span class="pill fake">Fake baseline</span>
+        <span class="pill real">Real LLM manual</span>
+        <span class="pill comparison">Comparison</span>
+      </div>
+    </div>
+    <span class="pill" id="schema-version">schema pending</span>
+  </header>
+
+  <div class="shell">
+    <aside class="panel controls">
+      <h2>Demo Run</h2>
+      <form id="demo-form">
+        <div class="field">
+          <label for="fixture-id">Fixture</label>
+          <select id="fixture-id" name="fixtureId">
+            <option value="order-suite-demo">order-suite-demo</option>
+            <option value="missing-fixture">missing-fixture</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="provider-mode">Provider mode</label>
+          <select id="provider-mode" name="providerMode">
+            <option value="fake">Fake baseline</option>
+            <option value="real">Real LLM manual</option>
+            <option value="comparison">Comparison</option>
+          </select>
+        </div>
+        <button id="run-button" type="submit">Run Demo</button>
+      </form>
+      <div class="status" aria-live="polite">
+        <strong id="run-status">Idle</strong>
+        <span id="run-detail">No run selected.</span>
+      </div>
+    </aside>
+
+    <div class="results">
+      <div class="panel summary" id="run-summary">
+        <h2>Run Summary</h2>
+        <div class="meta" id="run-pills"></div>
+      </div>
+      <div class="empty" id="empty-state">Run results will appear here.</div>
+      <div class="grid" id="section-grid" hidden></div>
+    </div>
+  </div>
+</main>
+
+<template id="section-template">
+  <section class="panel">
+    <div class="section-head">
+      <h3></h3>
+      <span class="pill"></span>
+    </div>
+    <div class="section-body"></div>
+  </section>
+</template>
+
+<script>
+  const apiEndpoint = "/api/v4/demo-runs";
+  const form = document.querySelector("#demo-form");
+  const runButton = document.querySelector("#run-button");
+  const runStatus = document.querySelector("#run-status");
+  const runDetail = document.querySelector("#run-detail");
+  const runPills = document.querySelector("#run-pills");
+  const schemaVersion = document.querySelector("#schema-version");
+  const emptyState = document.querySelector("#empty-state");
+  const sectionGrid = document.querySelector("#section-grid");
+  const template = document.querySelector("#section-template");
+
+  const sections = [
+    ["plan", "Plan"],
+    ["context", "Context"],
+    ["tools", "Tools"],
+    ["suite", "Suite"],
+    ["execution", "Execution"],
+    ["variableAudit", "Variable Audit"],
+    ["failureAnalysis", "Failure Analysis"],
+    ["memoryFeedback", "Memory Feedback"],
+    ["evaluation", "Evaluation"]
+  ];
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const selectedMode = document.querySelector("#provider-mode").value;
+    const comparison = selectedMode === "comparison";
+    const payload = {
+      fixtureId: document.querySelector("#fixture-id").value,
+      providerMode: comparison ? "fake" : selectedMode,
+      runProfile: comparison ? "comparison-demo" : selectedMode === "real" ? "manual-real-llm" : "local-demo",
+      comparison,
+      allowMemoryWrite: false,
+      outputFormats: ["JSON_REPORT", "MARKDOWN_REPORT"]
+    };
+
+    setStatus("Running", `${payload.fixtureId} / ${selectedMode}`);
+    runButton.disabled = true;
+    try {
+      const response = await fetch(apiEndpoint, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload)
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        throw new Error(body.message || body.code || `HTTP ${response.status}`);
+      }
+      renderResult(body, selectedMode);
+    } catch (error) {
+      setStatus("Failed", error.message);
+      runDetail.classList.add("error");
+    } finally {
+      runButton.disabled = false;
+    }
+  });
+
+  function renderResult(result, selectedMode) {
+    setStatus(result.status || "Completed", `${result.fixtureId} / ${result.runId}`);
+    schemaVersion.textContent = result.schemaVersion || "schema unknown";
+    runPills.replaceChildren(
+      pill(result.providerMode === "REAL" ? "Real LLM" : "Fake provider", result.providerMode === "REAL" ? "real" : "fake"),
+      pill(selectedMode === "comparison" || result.provider?.comparisonEnabled ? "Comparison" : "Single run", selectedMode === "comparison" ? "comparison" : ""),
+      pill(result.usesExternalHttp ? "External HTTP" : "No external HTTP", ""),
+      pill(result.usesRealLlm ? "Uses real LLM" : "No real LLM", result.usesRealLlm ? "real" : "fake")
+    );
+    emptyState.hidden = true;
+    sectionGrid.hidden = false;
+    sectionGrid.replaceChildren(...sections.map(([key, title]) => renderSection(result[key], title)));
+  }
+
+  function renderSection(section, fallbackTitle) {
+    const node = template.content.firstElementChild.cloneNode(true);
+    node.querySelector("h3").textContent = section?.title || fallbackTitle;
+    const status = node.querySelector(".section-head .pill");
+    status.textContent = section?.status || "NOT_RUN";
+    const body = node.querySelector(".section-body");
+    const source = sourcePill(section?.source || "NOT_RUN");
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    const pre = document.createElement("pre");
+    summary.textContent = detailTitle(section);
+    pre.textContent = JSON.stringify(section?.summary || {}, null, 2);
+    details.append(summary, pre);
+    body.append(source, summaryList(section), details);
+    return node;
+  }
+
+  function summaryList(section) {
+    const dl = document.createElement("dl");
+    const rows = [
+      ["Section", section?.sectionId || "not-run"],
+      ["Source", section?.source || "NOT_RUN"],
+      ["Status", section?.status || "NOT_RUN"]
+    ];
+    for (const [label, value] of rows) {
+      const dt = document.createElement("dt");
+      const dd = document.createElement("dd");
+      dt.textContent = label;
+      dd.textContent = value;
+      dl.append(dt, dd);
+    }
+    return dl;
+  }
+
+  function detailTitle(section) {
+    if (section?.sectionId === "tools") return "Tool call details";
+    if (section?.sectionId === "context") return "Context item details";
+    if (section?.sectionId === "suite") return "Step details";
+    return "Details";
+  }
+
+  function sourcePill(source) {
+    if (source === "REAL_APPLICATION") return pill("Real application", "real");
+    if (source === "FIXTURE") return pill("Demo fixture", "comparison");
+    if (source === "APPLICATION") return pill("Application view", "fake");
+    return pill(source, "");
+  }
+
+  function pill(text, className) {
+    const span = document.createElement("span");
+    span.className = className ? `pill ${className}` : "pill";
+    span.textContent = text;
+    return span;
+  }
+
+  function setStatus(status, detail) {
+    runStatus.textContent = status;
+    runDetail.textContent = detail;
+    runDetail.classList.remove("error");
+  }
+</script>
+</body>
+</html>
