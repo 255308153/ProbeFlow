@@ -709,6 +709,18 @@ public class AgentMemoryFeedbackApplicationService {
                 .append(firstText(dependency.variableName(), dependency.path(), dependency.expression()))
                 .append(". ");
         }
+        if (classification == FailureClassification.BUSINESS_PRECONDITION_FAILURE) {
+            content.append("Business precondition evidence: state ")
+                .append(metadataString(request.metadata().get("businessState")))
+                .append(", missing precondition step ")
+                .append(metadataString(request.metadata().get("missingPreconditionStep")))
+                .append(", test data requirement ")
+                .append(metadataString(request.metadata().get("testDataRequirement")))
+                .append(". ");
+        }
+        if (classification == FailureClassification.DOWNSTREAM_API_FAILURE) {
+            content.append("Downstream API evidence: prerequisite variables were already produced/consumed; learn this as service or endpoint behavior, not as a variable, precondition, or step-order fix. ");
+        }
         content.append("Root cause: ")
             .append(rootCauseText(analysis))
             .append(". Recommendation: ")
