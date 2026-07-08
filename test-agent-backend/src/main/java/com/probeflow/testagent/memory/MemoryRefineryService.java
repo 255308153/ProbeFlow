@@ -193,10 +193,12 @@ public class MemoryRefineryService {
             .stream()
             .filter(memory -> memory.getScopeType() == scopeType)
             .filter(memory -> sameSource(memory, request)
+                || sameFactFingerprint(memory, metadata)
                 || equivalent(memory, scopeType, summary, content, tags, request.sourceType(), request.sourceRef())
                 || isSimilarCandidate(memory, summary, content, fullContent, tags, request, metadata))
             .sorted(Comparator
                 .comparing((LongTermMemory memory) -> !sameSource(memory, request))
+                .thenComparing(memory -> !sameFactFingerprint(memory, metadata))
                 .thenComparing(memory -> !equivalent(memory, scopeType, summary, content, tags, request.sourceType(), request.sourceRef()))
                 .thenComparing(LongTermMemory::getCreatedAt)
                 .thenComparing(LongTermMemory::getMemoryId))
@@ -206,7 +208,12 @@ public class MemoryRefineryService {
     private boolean sameSource(LongTermMemory memory, MemoryCandidateRequest request) {
         return memory.getSourceType() == request.sourceType()
             && StringUtils.hasText(memory.getSourceRef())
-            && Objects.equals(memory.getSourceRef(), request.sourceRef());
+            && Objects.equals(memory.getSourceRef(), request.sourceRef())
+            && Objects.equals(metadataValue(memory.getMetadata(), "taskId"), request.taskId() == null ? "" : request.taskId());
+    }
+
+    private boolean sameFactFingerprint(LongTermMemory memory, Map<String, Object> metadata) {
+        return metadataHintEquals(memory.getMetadata(), metadata, "factFingerprint");
     }
 
     private LongTermMemory mergeIntoExisting(
@@ -236,9 +243,21 @@ public class MemoryRefineryService {
 
     private void writeEmbedding(LongTermMemory memory, Map<String, Object> metadata) {
         var profile = embeddingService.profile();
-        var embedding = embeddingService.embedDocument(memory.getSummary() + "\n" + memory.getContent());
+        var embedding = embeddingService.embedDocument(embeddingDocument(memory, metadata));
         memory.setEmbedding(EmbeddingValidation.requireVector("document", profile, embedding, embeddingDimension));
         memory.setMetadata(EmbeddingProfileMetadata.withProfile(metadata, profile));
+    }
+
+    private String embeddingDocument(LongTermMemory memory, Map<String, Object> metadata) {
+        return String.join(
+            "\n",
+            List.of(
+                collapseWhitespace(memory.getSummary()),
+                collapseWhitespace(memory.getContent()),
+                collapseWhitespace(memory.getFullContent()),
+                metadataValue(metadata, "evidenceSummary")
+            )
+        );
     }
 
     private boolean isSimilarCandidate(
@@ -486,6 +505,14 @@ public class MemoryRefineryService {
             merged.put("mergedSourceTypes", List.copyOf(sourceTypes));
         }
 
+        var factFingerprints = new LinkedHashSet<String>();
+        collectSourceRefs(factFingerprints, existing.get("mergedFactFingerprints"));
+        collectSourceRefs(factFingerprints, existing.get("factFingerprint"));
+        collectSourceRefs(factFingerprints, incoming.get("factFingerprint"));
+        if (!factFingerprints.isEmpty()) {
+            merged.put("mergedFactFingerprints", List.copyOf(factFingerprints));
+        }
+
         var evidenceSummaries = new LinkedHashSet<String>();
         collectSourceRefs(evidenceSummaries, existing.get("evidenceSummaries"));
         collectSourceRefs(evidenceSummaries, existingMemory.getSummary());
@@ -493,8 +520,26 @@ public class MemoryRefineryService {
         collectSourceRefs(evidenceSummaries, request.summary());
         if (!evidenceSummaries.isEmpty()) {
             merged.put("evidenceSummaries", List.copyOf(evidenceSummaries));
+            merged.put("evidenceSummary", evidenceSummaries.iterator().next());
+        }
+
+        var evidenceLedger = new ArrayList<Object>();
+        collectEvidenceEntries(evidenceLedger, existing.get("evidenceLedger"));
+        collectEvidenceEntries(evidenceLedger, incoming.get("evidenceLedger"));
+        if (!evidenceLedger.isEmpty()) {
+            merged.put("evidenceLedger", List.copyOf(evidenceLedger));
         }
         return new LinkedHashMap<>(merged);
+    }
+
+    private void collectEvidenceEntries(List<Object> entries, Object raw) {
+        if (raw instanceof List<?> values) {
+            entries.addAll(values);
+            return;
+        }
+        if (raw != null) {
+            entries.add(raw);
+        }
     }
 
     private void collectSourceRefs(LinkedHashSet<String> sourceRefs, Object raw) {
