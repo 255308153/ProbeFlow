@@ -21,3 +21,5 @@ probeflow:
   llm:
     allow-real-providers: false
     allowed-providers: fake
+    manual-real:
+      enabled: false

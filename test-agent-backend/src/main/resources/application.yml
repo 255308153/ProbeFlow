@@ -26,3 +26,12 @@ probeflow:
   llm:
     allow-real-providers: ${PROBEFLOW_LLM_ALLOW_REAL_PROVIDERS:false}
     allowed-providers: ${PROBEFLOW_LLM_ALLOWED_PROVIDERS:fake}
+    manual-real:
+      enabled: ${PROBEFLOW_LLM_MANUAL_REAL_ENABLED:false}
+      provider-name: ${PROBEFLOW_LLM_MANUAL_REAL_PROVIDER:manual-real}
+      endpoint: ${PROBEFLOW_LLM_MANUAL_REAL_ENDPOINT:}
+      key: ${PROBEFLOW_LLM_MANUAL_REAL_KEY:}
+      model: ${PROBEFLOW_LLM_MANUAL_REAL_MODEL:}
+      timeout-ms: ${PROBEFLOW_LLM_MANUAL_REAL_TIMEOUT_MS:0}
+      max-tokens: ${PROBEFLOW_LLM_MANUAL_REAL_MAX_TOKENS:0}
+      cost-limit-cents: ${PROBEFLOW_LLM_MANUAL_REAL_COST_LIMIT_CENTS:0}

@@ -9,29 +9,76 @@ import com.probeflow.testagent.manualsuiteagent.ManualSuiteAgentRunResult;
 import com.probeflow.testagent.manualsuiteagent.ManualSuiteAgentRunStatus;
 import com.probeflow.testagent.manualsuiteagent.ManualSuiteAgentSectionSource;
 import com.probeflow.testagent.manualsuiteagent.ManualSuiteAgentSectionSummary;
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 @Service
 public class DemoRunApplicationService {
 
     private final ManualSuiteAgentHarness harness;
+    private final DemoRunRealLlmGateway realLlmGateway;
 
     public DemoRunApplicationService() {
-        this(ManualSuiteAgentHarness.defaults());
+        this(ManualSuiteAgentHarness.defaults(), DemoRunRealLlmGateway.disabled());
     }
 
     public DemoRunApplicationService(ManualSuiteAgentHarness harness) {
+        this(harness, DemoRunRealLlmGateway.disabled());
+    }
+
+    public DemoRunApplicationService(ManualSuiteAgentHarness harness, DemoRunRealLlmGateway realLlmGateway) {
         this.harness = harness == null ? ManualSuiteAgentHarness.defaults() : harness;
+        this.realLlmGateway = realLlmGateway == null ? DemoRunRealLlmGateway.disabled() : realLlmGateway;
+    }
+
+    @Autowired
+    public DemoRunApplicationService(ObjectProvider<DemoRunRealLlmGateway> realLlmGateway) {
+        this(ManualSuiteAgentHarness.defaults(), realLlmGateway.getIfAvailable(DemoRunRealLlmGateway::disabled));
     }
 
     public DemoRunResult run(DemoRunRequest request) {
         var effectiveRequest = request == null
             ? new DemoRunRequest(null, null, null, null)
             : request;
-        var harnessResult = harness.run(toHarnessRequest(effectiveRequest));
+        if (effectiveRequest.providerMode() == DemoRunProviderMode.REAL) {
+            var realGuard = validateRealRunProfile(effectiveRequest);
+            if (realGuard != null) {
+                return rejectedRealResult(effectiveRequest, realGuard, List.of(), Map.of("category", "CONFIGURATION"));
+            }
+            var probe = realLlmGateway.probe(effectiveRequest, realProbeInput(effectiveRequest));
+            if (probe.status() != DemoRunRealLlmProbeStatus.SUCCESS) {
+                return rejectedRealResult(
+                    effectiveRequest,
+                    probe.message(),
+                    probe.callSummaries(),
+                    probe.metadata()
+                );
+            }
+            return runHarness(effectiveRequest, true, probe.callSummaries());
+        }
+        var harnessResult = harness.run(toHarnessRequest(effectiveRequest, false));
+        return toResult(effectiveRequest, harnessResult, List.of());
+    }
+
+    private DemoRunResult runHarness(
+        DemoRunRequest effectiveRequest,
+        boolean allowManualProvider,
+        List<DemoRunLlmCallSummary> llmCalls
+    ) {
+        var harnessResult = harness.run(toHarnessRequest(effectiveRequest, allowManualProvider));
+        return toResult(effectiveRequest, harnessResult, llmCalls);
+    }
+
+    private DemoRunResult toResult(
+        DemoRunRequest effectiveRequest,
+        ManualSuiteAgentRunResult harnessResult,
+        List<DemoRunLlmCallSummary> llmCalls
+    ) {
         var providerMode = toDemoProviderMode(harnessResult.providerMode());
         return new DemoRunResult(
             DemoRunResult.SCHEMA_VERSION,
@@ -45,7 +92,7 @@ public class DemoRunApplicationService {
             harnessResult.runProfile(),
             harnessResult.usesRealProvider(),
             harnessResult.usesExternalHttp(),
-            providerSummary(effectiveRequest, harnessResult, providerMode),
+            providerSummary(effectiveRequest, harnessResult, providerMode, llmCalls),
             planSection(harnessResult),
             contextSection(harnessResult),
             toolsSection(harnessResult),
@@ -61,7 +108,7 @@ public class DemoRunApplicationService {
         );
     }
 
-    private ManualSuiteAgentRunRequest toHarnessRequest(DemoRunRequest request) {
+    private ManualSuiteAgentRunRequest toHarnessRequest(DemoRunRequest request, boolean allowManualProvider) {
         var harnessProviderMode = request.providerMode() == DemoRunProviderMode.REAL
             ? ManualSuiteAgentProviderMode.MANUAL_REAL_LLM
             : ManualSuiteAgentProviderMode.DETERMINISTIC_FAKE;
@@ -69,7 +116,7 @@ public class DemoRunApplicationService {
             request.fixtureId(),
             harnessProviderMode,
             request.outputDirectory(),
-            false,
+            allowManualProvider,
             false,
             request.runProfile(),
             request.providerMode().name()
@@ -79,7 +126,8 @@ public class DemoRunApplicationService {
     private DemoRunProviderSummary providerSummary(
         DemoRunRequest request,
         ManualSuiteAgentRunResult result,
-        DemoRunProviderMode providerMode
+        DemoRunProviderMode providerMode,
+        List<DemoRunLlmCallSummary> llmCalls
     ) {
         return new DemoRunProviderSummary(
             providerMode,
@@ -92,12 +140,105 @@ public class DemoRunApplicationService {
             request.comparisonEnabled(),
             request.allowMemoryWrite(),
             request.outputFormats(),
+            llmCalls,
             List.of(
                 "default demo run uses deterministic fake provider",
                 "default demo run does not require a real LLM key",
                 "default demo run does not require real embedding",
                 "default demo run uses fake HTTP gateway only"
             )
+        );
+    }
+
+    private String validateRealRunProfile(DemoRunRequest request) {
+        if (!"manual-real-llm".equals(request.runProfile())) {
+            return "Manual real LLM mode requires runProfile=manual-real-llm.";
+        }
+        return null;
+    }
+
+    private Map<String, Object> realProbeInput(DemoRunRequest request) {
+        return orderedMap(
+            "fixtureId", request.fixtureId(),
+            "providerMode", request.providerMode().name(),
+            "runProfile", request.runProfile(),
+            "allowMemoryWrite", request.allowMemoryWrite(),
+            "usesExternalHttp", false
+        );
+    }
+
+    private DemoRunResult rejectedRealResult(
+        DemoRunRequest request,
+        String message,
+        List<DemoRunLlmCallSummary> llmCalls,
+        Map<String, Object> metadata
+    ) {
+        var now = Instant.now();
+        var diagnostic = new DemoRunDiagnosticView(
+            "REAL_LLM_NOT_AVAILABLE",
+            "ERROR",
+            message,
+            sanitizedMap(metadata)
+        );
+        var errors = new DemoRunSectionView(
+            "errors",
+            "Errors",
+            DemoRunSectionSource.APPLICATION,
+            DemoRunStatus.REJECTED.name(),
+            orderedMap(
+                "hasErrors", true,
+                "diagnostics", List.of(orderedMap(
+                    "code", diagnostic.code(),
+                    "category", diagnosticCategory(diagnostic.code()),
+                    "severity", diagnostic.severity(),
+                    "message", diagnostic.message(),
+                    "metadata", diagnostic.metadata()
+                ))
+            )
+        );
+        return new DemoRunResult(
+            DemoRunResult.SCHEMA_VERSION,
+            "v4d-rejected-" + java.util.UUID.randomUUID(),
+            request.fixtureId(),
+            "unknown",
+            DemoRunProviderMode.REAL,
+            DemoRunStatus.REJECTED,
+            now,
+            now,
+            request.runProfile(),
+            false,
+            false,
+            new DemoRunProviderSummary(
+                DemoRunProviderMode.REAL,
+                ManualSuiteAgentProviderMode.MANUAL_REAL_LLM.name(),
+                request.providerMode().name(),
+                request.runProfile(),
+                false,
+                false,
+                false,
+                request.comparisonEnabled(),
+                request.allowMemoryWrite(),
+                request.outputFormats(),
+                llmCalls,
+                List.of(
+                    "real LLM mode requires explicit providerMode=REAL",
+                    "real LLM mode requires runProfile=manual-real-llm",
+                    "real LLM mode is rejected when endpoint, key, model, timeout or cost limit are missing",
+                    "default demo run still uses fake provider and fake HTTP only"
+                )
+            ),
+            DemoRunSectionView.notRun("plan", "Plan"),
+            DemoRunSectionView.notRun("context", "Context"),
+            DemoRunSectionView.notRun("tools", "Tools"),
+            DemoRunSectionView.notRun("suite", "Suite Draft"),
+            DemoRunSectionView.notRun("execution", "Execution"),
+            DemoRunSectionView.notRun("variable-audit", "Variable Audit"),
+            DemoRunSectionView.notRun("failure-analysis", "Failure Analysis"),
+            DemoRunSectionView.notRun("memory-feedback", "Memory Feedback"),
+            DemoRunSectionView.notRun("evaluation", "Evaluation"),
+            errors,
+            List.of(),
+            List.of(diagnostic)
         );
     }
 

@@ -29,6 +29,7 @@ class V2Phase2AcceptanceBoundaryGuardTests {
         "/agentevaluation/",
         "/manualsuiteagent/",
         "/demorun/",
+        "ManualRealLlm",
         "/orchestration/",
         "/report/"
     );

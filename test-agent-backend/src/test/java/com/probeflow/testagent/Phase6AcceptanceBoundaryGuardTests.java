@@ -18,6 +18,7 @@ class Phase6AcceptanceBoundaryGuardTests {
         "/agentevaluation/",
         "/manualsuiteagent/",
         "/demorun/",
+        "ManualRealLlm",
         "/orchestration/",
         "/report/"
     );

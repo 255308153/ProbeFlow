@@ -198,7 +198,10 @@ class V2Phase1AcceptanceBoundaryGuardTests {
     }
 
     private String llmSourceText() throws Exception {
-        return sourceText(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/llm"));
+        return sourceText(
+            PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/llm"),
+            List.of("ManualRealLlm")
+        );
     }
 
     private String mainSourceText() throws Exception {
