@@ -26,7 +26,8 @@ class V2Phase3AcceptanceBoundaryGuardTests {
         "/demorun/",
         "ManualRealLlm",
         "/orchestration/",
-        "/report/"
+        "/report/",
+        "/projectimport/"
     );
 
     @Test

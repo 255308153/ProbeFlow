@@ -64,3 +64,6 @@ probeflow:
       enabled: ${PROBEFLOW_RERANK_LLM_ENABLED:false}
       provider: ${PROBEFLOW_RERANK_LLM_PROVIDER:disabled}
       model: ${PROBEFLOW_RERANK_LLM_MODEL:deepseek-v4-pro}
+  project-import:
+    local-directory:
+      allowed-roots: ${PROBEFLOW_PROJECT_IMPORT_LOCAL_DIRECTORY_ALLOWED_ROOTS:}

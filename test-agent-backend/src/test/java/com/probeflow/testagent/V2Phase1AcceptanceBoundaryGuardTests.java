@@ -12,7 +12,7 @@ import org.junit.jupiter.api.Test;
 class V2Phase1AcceptanceBoundaryGuardTests {
 
     private static final Path PROJECT_ROOT = Path.of("").toAbsolutePath();
-    private static final List<String> POST_V2_PHASE1_PACKAGES = List.of("/demorun/");
+    private static final List<String> POST_V2_PHASE1_PACKAGES = List.of("/demorun/", "/projectimport/");
 
     @Test
     void v2Phase1AcceptanceIsCoveredThroughLlmApplicationServiceSeams() throws Exception {
