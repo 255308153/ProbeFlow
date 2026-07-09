@@ -57,6 +57,7 @@ class Phase1BoundaryGuardTests {
             "llm",
             "manualsuiteagent",
             "memory",
+            "memorygraph",
             "observation",
             "orchestration",
             "policyvalidator",

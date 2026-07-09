@@ -322,6 +322,8 @@ class Phase4AcceptanceBoundaryGuardTests {
             "KnowledgeRetrievalApplicationService",
             "LlmApplicationService",
             "LongTermMemoryRetrievalService",
+            "MemoryGraphProjectionService",
+            "MemoryGraphQueryService",
             "MemoryRefineryService",
             "MemoryUsageRecordingService",
             "MemoryUsefulnessFeedbackService",

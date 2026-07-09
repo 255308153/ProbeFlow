@@ -11,6 +11,7 @@ import com.probeflow.testagent.memory.MemoryType;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -41,6 +42,11 @@ class MemoryGraphSuiteVariableIssue03Tests {
         edges.deleteAll();
         nodes.deleteAll();
         longTermMemories.deleteAll();
+    }
+
+    @AfterEach
+    void cleanAfter() {
+        clean();
     }
 
     @Test
