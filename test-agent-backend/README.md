@@ -37,6 +37,12 @@ mvn test
 
 Automated startup tests use the `test` profile with an in-memory H2 database, so they do not require locally running containers.
 
+## V5-4 Query Rewrite And Multi-route Retrieval
+
+V5-4 expands the read path from one raw query to deterministic query variants, stage-aware Knowledge / Memory / Graph routes, route fusion, budget fallback, and Unified Context route evidence. It covers recall and explanation; V5-5 owns rerank and Small-to-Big.
+
+See [docs/v5-4-query-rewrite-multi-route-retrieval.md](docs/v5-4-query-rewrite-multi-route-retrieval.md) for Chinese design notes, V5-3 / V5-5 boundaries, deterministic rewrite defaults, DeepSeek V4 Pro manual acceptance constraints, budget governance, and acceptance guardrails.
+
 ## V5-1 Real Embedding And pgvector
 
 V5-1 adds a real embedding manual profile, pgvector candidate retrieval for Knowledge RAG and Long-term Memory, embedding profile metadata, reindex guards, and semantic evidence propagation into Unified Context. Fake embedding remains the default for local tests and CI.
