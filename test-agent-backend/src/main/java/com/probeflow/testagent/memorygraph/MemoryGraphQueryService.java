@@ -105,7 +105,7 @@ public class MemoryGraphQueryService {
                         neighbor.getDisplayValue(),
                         neighbor.getNormalizedValue(),
                         neighbor.getScope(),
-                        matchReason(edge.getRelationType()),
+                        matchReason(path),
                         List.copyOf(path),
                         confidence,
                         List.copyOf(edge.getSourceMemoryIds()),
@@ -127,16 +127,37 @@ public class MemoryGraphQueryService {
         Map<String, MemoryGraphRelatedMemory> relatedMemories
     ) {
         var memoryId = memoryNode.getNormalizedValue();
-        longTermMemories.findById(memoryId).ifPresent(memory -> relatedMemories.putIfAbsent(memoryId, new MemoryGraphRelatedMemory(
-            memoryId,
-            memory.getSummary(),
-            memory.getSourceRef(),
-            matchReason(edge.getRelationType()),
-            List.copyOf(path),
-            confidence,
-            List.copyOf(edge.getSourceMemoryIds()),
-            List.copyOf(edge.getEvidenceSummaries())
-        )));
+        longTermMemories.findById(memoryId).ifPresent(memory -> {
+            var candidate = new MemoryGraphRelatedMemory(
+                memoryId,
+                memory.getSummary(),
+                memory.getSourceRef(),
+                matchReason(path),
+                List.copyOf(path),
+                confidence,
+                List.copyOf(edge.getSourceMemoryIds()),
+                List.copyOf(edge.getEvidenceSummaries())
+            );
+            var existing = relatedMemories.get(memoryId);
+            if (existing == null || betterPath(candidate, existing)) {
+                relatedMemories.put(memoryId, candidate);
+            }
+        });
+    }
+
+    private boolean betterPath(MemoryGraphRelatedMemory candidate, MemoryGraphRelatedMemory existing) {
+        if ("graph-neighbor-memory".equals(existing.matchReason()) && !"graph-neighbor-memory".equals(candidate.matchReason())) {
+            return true;
+        }
+        if (candidate.confidence() > existing.confidence() && candidate.relationPath().size() <= existing.relationPath().size()) {
+            return true;
+        }
+        return candidate.relationPath().stream().anyMatch(this::isSpecificRelation)
+            && existing.relationPath().stream().noneMatch(this::isSpecificRelation);
+    }
+
+    private boolean isSpecificRelation(String relationName) {
+        return !"MEMORY_MENTIONS_ENTITY".equals(relationName) && !"ENTITY_RELATED_TO_MEMORY".equals(relationName);
     }
 
     private boolean forwardQueryable(MemoryGraphEdge edge) {
@@ -155,6 +176,17 @@ public class MemoryGraphQueryService {
             case ENTITY_RELATED_TO_MEMORY, MEMORY_MENTIONS_ENTITY -> "graph-neighbor-memory";
             default -> "graph-neighbor-memory";
         };
+    }
+
+    private String matchReason(List<String> relationPath) {
+        for (var relationName : relationPath) {
+            var relationType = MemoryGraphRelationType.valueOf(relationName);
+            var reason = matchReason(relationType);
+            if (!"graph-neighbor-memory".equals(reason)) {
+                return reason;
+            }
+        }
+        return "graph-neighbor-memory";
     }
 
     private MemoryGraphSeed normalizeSeed(MemoryGraphSeed seed) {

@@ -88,6 +88,28 @@ public class MemoryGraphProjectionService {
         );
         putEntity(entityNodes, MemoryGraphEntityType.API_PATH, value(metadata, "apiPath", "path", "endpoint"), moduleScope, metadata, evidence, context);
         putEntity(entityNodes, MemoryGraphEntityType.HTTP_METHOD, value(metadata, "httpMethod", "method"), moduleScope, metadata, evidence, context);
+        putEntity(entityNodes, MemoryGraphEntityType.ERROR_CODE, value(metadata, "errorCode", "error", "code"), moduleScope, metadata, evidence, context);
+        putEntity(
+            entityNodes,
+            MemoryGraphEntityType.FAILURE_CLASSIFICATION,
+            value(metadata, "failureClassification", "classification", "failureType", "rootCauseClassification"),
+            null,
+            metadata,
+            evidence,
+            context
+        );
+        putEntity(entityNodes, MemoryGraphEntityType.BUSINESS_ENTITY, value(metadata, "businessEntity", "businessObject", "entity", "entityName", "resource"), moduleScope, metadata, evidence, context);
+        if (isFactType(metadata, "business_precondition_fact") && entityNodes.containsKey(MemoryGraphEntityType.BUSINESS_ENTITY)) {
+            putEntity(
+                entityNodes,
+                MemoryGraphEntityType.PRECONDITION,
+                firstNonBlank(value(metadata, "precondition", "businessPrecondition", "preconditionKey"), memory.getSummary()),
+                moduleScope,
+                metadata,
+                evidence,
+                context
+            );
+        }
         putEntity(entityNodes, MemoryGraphEntityType.FACT_TYPE, value(metadata, "factType"), null, metadata, evidence, context);
 
         for (var tag : memory.getTags()) {
@@ -111,6 +133,10 @@ public class MemoryGraphProjectionService {
         relate(entityNodes, MemoryGraphEntityType.API_PATH, MemoryGraphEntityType.MODULE, MemoryGraphRelationType.API_BELONGS_TO_MODULE, evidence, context);
         relate(entityNodes, MemoryGraphEntityType.MODULE, MemoryGraphEntityType.SYSTEM, MemoryGraphRelationType.MODULE_BELONGS_TO_SYSTEM, evidence, context);
         relate(entityNodes, MemoryGraphEntityType.API_PATH, MemoryGraphEntityType.HTTP_METHOD, MemoryGraphRelationType.API_USES_HTTP_METHOD, evidence, context);
+        relate(entityNodes, MemoryGraphEntityType.ERROR_CODE, MemoryGraphEntityType.API_PATH, MemoryGraphRelationType.ERROR_OBSERVED_ON_API, evidence, context);
+        relate(memoryNode, entityNodes.get(MemoryGraphEntityType.FAILURE_CLASSIFICATION), MemoryGraphRelationType.FAILURE_CLASSIFIED_AS, evidence, context);
+        relate(entityNodes, MemoryGraphEntityType.BUSINESS_ENTITY, MemoryGraphEntityType.API_PATH, MemoryGraphRelationType.BUSINESS_ENTITY_RELATED_TO_API, evidence, context);
+        relate(entityNodes, MemoryGraphEntityType.BUSINESS_ENTITY, MemoryGraphEntityType.PRECONDITION, MemoryGraphRelationType.BUSINESS_ENTITY_REQUIRES_PRECONDITION, evidence, context);
         relate(memoryNode, entityNodes.get(MemoryGraphEntityType.FACT_TYPE), MemoryGraphRelationType.FACT_HAS_TYPE, evidence, context);
         for (var tagNode : tagNodes) {
             relate(memoryNode, tagNode, MemoryGraphRelationType.FACT_HAS_TAG, evidence, context);
@@ -256,6 +282,15 @@ public class MemoryGraphProjectionService {
             }
         }
         return null;
+    }
+
+    private boolean isFactType(Map<String, Object> metadata, String expected) {
+        var factType = value(metadata, "factType");
+        return StringUtils.hasText(factType) && normalize(MemoryGraphEntityType.FACT_TYPE, factType).equals(normalize(MemoryGraphEntityType.FACT_TYPE, expected));
+    }
+
+    private String firstNonBlank(String first, String second) {
+        return StringUtils.hasText(first) ? first : second;
     }
 
     static String normalize(MemoryGraphEntityType entityType, String value) {
