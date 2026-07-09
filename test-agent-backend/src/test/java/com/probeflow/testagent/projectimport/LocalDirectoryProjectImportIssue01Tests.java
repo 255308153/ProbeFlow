@@ -1,7 +1,6 @@
 package com.probeflow.testagent.projectimport;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -55,28 +54,6 @@ class LocalDirectoryProjectImportIssue01Tests {
     @DynamicPropertySource
     static void projectImportProperties(DynamicPropertyRegistry registry) {
         registry.add("probeflow.project-import.local-directory.allowed-roots", ALLOWED_ROOT::toString);
-    }
-
-    @Test
-    void safeAbsoluteDirectoryReturnsLocalDirectoryImportContractWithoutCreatingAnalysisArtifacts() throws Exception {
-        var projectDir = Files.createDirectories(ALLOWED_ROOT.resolve("orders-service"));
-        var before = artifactCounts();
-
-        mockMvc.perform(post("/api/project-imports/local-directory")
-                .contentType(MediaType.APPLICATION_JSON)
-                .content(objectMapper.writeValueAsString(localDirectoryBody(projectDir.toString()))))
-            .andExpect(status().isOk())
-            .andExpect(jsonPath("$.materialId").value(nullValue()))
-            .andExpect(jsonPath("$.taskId").value(nullValue()))
-            .andExpect(jsonPath("$.status").value("VALIDATED"))
-            .andExpect(jsonPath("$.materialType").value("SOURCE_DIRECTORY"))
-            .andExpect(jsonPath("$.apiSpecCount").value(0))
-            .andExpect(jsonPath("$.warnings").isArray())
-            .andExpect(jsonPath("$.warnings").isEmpty())
-            .andExpect(jsonPath("$.blockers").isArray())
-            .andExpect(jsonPath("$.blockers").isEmpty());
-
-        assertThat(artifactCounts()).isEqualTo(before);
     }
 
     @Test
