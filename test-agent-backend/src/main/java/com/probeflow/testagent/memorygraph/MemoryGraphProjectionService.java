@@ -110,6 +110,13 @@ public class MemoryGraphProjectionService {
                 context
             );
         }
+        putEntity(entityNodes, MemoryGraphEntityType.SUITE_ID, value(metadata, "suiteId", "suite"), null, metadata, evidence, context);
+        var suiteScope = scope("suite", normalizeGeneral(value(metadata, "suiteId", "suite")));
+        putEntity(entityNodes, MemoryGraphEntityType.CASE_ID, value(metadata, "caseId", "testCaseId"), suiteScope, metadata, evidence, context);
+        putEntity(entityNodes, MemoryGraphEntityType.ROOT_STEP_ID, value(metadata, "rootStepId", "producerStepId", "upstreamStepId", "stepId"), suiteScope, metadata, evidence, context);
+        putEntity(entityNodes, MemoryGraphEntityType.DOWNSTREAM_STEP_ID, value(metadata, "downstreamStepId", "consumerStepId"), suiteScope, metadata, evidence, context);
+        putEntity(entityNodes, MemoryGraphEntityType.VARIABLE_KEY, value(metadata, "variableKey", "suiteVariableKey", "targetKey"), suiteScope, metadata, evidence, context);
+        putEntity(entityNodes, MemoryGraphEntityType.SOURCE_PATH, value(metadata, "sourcePath", "jsonPath", "responsePath"), suiteScope, metadata, evidence, context);
         putEntity(entityNodes, MemoryGraphEntityType.FACT_TYPE, value(metadata, "factType"), null, metadata, evidence, context);
 
         for (var tag : memory.getTags()) {
@@ -137,6 +144,10 @@ public class MemoryGraphProjectionService {
         relate(memoryNode, entityNodes.get(MemoryGraphEntityType.FAILURE_CLASSIFICATION), MemoryGraphRelationType.FAILURE_CLASSIFIED_AS, evidence, context);
         relate(entityNodes, MemoryGraphEntityType.BUSINESS_ENTITY, MemoryGraphEntityType.API_PATH, MemoryGraphRelationType.BUSINESS_ENTITY_RELATED_TO_API, evidence, context);
         relate(entityNodes, MemoryGraphEntityType.BUSINESS_ENTITY, MemoryGraphEntityType.PRECONDITION, MemoryGraphRelationType.BUSINESS_ENTITY_REQUIRES_PRECONDITION, evidence, context);
+        relate(entityNodes, MemoryGraphEntityType.SUITE_ID, MemoryGraphEntityType.CASE_ID, MemoryGraphRelationType.SUITE_CONTAINS_CASE, evidence, context);
+        relate(entityNodes, MemoryGraphEntityType.ROOT_STEP_ID, MemoryGraphEntityType.VARIABLE_KEY, MemoryGraphRelationType.SUITE_STEP_PRODUCES_VARIABLE, evidence, context);
+        relate(entityNodes, MemoryGraphEntityType.DOWNSTREAM_STEP_ID, MemoryGraphEntityType.VARIABLE_KEY, MemoryGraphRelationType.SUITE_STEP_CONSUMES_VARIABLE, evidence, context);
+        relate(entityNodes, MemoryGraphEntityType.VARIABLE_KEY, MemoryGraphEntityType.SOURCE_PATH, MemoryGraphRelationType.VARIABLE_EXTRACTED_FROM_SOURCE_PATH, evidence, context);
         relate(memoryNode, entityNodes.get(MemoryGraphEntityType.FACT_TYPE), MemoryGraphRelationType.FACT_HAS_TYPE, evidence, context);
         for (var tagNode : tagNodes) {
             relate(memoryNode, tagNode, MemoryGraphRelationType.FACT_HAS_TAG, evidence, context);
