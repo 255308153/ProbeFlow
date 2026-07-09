@@ -56,3 +56,7 @@ probeflow:
       provider: ${PROBEFLOW_MEMORY_FACT_EXTRACTOR_PROVIDER:fake}
       model: ${PROBEFLOW_MEMORY_FACT_EXTRACTOR_MODEL:fake-model}
       template-id: ${PROBEFLOW_MEMORY_FACT_EXTRACTOR_TEMPLATE_ID:v5.memory-fact-extraction.v1}
+  rerank:
+    cross-encoder:
+      enabled: ${PROBEFLOW_RERANK_CROSS_ENCODER_ENABLED:false}
+      provider: ${PROBEFLOW_RERANK_CROSS_ENCODER_PROVIDER:disabled}

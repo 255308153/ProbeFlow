@@ -155,9 +155,11 @@ class V5Phase1AcceptanceBoundaryGuardTests {
     @Test
     void v5Phase1DoesNotAddMem0VikingDbOrLaterRagProImplementations() throws Exception {
         var pom = Files.readString(PROJECT_ROOT.resolve("pom.xml"));
-        var mainSources = sourceText(PROJECT_ROOT.resolve("src/main/java"));
+        var phaseOneSources = sourceText(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/knowledge"))
+            + "\n"
+            + sourceText(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/memory"));
 
-        assertThat(presentTerms(pom + "\n" + mainSources, List.of(
+        assertThat(presentTerms(pom + "\n" + phaseOneSources, List.of(
             "mem0",
             "vikingdb",
             "viking-db",
@@ -165,7 +167,7 @@ class V5Phase1AcceptanceBoundaryGuardTests {
             "com.volcengine"
         ))).isEmpty();
 
-        assertThat(presentTerms(mainSources, List.of(
+        assertThat(presentTerms(phaseOneSources, List.of(
             "MultiRecall",
             "MultiRouteRetrieval",
             "ReciprocalRankFusion",

@@ -43,6 +43,12 @@ V5-4 expands the read path from one raw query to deterministic query variants, s
 
 See [docs/v5-4-query-rewrite-multi-route-retrieval.md](docs/v5-4-query-rewrite-multi-route-retrieval.md) for Chinese design notes, V5-3 / V5-5 boundaries, deterministic rewrite defaults, DeepSeek V4 Pro manual acceptance constraints, budget governance, and acceptance guardrails.
 
+## V5-5 Cross Encoder Rerank Adapter
+
+V5-5 keeps Cross Encoder rerank as an explicit adapter contract, not a default dependency. Default configuration disables the provider, automated tests use fake providers or local stubs, and failures fall back to deterministic rerank.
+
+See [docs/v5-5-cross-encoder-rerank-adapter.md](docs/v5-5-cross-encoder-rerank-adapter.md) for the request / response contract, safe metadata boundary, fallback behavior, and external-service guardrails.
+
 ## V5-1 Real Embedding And pgvector
 
 V5-1 adds a real embedding manual profile, pgvector candidate retrieval for Knowledge RAG and Long-term Memory, embedding profile metadata, reindex guards, and semantic evidence propagation into Unified Context. Fake embedding remains the default for local tests and CI.

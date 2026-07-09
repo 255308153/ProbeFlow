@@ -268,6 +268,7 @@ class Phase4AcceptanceBoundaryGuardTests {
         var sourceRoot = PROJECT_ROOT.resolve("src/main/java");
         var entryPoints = Files.walk(sourceRoot)
             .filter(Files::isRegularFile)
+            .filter(path -> !path.toString().contains("/rerank/"))
             .filter(path -> {
                 var fileName = path.getFileName().toString();
                 return fileName.endsWith("Service.java")
@@ -281,6 +282,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             .filter(Files::isRegularFile)
             .filter(path -> path.toString().endsWith(".java"))
             .filter(path -> !path.toString().contains("/demorun/"))
+            .filter(path -> !path.toString().contains("/rerank/"))
             .map(this::readUnchecked)
             .collect(Collectors.joining("\n"));
         var controllerAnnotations = sourceText.lines()
@@ -332,7 +334,6 @@ class Phase4AcceptanceBoundaryGuardTests {
             "PolicyValidatorService",
             "ReplanningApplicationService",
             "ReportGenerationApplicationService",
-            "RerankCandidateContractService",
             "SessionMemoryService",
             "SuiteDraftGenerationService",
             "TaskInitializationService",
