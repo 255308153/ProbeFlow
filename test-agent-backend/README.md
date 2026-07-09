@@ -55,6 +55,12 @@ V5-5 keeps LLM rerank behind an explicit manual profile. Default configuration d
 
 See [docs/v5-5-llm-rerank-manual-profile.md](docs/v5-5-llm-rerank-manual-profile.md) for safe candidate summaries, JSON output validation, citation guardrails, redacted diagnostics, and DeepSeek policy.
 
+## V5-5 Rerank Small-to-Big Completion
+
+V5-5 closes the V5 read path by comparing V5-4 fused rank with post-rerank rank, expanding useful small hits into parent/error-code/test-spec/memory evidence context, and feeding post-rerank expanded materials into Unified Context without changing V5-4 route recall or Memory Refinery writes.
+
+See [docs/v5-5-rerank-small-to-big-completion.md](docs/v5-5-rerank-small-to-big-completion.md) for Chinese V5 completion notes, offline rerank evaluation fixture scope, deterministic default boundaries, DeepSeek V4 Pro manual validation policy, and the V6-1 local project import boundary.
+
 ## V5-1 Real Embedding And pgvector
 
 V5-1 adds a real embedding manual profile, pgvector candidate retrieval for Knowledge RAG and Long-term Memory, embedding profile metadata, reindex guards, and semantic evidence propagation into Unified Context. Fake embedding remains the default for local tests and CI.
