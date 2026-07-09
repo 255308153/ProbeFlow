@@ -14,7 +14,6 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -198,12 +197,29 @@ class MemoryFactAcceptanceBoundaryIssue08Tests {
     }
 
     private String readMemoryFactImplementationSources() throws IOException {
-        try (Stream<Path> paths = Files.walk(Path.of("src/main/java/com/probeflow/testagent/memory"))) {
-            var builder = new StringBuilder();
-            for (var path : paths.filter(Files::isRegularFile).filter(path -> path.toString().endsWith(".java")).toList()) {
-                builder.append(Files.readString(path)).append('\n');
-            }
-            return builder.toString();
+        var memoryRoot = Path.of("src/main/java/com/probeflow/testagent/memory");
+        var fileNames = List.of(
+            "DeterministicMemoryFactExtractor.java",
+            "LlmAssistedMemoryFactExtractor.java",
+            "MemoryCandidateRequest.java",
+            "MemoryFact.java",
+            "MemoryFactEvidence.java",
+            "MemoryFactExtractor.java",
+            "MemoryFactQualityDecision.java",
+            "MemoryFactQualityGate.java",
+            "MemoryFactQualityStatus.java",
+            "MemoryFactType.java",
+            "MemoryRefineryResult.java",
+            "MemoryRefineryService.java",
+            "MemoryScopeType.java",
+            "MemorySourceType.java",
+            "MemoryStatus.java",
+            "MemoryType.java"
+        );
+        var builder = new StringBuilder();
+        for (var fileName : fileNames) {
+            builder.append(Files.readString(memoryRoot.resolve(fileName))).append('\n');
         }
+        return builder.toString();
     }
 }

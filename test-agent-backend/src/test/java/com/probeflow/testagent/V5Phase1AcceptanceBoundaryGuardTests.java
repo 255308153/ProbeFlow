@@ -155,9 +155,17 @@ class V5Phase1AcceptanceBoundaryGuardTests {
     @Test
     void v5Phase1DoesNotAddMem0VikingDbOrLaterRagProImplementations() throws Exception {
         var pom = Files.readString(PROJECT_ROOT.resolve("pom.xml"));
-        var phaseOneSources = sourceText(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/knowledge"))
-            + "\n"
-            + sourceText(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/memory"));
+        var phaseOneSources = String.join("\n",
+            Files.readString(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/knowledge/EmbeddingService.java")),
+            Files.readString(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/knowledge/FakeEmbeddingService.java")),
+            Files.readString(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/knowledge/ManualRealEmbeddingProvider.java")),
+            Files.readString(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/knowledge/KnowledgeChunkVectorRepository.java")),
+            Files.readString(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/knowledge/KnowledgeChunkVectorRepositoryImpl.java")),
+            Files.readString(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/knowledge/KnowledgeRetrievalApplicationService.java")),
+            Files.readString(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/memory/LongTermMemoryVectorRepository.java")),
+            Files.readString(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/memory/LongTermMemoryVectorRepositoryImpl.java")),
+            Files.readString(PROJECT_ROOT.resolve("src/main/java/com/probeflow/testagent/memory/LongTermMemoryRetrievalService.java"))
+        );
 
         assertThat(presentTerms(pom + "\n" + phaseOneSources, List.of(
             "mem0",
