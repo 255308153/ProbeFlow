@@ -2,8 +2,14 @@ package com.probeflow.testagent.knowledge;
 
 import com.probeflow.testagent.apispec.ApiSpecRepository;
 import com.probeflow.testagent.apispec.HttpMethod;
+import com.probeflow.testagent.retrieval.QueryFilters;
+import com.probeflow.testagent.retrieval.QueryIntent;
+import com.probeflow.testagent.retrieval.QueryRewriteResult;
+import com.probeflow.testagent.retrieval.QueryTargetCorpus;
+import com.probeflow.testagent.retrieval.QueryVariant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -13,6 +19,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.regex.Pattern;
+import java.util.function.Supplier;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -21,6 +28,7 @@ public class KnowledgeRetrievalApplicationService {
 
     private static final int DEFAULT_LIMIT = 8;
     private static final int DEFAULT_TOKEN_BUDGET = 1200;
+    private static final int DEFAULT_ROUTE_LIMIT = 4;
     private static final Pattern IDENTIFIER = Pattern.compile("\\b[A-Za-z][A-Za-z0-9_]{2,}\\b");
     private static final Set<String> STOP_WORDS = Set.of(
         "the", "and", "for", "with", "from", "that", "this", "into", "must", "have", "when",
@@ -94,6 +102,77 @@ public class KnowledgeRetrievalApplicationService {
         );
     }
 
+    @Transactional(readOnly = true)
+    public KnowledgeRetrievalResult retrieve(KnowledgeQuery query, QueryRewriteResult rewriteResult) {
+        validate(query);
+        var normalized = normalize(query);
+        var diagnostics = new ArrayList<String>();
+        if (rewriteResult != null) {
+            diagnostics.addAll(rewriteResult.diagnostics());
+        }
+
+        var routeLimit = perRouteLimit(normalized.limit());
+        var variants = applicableKnowledgeVariants(normalized, rewriteResult, diagnostics);
+        var originalVariants = originalVariants(normalized, variants);
+        var routeVariants = routeVariants(normalized, variants);
+
+        var routeCandidates = new ArrayList<RouteCandidate>();
+        routeCandidates.addAll(runKnowledgeRoute(
+            "original-semantic",
+            diagnostics,
+            () -> semanticRoute("original-semantic", normalized, originalVariants, routeLimit)
+        ));
+        routeCandidates.addAll(runKnowledgeRoute(
+            "rewritten-semantic",
+            diagnostics,
+            () -> semanticRoute("rewritten-semantic", normalized, rewrittenVariants(routeVariants), routeLimit)
+        ));
+        routeCandidates.addAll(runKnowledgeRoute(
+            "metadata-exact",
+            diagnostics,
+            () -> metadataRoute(normalized, routeVariants, routeLimit)
+        ));
+        routeCandidates.addAll(runKnowledgeRoute(
+            "lexical-tag",
+            diagnostics,
+            () -> lexicalRoute(normalized, routeVariants, routeLimit)
+        ));
+        routeCandidates.addAll(runKnowledgeRoute(
+            "document-type",
+            diagnostics,
+            () -> documentTypeRoute(normalized, routeVariants, routeLimit)
+        ));
+
+        if (routeCandidates.isEmpty()) {
+            return new KnowledgeRetrievalResult(
+                normalized.rawQuery(),
+                List.of(),
+                KnowledgeContext.empty(true, true),
+                0.0d,
+                0,
+                0,
+                true,
+                diagnostics
+            );
+        }
+
+        var merged = mergeRouteCandidates(routeCandidates);
+        var constrained = applyLimitAndTokenBudget(merged, normalized.limit(), normalized.tokenBudget());
+        var lowConfidence = constrained.isEmpty() || constrained.getFirst().lowConfidence();
+        var coverage = constrained.isEmpty() ? 0.0d : (lowConfidence ? 0.4d : 1.0d);
+        var context = assembleKnowledgeContext(constrained, coverage, lowConfidence);
+        return new KnowledgeRetrievalResult(
+            normalized.rawQuery(),
+            constrained,
+            context,
+            coverage,
+            routeCandidates.size(),
+            constrained.stream().mapToInt(KnowledgeRetrievalHit::tokenCount).sum(),
+            lowConfidence,
+            diagnostics
+        );
+    }
+
     @Transactional
     public KnowledgeRetrievalResult retrieveForApiSpec(String apiSpecId, KnowledgeQuery query) {
         requireNonBlank(apiSpecId, "apiSpecId must not be blank");
@@ -144,6 +223,600 @@ public class KnowledgeRetrievalApplicationService {
             query.limit() == null ? DEFAULT_LIMIT : query.limit(),
             query.tokenBudget() == null ? DEFAULT_TOKEN_BUDGET : query.tokenBudget()
         );
+    }
+
+    private int perRouteLimit(int finalLimit) {
+        return Math.max(1, Math.min(DEFAULT_ROUTE_LIMIT, finalLimit));
+    }
+
+    private List<RouteCandidate> runKnowledgeRoute(
+        String routeName,
+        List<String> diagnostics,
+        Supplier<List<RouteCandidate>> route
+    ) {
+        try {
+            var candidates = route.get();
+            if (candidates.isEmpty()) {
+                diagnostics.add("knowledge-route-empty:" + routeName);
+            }
+            return candidates;
+        } catch (RuntimeException exception) {
+            diagnostics.add("knowledge-route-failed:" + routeName);
+            return List.of();
+        }
+    }
+
+    private List<QueryVariant> applicableKnowledgeVariants(
+        KnowledgeQuery query,
+        QueryRewriteResult rewriteResult,
+        List<String> diagnostics
+    ) {
+        if (rewriteResult == null || rewriteResult.variants().isEmpty()) {
+            diagnostics.add("knowledge-query-variants-fallback:original-query");
+            return List.of(syntheticVariant(query));
+        }
+
+        var variants = new ArrayList<QueryVariant>();
+        for (var variant : rewriteResult.variants()) {
+            if (variant == null || variant.targetCorpus() == QueryTargetCorpus.MEMORY || variant.targetCorpus() == QueryTargetCorpus.GRAPH) {
+                continue;
+            }
+            if (filtersConflict(query, variant.filters())) {
+                diagnostics.add("knowledge-query-variant-skipped:filter-conflict");
+                continue;
+            }
+            variants.add(variant);
+        }
+        if (variants.isEmpty()) {
+            diagnostics.add("knowledge-query-variants-fallback:original-query");
+            variants.add(syntheticVariant(query));
+        }
+        return List.copyOf(variants);
+    }
+
+    private QueryVariant syntheticVariant(KnowledgeQuery query) {
+        return new QueryVariant(
+            "qv-knowledge-original",
+            query.rawQuery(),
+            QueryIntent.RAW_TASK,
+            QueryTargetCorpus.KNOWLEDGE,
+            query.applicableStage() == null ? "default" : query.applicableStage(),
+            new QueryFilters(
+                query.systemName(),
+                query.moduleName(),
+                query.apiPath(),
+                query.httpMethod(),
+                query.bizEntity(),
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                query.tags(),
+                query.documentType() == null ? List.of() : List.of(query.documentType()),
+                List.of()
+            ),
+            100,
+            "Original query used because no knowledge query variant was supplied."
+        );
+    }
+
+    private boolean filtersConflict(KnowledgeQuery query, QueryFilters filters) {
+        if (filters == null) {
+            return false;
+        }
+        return conflicts(query.systemName(), filters.systemName())
+            || conflicts(query.moduleName(), filters.moduleName())
+            || conflicts(query.apiPath(), filters.apiPath())
+            || conflicts(query.httpMethod(), normalizeUpper(filters.httpMethod()))
+            || conflicts(query.bizEntity(), filters.businessEntity())
+            || (query.documentType() != null
+                && !filters.documentTypes().isEmpty()
+                && !filters.documentTypes().contains(query.documentType()));
+    }
+
+    private boolean conflicts(String left, String right) {
+        return left != null && right != null && !left.equals(right);
+    }
+
+    private boolean hasText(String value) {
+        return value != null && !value.isBlank();
+    }
+
+    private List<QueryVariant> originalVariants(KnowledgeQuery query, List<QueryVariant> variants) {
+        var originals = variants.stream()
+            .filter(variant -> variant.intent() == QueryIntent.RAW_TASK)
+            .toList();
+        return originals.isEmpty() ? List.of(syntheticVariant(query)) : originals;
+    }
+
+    private List<QueryVariant> routeVariants(KnowledgeQuery query, List<QueryVariant> variants) {
+        return variants.isEmpty() ? List.of(syntheticVariant(query)) : variants;
+    }
+
+    private List<QueryVariant> rewrittenVariants(List<QueryVariant> variants) {
+        return variants.stream()
+            .filter(variant -> variant.intent() != QueryIntent.RAW_TASK)
+            .filter(variant -> hasText(variant.queryText()))
+            .toList();
+    }
+
+    private List<RouteCandidate> semanticRoute(
+        String routeName,
+        KnowledgeQuery baseQuery,
+        List<QueryVariant> variants,
+        int routeLimit
+    ) {
+        if (variants.isEmpty()) {
+            return List.of();
+        }
+        var scored = new ArrayList<ScoredRouteHit>();
+        for (var variant : variants) {
+            for (var documentType : semanticDocumentTypes(baseQuery, variant)) {
+                var routeQuery = routeQuery(baseQuery, variant, documentType, variant.queryText());
+                var queryEmbedding = embeddingService.embedQuery(routeQuery.query().rawQuery());
+                validateEmbedding(queryEmbedding);
+                var candidates = chunks.findPgvectorCandidates(
+                    routeQuery.query().systemName(),
+                    routeQuery.query().moduleName(),
+                    routeQuery.query().bizEntity(),
+                    routeQuery.query().documentType(),
+                    routeQuery.query().apiPath(),
+                    routeQuery.query().httpMethod(),
+                    routeQuery.query().applicableStage(),
+                    routeQuery.query().tags(),
+                    queryEmbedding,
+                    Math.max(routeLimit * 4, 8)
+                );
+                if (candidates == null || candidates.isEmpty()) {
+                    continue;
+                }
+                var documentsById = loadDocuments(candidates);
+                var routeHits = candidates.stream()
+                    .map(candidate -> toHit(candidate, documentsById.get(candidate.chunk().getDocumentId())))
+                    .filter(Objects::nonNull)
+                    .toList();
+                var ranked = rankCandidates(routeHits, routeQuery.query(), queryEmbedding);
+                for (var hit : ranked) {
+                    var score = semanticRouteScore(hit);
+                    scored.add(new ScoredRouteHit(
+                        hit,
+                        variant,
+                        score,
+                        routeName + " matched query variant " + variant.deterministicId(),
+                        hit.matchReasons(),
+                        Map.of("semantic", score)
+                    ));
+                }
+            }
+        }
+        return topRouteCandidates(routeName, scored, routeLimit);
+    }
+
+    private List<DocumentType> semanticDocumentTypes(KnowledgeQuery baseQuery, QueryVariant variant) {
+        if (baseQuery.documentType() != null) {
+            return List.of(baseQuery.documentType());
+        }
+        if (variant.filters() != null && !variant.filters().documentTypes().isEmpty()) {
+            return variant.filters().documentTypes();
+        }
+        return Collections.singletonList(null);
+    }
+
+    private double semanticRouteScore(KnowledgeRetrievalHit hit) {
+        var distance = hit.metadata().get("vectorDistance");
+        if (distance instanceof Number number) {
+            return Math.max(0.0d, 1.0d - number.doubleValue());
+        }
+        return Math.max(0.0d, hit.score());
+    }
+
+    private List<RouteCandidate> metadataRoute(
+        KnowledgeQuery baseQuery,
+        List<QueryVariant> variants,
+        int routeLimit
+    ) {
+        var scored = new ArrayList<ScoredRouteHit>();
+        for (var variant : variants) {
+            for (var documentType : exactDocumentTypes(baseQuery, variant)) {
+                var routeQuery = routeQuery(baseQuery, variant, documentType, variant.queryText());
+                for (var hit : activeRouteHits(routeQuery, "metadata-exact")) {
+                    var evidence = metadataEvidence(hit, routeQuery.query());
+                    if (evidence.score() > 0.0d) {
+                        scored.add(new ScoredRouteHit(
+                            hit,
+                            variant,
+                            evidence.score(),
+                            "metadata exact matched " + String.join(",", evidence.reasons()),
+                            evidence.reasons(),
+                            Map.of("metadata", evidence.score())
+                        ));
+                    }
+                }
+            }
+        }
+        return topRouteCandidates("metadata-exact", scored, routeLimit);
+    }
+
+    private List<RouteCandidate> lexicalRoute(
+        KnowledgeQuery baseQuery,
+        List<QueryVariant> variants,
+        int routeLimit
+    ) {
+        var scored = new ArrayList<ScoredRouteHit>();
+        for (var variant : variants) {
+            for (var documentType : exactDocumentTypes(baseQuery, variant)) {
+                var routeQuery = routeQuery(baseQuery, variant, documentType, variant.queryText());
+                for (var hit : activeRouteHits(routeQuery, "lexical-tag")) {
+                    var evidence = lexicalEvidence(hit, routeQuery);
+                    if (evidence.score() > 0.0d) {
+                        scored.add(new ScoredRouteHit(
+                            hit,
+                            variant,
+                            evidence.score(),
+                            "lexical and tag matched " + String.join(",", evidence.reasons()),
+                            evidence.reasons(),
+                            Map.of("lexical", evidence.score())
+                        ));
+                    }
+                }
+            }
+        }
+        return topRouteCandidates("lexical-tag", scored, routeLimit);
+    }
+
+    private List<RouteCandidate> documentTypeRoute(
+        KnowledgeQuery baseQuery,
+        List<QueryVariant> variants,
+        int routeLimit
+    ) {
+        var scored = new ArrayList<ScoredRouteHit>();
+        for (var variant : variants) {
+            var preferredTypes = documentTypesForStage(baseQuery, variant);
+            for (var index = 0; index < preferredTypes.size(); index++) {
+                var documentType = preferredTypes.get(index);
+                var routeQuery = routeQuery(baseQuery, variant, documentType, variant.queryText());
+                for (var hit : activeRouteHits(routeQuery, "document-type")) {
+                    var stageFit = stageFitScore(hit, routeQuery.query());
+                    var keyword = keywordEvidence(hit, routeQuery.query()).score();
+                    var score = Math.max(0.05d, 1.0d - (index * 0.08d)) + (stageFit * 0.10d) + (keyword * 0.05d);
+                    var reasons = new ArrayList<String>();
+                    reasons.add("document-type");
+                    addReasonWhen(reasons, stageFit >= 1.0d, "stage-fit");
+                    scored.add(new ScoredRouteHit(
+                        hit,
+                        variant,
+                        Math.min(1.0d, score),
+                        "document type preference matched " + documentType.name(),
+                        reasons,
+                        Map.of("stageFit", stageFit)
+                    ));
+                }
+            }
+        }
+        return topRouteCandidates("document-type", scored, routeLimit);
+    }
+
+    private List<DocumentType> exactDocumentTypes(KnowledgeQuery baseQuery, QueryVariant variant) {
+        if (baseQuery.documentType() != null) {
+            return List.of(baseQuery.documentType());
+        }
+        if (variant.filters() != null && !variant.filters().documentTypes().isEmpty()) {
+            return variant.filters().documentTypes();
+        }
+        return Collections.singletonList(null);
+    }
+
+    private List<DocumentType> documentTypesForStage(KnowledgeQuery baseQuery, QueryVariant variant) {
+        if (baseQuery.documentType() != null) {
+            return List.of(baseQuery.documentType());
+        }
+        if (variant.filters() != null && !variant.filters().documentTypes().isEmpty()) {
+            return variant.filters().documentTypes();
+        }
+        var stage = firstNonBlank(baseQuery.applicableStage(), variant.stageProfile());
+        if (stage == null) {
+            return List.of(DocumentType.API_NOTE, DocumentType.BUSINESS_FLOW, DocumentType.TEST_SPEC, DocumentType.DOMAIN_RULE);
+        }
+        return switch (stage) {
+            case "api_analysis" -> List.of(DocumentType.API_NOTE, DocumentType.BUSINESS_FLOW, DocumentType.DOMAIN_RULE);
+            case "case_generation" -> List.of(DocumentType.TEST_SPEC, DocumentType.BUSINESS_FLOW, DocumentType.DOMAIN_RULE);
+            case "failure_analysis" -> List.of(DocumentType.ERROR_CODE_GUIDE, DocumentType.INCIDENT_POSTMORTEM, DocumentType.ENV_GUIDE);
+            case "suite_generation", "suite_recovery" -> List.of(DocumentType.BUSINESS_FLOW, DocumentType.TEST_SPEC, DocumentType.DOMAIN_RULE);
+            default -> List.of(DocumentType.DOMAIN_RULE, DocumentType.API_NOTE, DocumentType.TEST_SPEC);
+        };
+    }
+
+    private RouteQuery routeQuery(
+        KnowledgeQuery baseQuery,
+        QueryVariant variant,
+        DocumentType documentType,
+        String queryText
+    ) {
+        var filters = variant.filters() == null ? emptyFilters() : variant.filters();
+        var tags = mergeTags(baseQuery.tags(), filters.tags());
+        var query = new KnowledgeQuery(
+            firstNonBlank(queryText, baseQuery.rawQuery()),
+            firstNonBlank(filters.systemName(), baseQuery.systemName()),
+            firstNonBlank(filters.moduleName(), baseQuery.moduleName()),
+            firstNonBlank(filters.apiPath(), baseQuery.apiPath()),
+            normalizeUpper(firstNonBlank(filters.httpMethod(), baseQuery.httpMethod())),
+            firstNonBlank(filters.businessEntity(), baseQuery.bizEntity()),
+            documentType,
+            firstNonBlank(baseQuery.applicableStage(), variant.stageProfile()),
+            tags,
+            baseQuery.limit(),
+            baseQuery.tokenBudget()
+        );
+        return new RouteQuery(variant, query, filters);
+    }
+
+    private QueryFilters emptyFilters() {
+        return new QueryFilters(null, null, null, null, null, null, null, null, null, null, null, List.of(), List.of(), List.of());
+    }
+
+    private List<String> mergeTags(List<String> left, List<String> right) {
+        var tags = new LinkedHashSet<String>();
+        tags.addAll(left == null ? List.of() : left);
+        tags.addAll(right == null ? List.of() : right);
+        return normalizeTags(List.copyOf(tags));
+    }
+
+    private List<KnowledgeRetrievalHit> activeRouteHits(RouteQuery routeQuery, String channel) {
+        var query = routeQuery.query();
+        var routeChunks = chunks.findActiveLatestChunks(
+            query.systemName(),
+            query.moduleName(),
+            query.bizEntity(),
+            query.documentType()
+        );
+        if (routeChunks == null || routeChunks.isEmpty()) {
+            return List.of();
+        }
+        var documentsById = loadDocumentsForChunks(routeChunks);
+        return routeChunks.stream()
+            .filter(chunk -> matchesApiPath(chunk, query.apiPath()))
+            .filter(chunk -> matchesHttpMethod(chunk, query.httpMethod()))
+            .filter(chunk -> query.applicableStage() == null || chunk.getApplicableStages().contains(query.applicableStage()))
+            .filter(chunk -> query.tags().isEmpty() || chunk.getTags().containsAll(query.tags()))
+            .map(chunk -> toRouteHit(chunk, documentsById.get(chunk.getDocumentId()), channel))
+            .filter(Objects::nonNull)
+            .toList();
+    }
+
+    private Map<String, KnowledgeDocument> loadDocumentsForChunks(List<KnowledgeChunk> routeChunks) {
+        var documentIds = routeChunks.stream()
+            .map(KnowledgeChunk::getDocumentId)
+            .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+        var documentsById = new LinkedHashMap<String, KnowledgeDocument>();
+        for (var document : documents.findAllById(documentIds)) {
+            documentsById.put(document.getDocumentId(), document);
+        }
+        return documentsById;
+    }
+
+    private KnowledgeRetrievalHit toRouteHit(KnowledgeChunk chunk, KnowledgeDocument document, String channel) {
+        if (document == null) {
+            return null;
+        }
+        var metadata = new LinkedHashMap<>(
+            EmbeddingProfileMetadata.withReindexStatus(chunk.getMetadata(), embeddingService.profile())
+        );
+        metadata.put("retrievalChannel", channel);
+        return new KnowledgeRetrievalHit(
+            chunk.getChunkId(),
+            chunk.getDocumentId(),
+            chunk.getDocumentRevisionId(),
+            chunk.getChunkTitle(),
+            chunk.getChunkContent(),
+            document.getSourceRef(),
+            document.getDocType(),
+            document.getAuthority(),
+            document.getSystemName(),
+            document.getModuleName(),
+            document.getBizEntity(),
+            List.copyOf(chunk.getTags()),
+            List.copyOf(chunk.getApplicableStages()),
+            metadata,
+            chunk.getTokenCount(),
+            0.0d,
+            Map.of(),
+            List.of(),
+            true
+        );
+    }
+
+    private RouteScoring metadataEvidence(KnowledgeRetrievalHit hit, KnowledgeQuery query) {
+        var reasons = new ArrayList<String>();
+        var possible = 0;
+        var matched = 0;
+        possible += addExactReason(reasons, query.systemName(), hit.systemName(), "system");
+        matched = reasons.size();
+        var beforeModule = reasons.size();
+        possible += addExactReason(reasons, query.moduleName(), hit.moduleName(), "module");
+        matched += reasons.size() - beforeModule;
+        var beforeEntity = reasons.size();
+        possible += addExactReason(reasons, query.bizEntity(), hit.bizEntity(), "business-entity");
+        matched += reasons.size() - beforeEntity;
+        if (query.documentType() != null) {
+            possible++;
+            if (query.documentType() == hit.documentType()) {
+                matched++;
+                reasons.add("document-type");
+            }
+        }
+        if (query.apiPath() != null) {
+            possible++;
+            if (metadataList(hit.metadata(), "apiPathHints").contains(query.apiPath())) {
+                matched++;
+                reasons.add("api-path");
+            }
+        }
+        if (query.httpMethod() != null) {
+            possible++;
+            if (matchesHttpMethodHint(hit, query)) {
+                matched++;
+                reasons.add("http-method");
+            }
+        }
+        if (query.applicableStage() != null) {
+            possible++;
+            if (hit.applicableStages().contains(query.applicableStage())) {
+                matched++;
+                reasons.add("applicable-stage");
+            }
+        }
+        return new RouteScoring(possible == 0 ? 0.0d : matched / (double) possible, List.copyOf(reasons));
+    }
+
+    private int addExactReason(List<String> reasons, String expected, String actual, String reason) {
+        if (expected == null) {
+            return 0;
+        }
+        if (expected.equals(actual)) {
+            reasons.add(reason);
+        }
+        return 1;
+    }
+
+    private RouteScoring lexicalEvidence(KnowledgeRetrievalHit hit, RouteQuery routeQuery) {
+        var query = routeQuery.query();
+        var filters = routeQuery.filters();
+        var reasons = new LinkedHashSet<String>();
+        double score = 0.0d;
+        double possible = 0.0d;
+
+        var keyword = keywordEvidence(hit, query);
+        possible += 1.0d;
+        score += keyword.score();
+        reasons.addAll(keyword.reasons());
+
+        if (filters.errorCode() != null) {
+            possible += 1.0d;
+            if (metadataList(hit.metadata(), "errorCodeHints").contains(filters.errorCode())) {
+                score += 1.0d;
+                reasons.add("error-code");
+            }
+        }
+
+        var queryTerms = normalizedTerms(joinNonBlank(query.rawQuery(), filters.errorCode(), String.join(" ", query.tags())));
+        var frontmatterTerms = new ArrayList<String>();
+        frontmatterTerms.addAll(normalizedTerms(String.join(" ", metadataList(hit.metadata(), "frontmatterKeys"))));
+        frontmatterTerms.addAll(normalizedTerms(String.join(" ", metadataList(hit.metadata(), "keywordTags"))));
+        frontmatterTerms.addAll(normalizedTerms(String.join(" ", metadataList(hit.metadata(), "headerPath"))));
+        possible += 1.0d;
+        var frontmatterMatch = overlapRatio(queryTerms, frontmatterTerms);
+        if (frontmatterMatch > 0.0d) {
+            score += frontmatterMatch;
+            reasons.add("frontmatter");
+        }
+
+        possible += 1.0d;
+        var tagMatch = overlapRatio(queryTerms, lowercased(hit.tags()));
+        if (!query.tags().isEmpty() && hit.tags().containsAll(query.tags())) {
+            tagMatch = Math.max(tagMatch, 1.0d);
+        }
+        if (tagMatch > 0.0d) {
+            score += tagMatch;
+            reasons.add("tag");
+        }
+
+        return new RouteScoring(possible == 0.0d ? 0.0d : score / possible, List.copyOf(reasons));
+    }
+
+    private List<RouteCandidate> topRouteCandidates(
+        String routeName,
+        List<ScoredRouteHit> scored,
+        int routeLimit
+    ) {
+        var sorted = scored.stream()
+            .sorted(Comparator
+                .comparingDouble(ScoredRouteHit::score).reversed()
+                .thenComparing(hit -> hit.hit().chunkTitle(), Comparator.nullsLast(String::compareTo))
+                .thenComparing(hit -> hit.hit().chunkId()))
+            .limit(routeLimit)
+            .toList();
+        var candidates = new ArrayList<RouteCandidate>();
+        for (var index = 0; index < sorted.size(); index++) {
+            var scoredHit = sorted.get(index);
+            var evidence = new KnowledgeRouteEvidence(
+                routeName,
+                scoredHit.variant().deterministicId(),
+                index + 1,
+                scoredHit.score(),
+                scoredHit.matchReason()
+            );
+            var hit = withRouteEvidence(
+                scoredHit.hit(),
+                evidence,
+                scoredHit.score(),
+                scoredHit.componentScores(),
+                scoredHit.reasons()
+            );
+            candidates.add(new RouteCandidate(hit, evidence));
+        }
+        return List.copyOf(candidates);
+    }
+
+    private KnowledgeRetrievalHit withRouteEvidence(
+        KnowledgeRetrievalHit hit,
+        KnowledgeRouteEvidence evidence,
+        double score,
+        Map<String, Double> componentScores,
+        List<String> reasons
+    ) {
+        return new KnowledgeRetrievalHit(
+            hit.chunkId(),
+            hit.documentId(),
+            hit.documentRevisionId(),
+            hit.chunkTitle(),
+            hit.chunkContent(),
+            hit.sourceRef(),
+            hit.documentType(),
+            hit.authority(),
+            hit.systemName(),
+            hit.moduleName(),
+            hit.bizEntity(),
+            hit.tags(),
+            hit.applicableStages(),
+            hit.metadata(),
+            hit.tokenCount(),
+            score,
+            componentScores,
+            reasons,
+            score < 0.30d,
+            List.of(evidence)
+        );
+    }
+
+    private List<KnowledgeRetrievalHit> mergeRouteCandidates(List<RouteCandidate> routeCandidates) {
+        var mergedByChunk = new LinkedHashMap<String, MergedRouteHit>();
+        for (var candidate : routeCandidates) {
+            mergedByChunk.computeIfAbsent(candidate.hit().chunkId(), ignored -> new MergedRouteHit(candidate.hit()))
+                .add(candidate);
+        }
+        return mergedByChunk.values().stream()
+            .map(MergedRouteHit::toHit)
+            .sorted(Comparator
+                .comparingDouble(KnowledgeRetrievalHit::score).reversed()
+                .thenComparing((KnowledgeRetrievalHit hit) -> hit.routeEvidence().size(), Comparator.reverseOrder())
+                .thenComparing(KnowledgeRetrievalHit::chunkTitle, Comparator.nullsLast(String::compareTo))
+                .thenComparing(KnowledgeRetrievalHit::chunkId))
+            .toList();
+    }
+
+    private boolean matchesApiPath(KnowledgeChunk chunk, String apiPath) {
+        return apiPath == null || metadataList(chunk, "apiPathHints").contains(apiPath);
+    }
+
+    private boolean matchesHttpMethod(KnowledgeChunk chunk, String httpMethod) {
+        if (httpMethod == null) {
+            return true;
+        }
+        return metadataList(chunk, "httpMethodHints").stream()
+            .map(value -> value.toUpperCase(Locale.ROOT))
+            .anyMatch(httpMethod::equals);
     }
 
     private Map<String, KnowledgeDocument> loadDocuments(List<KnowledgeVectorCandidate> candidates) {
@@ -266,7 +939,8 @@ public class KnowledgeRetrievalApplicationService {
             finalScore,
             weightedScores,
             reasons,
-            !profileCompatible || finalScore < 0.30d || (keyword.score() < 0.20d && vector < 0.45d)
+            !profileCompatible || finalScore < 0.30d || (keyword.score() < 0.20d && vector < 0.45d),
+            hit.routeEvidence()
         );
     }
 
@@ -639,9 +1313,126 @@ public class KnowledgeRetrievalApplicationService {
         return value == null ? "" : value.trim().replaceAll("\\s+", " ").toLowerCase(Locale.ROOT);
     }
 
+    private String joinNonBlank(String... parts) {
+        var values = new ArrayList<String>();
+        for (var part : parts) {
+            if (part != null && !part.isBlank()) {
+                values.add(part.trim());
+            }
+        }
+        return String.join(" ", values);
+    }
+
     private void addReasonWhen(List<String> reasons, boolean condition, String reason) {
         if (condition && !reasons.contains(reason)) {
             reasons.add(reason);
+        }
+    }
+
+    private Map<String, Object> routeEvidenceMetadata(KnowledgeRouteEvidence evidence) {
+        var metadata = new LinkedHashMap<String, Object>();
+        metadata.put("routeName", evidence.routeName());
+        metadata.put("queryVariantId", evidence.queryVariantId());
+        metadata.put("routeRank", evidence.routeRank());
+        metadata.put("routeScore", evidence.routeScore());
+        metadata.put("matchReason", evidence.matchReason());
+        return metadata;
+    }
+
+    private record RouteQuery(QueryVariant variant, KnowledgeQuery query, QueryFilters filters) {
+    }
+
+    private record RouteScoring(double score, List<String> reasons) {
+        private RouteScoring {
+            reasons = reasons == null ? List.of() : List.copyOf(reasons);
+        }
+    }
+
+    private record ScoredRouteHit(
+        KnowledgeRetrievalHit hit,
+        QueryVariant variant,
+        double score,
+        String matchReason,
+        List<String> reasons,
+        Map<String, Double> componentScores
+    ) {
+        private ScoredRouteHit {
+            reasons = reasons == null ? List.of() : List.copyOf(reasons);
+            componentScores = componentScores == null ? Map.of() : Map.copyOf(componentScores);
+        }
+    }
+
+    private record RouteCandidate(KnowledgeRetrievalHit hit, KnowledgeRouteEvidence evidence) {
+    }
+
+    private final class MergedRouteHit {
+        private KnowledgeRetrievalHit baseHit;
+        private double score;
+        private final List<KnowledgeRouteEvidence> evidence = new ArrayList<>();
+        private final LinkedHashMap<String, Double> componentScores = new LinkedHashMap<>();
+        private final LinkedHashSet<String> matchReasons = new LinkedHashSet<>();
+
+        private MergedRouteHit(KnowledgeRetrievalHit baseHit) {
+            this.baseHit = baseHit;
+        }
+
+        private MergedRouteHit add(RouteCandidate candidate) {
+            var hit = candidate.hit();
+            if (hit.score() >= score) {
+                baseHit = hit;
+                score = hit.score();
+            }
+            evidence.add(candidate.evidence());
+            matchReasons.addAll(hit.matchReasons());
+            mergeScores(hit.componentScores());
+            return this;
+        }
+
+        private void mergeScores(Map<String, Double> scores) {
+            if (scores == null) {
+                return;
+            }
+            for (var entry : scores.entrySet()) {
+                componentScores.merge(entry.getKey(), entry.getValue(), Math::max);
+            }
+        }
+
+        private KnowledgeRetrievalHit toHit() {
+            var metadata = new LinkedHashMap<>(baseHit.metadata());
+            metadata.put("routeEvidence", evidence.stream()
+                .map(KnowledgeRetrievalApplicationService.this::routeEvidenceMetadata)
+                .toList());
+            metadata.put("routeNames", evidence.stream()
+                .map(KnowledgeRouteEvidence::routeName)
+                .distinct()
+                .toList());
+            metadata.put("queryVariantIds", evidence.stream()
+                .map(KnowledgeRouteEvidence::queryVariantId)
+                .distinct()
+                .toList());
+
+            return new KnowledgeRetrievalHit(
+                baseHit.chunkId(),
+                baseHit.documentId(),
+                baseHit.documentRevisionId(),
+                baseHit.chunkTitle(),
+                baseHit.chunkContent(),
+                baseHit.sourceRef(),
+                baseHit.documentType(),
+                baseHit.authority(),
+                baseHit.systemName(),
+                baseHit.moduleName(),
+                baseHit.bizEntity(),
+                baseHit.tags(),
+                baseHit.applicableStages(),
+                metadata,
+                baseHit.tokenCount(),
+                score,
+                componentScores,
+                List.copyOf(matchReasons),
+                score < 0.30d && evidence.size() <= 1,
+                evidence
+            );
         }
     }
 
