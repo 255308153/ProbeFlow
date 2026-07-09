@@ -3,6 +3,7 @@ package com.probeflow.testagent.memory;
 import com.probeflow.testagent.apispec.ApiSpec;
 import com.probeflow.testagent.apispec.ApiSpecRepository;
 import com.probeflow.testagent.knowledge.DocumentAuthority;
+import com.probeflow.testagent.knowledge.DocumentType;
 import com.probeflow.testagent.knowledge.EmbeddingProfileMetadata;
 import com.probeflow.testagent.knowledge.KnowledgeContext;
 import com.probeflow.testagent.knowledge.KnowledgeContextEntry;
@@ -13,6 +14,19 @@ import com.probeflow.testagent.knowledge.KnowledgeRetrievalHit;
 import com.probeflow.testagent.knowledge.KnowledgeRetrievalResult;
 import com.probeflow.testagent.retrieval.RetrievalRouteDiagnostic;
 import com.probeflow.testagent.retrieval.RetrievalRouteEvidence;
+import com.probeflow.testagent.rerank.KnowledgeExpansionContext;
+import com.probeflow.testagent.rerank.KnowledgeExpansionPruning;
+import com.probeflow.testagent.rerank.KnowledgeExpansionSource;
+import com.probeflow.testagent.rerank.MemoryConflictAuditEvidence;
+import com.probeflow.testagent.rerank.MemoryEvidenceExpansionItem;
+import com.probeflow.testagent.rerank.MemoryEvidenceRole;
+import com.probeflow.testagent.rerank.MemoryGraphRelationExpansion;
+import com.probeflow.testagent.rerank.RerankCandidate;
+import com.probeflow.testagent.rerank.RerankCorpusType;
+import com.probeflow.testagent.rerank.RerankFeatureDiagnostic;
+import com.probeflow.testagent.rerank.RerankFeatureLedger;
+import com.probeflow.testagent.rerank.RerankOutputItem;
+import com.probeflow.testagent.rerank.RerankRouteEvidence;
 import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskRepository;
 import java.util.ArrayList;
@@ -69,10 +83,25 @@ public class UnifiedContextBuilder {
         var taskState = toTaskState(task);
         var sessionContext = loadSessionContext(normalized.sessionId());
         var taskMemory = loadTaskMemory(normalized.taskId(), normalized.stageProfile());
-        var knowledge = loadKnowledge(apiSpec, normalized);
-        var longTermMemory = loadLongTermMemory(apiSpec, normalized);
-        var pruned = pruneToBudget(normalized.tokenBudget(), apiContext, sessionContext, taskMemory, knowledge, longTermMemory);
-        var constraints = buildConstraints(apiSpec, normalized.stageProfile(), pruned.knowledge(), pruned.longTermMemory());
+        var requestedPostRerankContext = normalized.postRerankContext();
+        var postRerankContext = usePostRerankExpandedContext(normalized) ? requestedPostRerankContext : null;
+        var knowledge = postRerankContext == null
+            ? loadKnowledge(apiSpec, normalized)
+            : buildPostRerankKnowledge(postRerankContext);
+        var longTermMemory = postRerankContext == null
+            ? loadLongTermMemory(apiSpec, normalized)
+            : buildPostRerankLongTermMemory(postRerankContext);
+        var pruned = postRerankContext == null
+            ? pruneToBudget(normalized.tokenBudget(), apiContext, sessionContext, taskMemory, knowledge, longTermMemory)
+            : prunePostRerankToBudget(normalized.tokenBudget(), apiContext, sessionContext, taskMemory, knowledge, longTermMemory);
+        var constraints = buildConstraints(
+            apiSpec,
+            normalized.stageProfile(),
+            pruned.knowledge(),
+            pruned.longTermMemory(),
+            postRerankContext,
+            requestedPostRerankContext
+        );
         var citations = buildCitations(
             pruned.sessionContext(),
             pruned.taskMemory(),
@@ -80,7 +109,7 @@ public class UnifiedContextBuilder {
             pruned.longTermMemory()
         );
         memoryUsageRecording.recordLongTermMemoryUsage(normalized, pruned.longTermMemory(), citations);
-        var conflicts = detectConflicts(knowledge, taskMemory, longTermMemory, normalized);
+        var conflicts = detectConflicts(pruned.knowledge(), pruned.taskMemory(), pruned.longTermMemory(), normalized);
         var budget = buildBudget(
             normalized.tokenBudget(),
             apiContext,
@@ -239,17 +268,252 @@ public class UnifiedContextBuilder {
         ));
     }
 
+    private boolean usePostRerankExpandedContext(UnifiedContextQuery query) {
+        var postRerankContext = query.postRerankContext();
+        return postRerankContext != null
+            && postRerankContext.hasRerankOutput()
+            && postRerankContext.hasExpandedMaterial();
+    }
+
+    private KnowledgeRetrievalResult buildPostRerankKnowledge(PostRerankExpandedContext postRerankContext) {
+        var rerankItems = rerankItemsByCandidateId(postRerankContext, RerankCorpusType.KNOWLEDGE);
+        var contexts = postRerankContext.knowledgeExpansion().contexts().stream()
+            .filter(context -> rerankItems.containsKey(context.anchorChunkId()))
+            .sorted(Comparator
+                .comparingInt((KnowledgeExpansionContext context) -> rerankItems.get(context.anchorChunkId()).afterRank())
+                .thenComparing(KnowledgeExpansionContext::anchorChunkId))
+            .toList();
+
+        var hits = new ArrayList<KnowledgeRetrievalHit>();
+        var seenParents = new LinkedHashSet<String>();
+        for (var context : contexts) {
+            if (!seenParents.add(context.parentIdentity())) {
+                continue;
+            }
+            hits.add(postRerankKnowledgeHit(context, rerankItems.get(context.anchorChunkId())));
+        }
+        return new KnowledgeRetrievalResult(
+            "post-rerank-expanded",
+            List.copyOf(hits),
+            buildPostRerankKnowledgeContext(hits),
+            hits.isEmpty() ? 0.0d : 1.0d,
+            contexts.size(),
+            hits.stream().mapToInt(KnowledgeRetrievalHit::tokenCount).sum(),
+            hits.stream().anyMatch(KnowledgeRetrievalHit::lowConfidence),
+            postRerankContext.diagnostics()
+        );
+    }
+
+    private KnowledgeRetrievalHit postRerankKnowledgeHit(KnowledgeExpansionContext context, RerankOutputItem rerankItem) {
+        var candidate = rerankItem.candidate();
+        var anchor = context.sources().stream()
+            .filter(source -> source.chunkId().equals(context.anchorChunkId()))
+            .findFirst()
+            .or(() -> context.sources().stream().findFirst())
+            .orElseThrow(() -> new IllegalArgumentException("knowledge expansion must include at least one source"));
+        var metadata = new LinkedHashMap<String, Object>(candidate.metadata());
+        metadata.putAll(postRerankEvidence(rerankItem));
+        metadata.putAll(knowledgeExpansionEvidence(context));
+        return new KnowledgeRetrievalHit(
+            context.anchorChunkId(),
+            anchor.documentId(),
+            anchor.documentRevisionId(),
+            anchor.title(),
+            expandedKnowledgeContent(context),
+            anchor.sourceRef(),
+            anchor.documentType(),
+            DocumentAuthority.HIGH,
+            stringMetadata(candidate.metadata(), "systemName"),
+            stringMetadata(candidate.metadata(), "moduleName"),
+            firstNonBlank(anchor.businessEntity(), stringMetadata(candidate.metadata(), "businessEntity")),
+            listMetadata(candidate.metadata(), "tags"),
+            listMetadata(candidate.metadata(), "applicableStages"),
+            metadata,
+            context.tokenCost(),
+            rerankItem.rerankScore(),
+            featureScores(candidate.featureLedger()),
+            postRerankMatchReasons(rerankItem),
+            candidate.featureLedger().lowConfidence(),
+            List.of()
+        );
+    }
+
+    private String expandedKnowledgeContent(KnowledgeExpansionContext context) {
+        return context.sources().stream()
+            .map(source -> joinNonBlank(source.title(), source.content()))
+            .filter(StringUtils::hasText)
+            .distinct()
+            .toList()
+            .stream()
+            .collect(java.util.stream.Collectors.joining("\n\n"));
+    }
+
+    private KnowledgeContext buildPostRerankKnowledgeContext(List<KnowledgeRetrievalHit> hits) {
+        if (hits.isEmpty()) {
+            return KnowledgeContext.empty(true, true);
+        }
+        var businessRules = new ArrayList<KnowledgeContextEntry>();
+        var apiNotes = new ArrayList<KnowledgeContextEntry>();
+        var testSpecs = new ArrayList<KnowledgeContextEntry>();
+        var errorCodeGuides = new ArrayList<KnowledgeContextEntry>();
+        var environmentNotes = new ArrayList<KnowledgeContextEntry>();
+        var incidentHints = new ArrayList<KnowledgeContextEntry>();
+        var citedChunks = new ArrayList<KnowledgeContextEntry>();
+        for (var hit : hits) {
+            var entry = toKnowledgeContextEntry(hit);
+            citedChunks.add(entry);
+            switch (hit.documentType()) {
+                case BUSINESS_FLOW, DOMAIN_RULE -> businessRules.add(entry);
+                case API_NOTE -> apiNotes.add(entry);
+                case TEST_SPEC -> testSpecs.add(entry);
+                case ERROR_CODE_GUIDE -> errorCodeGuides.add(entry);
+                case ENV_GUIDE -> environmentNotes.add(entry);
+                case INCIDENT_POSTMORTEM -> incidentHints.add(entry);
+            }
+        }
+        return new KnowledgeContext(
+            List.copyOf(businessRules),
+            List.copyOf(apiNotes),
+            List.copyOf(testSpecs),
+            List.copyOf(errorCodeGuides),
+            List.copyOf(environmentNotes),
+            List.copyOf(incidentHints),
+            List.copyOf(citedChunks),
+            hits.stream().anyMatch(KnowledgeRetrievalHit::lowConfidence),
+            false
+        );
+    }
+
+    private KnowledgeContextEntry toKnowledgeContextEntry(KnowledgeRetrievalHit hit) {
+        return new KnowledgeContextEntry(
+            hit.chunkId(),
+            hit.documentId(),
+            hit.documentRevisionId(),
+            hit.chunkTitle(),
+            hit.score(),
+            evidenceType(hit.documentType()),
+            hit.sourceRef(),
+            hit.metadata(),
+            hit.matchReasons(),
+            hit.lowConfidence()
+        );
+    }
+
+    private String evidenceType(DocumentType documentType) {
+        return switch (documentType) {
+            case BUSINESS_FLOW, DOMAIN_RULE -> "business-rule";
+            case API_NOTE -> "api-note";
+            case TEST_SPEC -> "test-spec";
+            case ERROR_CODE_GUIDE -> "error-code-guide";
+            case ENV_GUIDE -> "environment-note";
+            case INCIDENT_POSTMORTEM -> "incident-hint";
+        };
+    }
+
+    private LongTermMemoryRetrievalResult buildPostRerankLongTermMemory(PostRerankExpandedContext postRerankContext) {
+        var rerankItems = rerankItemsByCandidateId(postRerankContext, RerankCorpusType.MEMORY);
+        var items = postRerankContext.memoryExpansion().items().stream()
+            .filter(item -> rerankItems.containsKey(item.anchor().memoryAnchor()))
+            .sorted(Comparator
+                .comparingInt((MemoryEvidenceExpansionItem item) -> rerankItems.get(item.anchor().memoryAnchor()).afterRank())
+                .thenComparing(item -> item.anchor().memoryAnchor()))
+            .toList();
+        var hits = new ArrayList<LongTermMemoryRetrievalHit>();
+        var seenMemoryEvidence = new LinkedHashSet<String>();
+        for (var item : items) {
+            if (!seenMemoryEvidence.add(item.anchor().memoryAnchor())) {
+                continue;
+            }
+            hits.add(postRerankMemoryHit(item, rerankItems.get(item.anchor().memoryAnchor())));
+        }
+        return new LongTermMemoryRetrievalResult(
+            List.copyOf(hits),
+            items.size(),
+            hits.stream().mapToInt(LongTermMemoryRetrievalHit::tokenCount).sum(),
+            List.of()
+        );
+    }
+
+    private LongTermMemoryRetrievalHit postRerankMemoryHit(MemoryEvidenceExpansionItem item, RerankOutputItem rerankItem) {
+        var candidate = rerankItem.candidate();
+        var metadata = new LinkedHashMap<String, Object>(candidate.metadata());
+        metadata.putAll(postRerankEvidence(rerankItem));
+        metadata.putAll(memoryExpansionEvidence(item));
+        return new LongTermMemoryRetrievalHit(
+            item.anchor().memoryAnchor(),
+            memoryScopeType(candidate),
+            firstNonBlank(item.title(), candidate.title()),
+            memoryContent(item, candidate),
+            firstNonBlank(item.fullContent(), candidate.content()),
+            listMetadata(candidate.metadata(), "tags"),
+            memorySourceType(candidate),
+            memorySourceRef(item, candidate),
+            asFloat(candidate.featureLedger().memoryConfidence()),
+            asFloat(candidate.featureLedger().memoryImportance()),
+            asFloat(candidate.featureLedger().memorySuccessContribution()),
+            intMetadata(candidate.metadata(), "hitCount"),
+            null,
+            metadata,
+            item.estimatedTokens(),
+            rerankItem.rerankScore(),
+            featureScores(candidate.featureLedger()),
+            postRerankMatchReasons(rerankItem),
+            item.lowConfidence() || candidate.featureLedger().lowConfidence(),
+            memoryRouteEvidence(candidate.routeEvidence())
+        );
+    }
+
+    private String memoryContent(MemoryEvidenceExpansionItem item, RerankCandidate candidate) {
+        var evidence = item.evidenceSummaries().isEmpty()
+            ? candidate.content()
+            : String.join(" ", item.evidenceSummaries());
+        return firstNonBlank(evidence, item.fullContent());
+    }
+
+    private String memorySourceRef(MemoryEvidenceExpansionItem item, RerankCandidate candidate) {
+        if (!item.sourceRefs().isEmpty()) {
+            return item.sourceRefs().getFirst();
+        }
+        return candidate.sourceIdentity().sourceRef();
+    }
+
+    private LinkedHashMap<String, RerankOutputItem> rerankItemsByCandidateId(
+        PostRerankExpandedContext postRerankContext,
+        RerankCorpusType corpusType
+    ) {
+        var items = new LinkedHashMap<String, RerankOutputItem>();
+        for (var item : postRerankContext.rerankOutput().items()) {
+            if (item.candidate().corpusType() == corpusType) {
+                items.putIfAbsent(item.candidate().candidateIdentity().candidateId(), item);
+            }
+        }
+        return items;
+    }
+
     private Map<String, Object> buildConstraints(
         ApiSpec apiSpec,
         String stageProfile,
         KnowledgeRetrievalResult knowledge,
-        LongTermMemoryRetrievalResult longTermMemory
+        LongTermMemoryRetrievalResult longTermMemory,
+        PostRerankExpandedContext postRerankContext,
+        PostRerankExpandedContext requestedPostRerankContext
     ) {
         var constraints = new LinkedHashMap<String, Object>();
         constraints.put("apiConstraints", new LinkedHashMap<>(apiSpec.getConstraints()));
         constraints.put("apiAuth", new LinkedHashMap<>(apiSpec.getAuth()));
         constraints.put("stageProfile", stageProfile);
         var diagnostics = retrievalDiagnostics(knowledge, longTermMemory);
+        if (postRerankContext != null) {
+            var postRerankDiagnostics = postRerankDiagnostics(postRerankContext);
+            if (!postRerankDiagnostics.isEmpty()) {
+                diagnostics.put("postRerank", postRerankDiagnostics);
+            }
+        } else {
+            var postRerankDiagnostics = postRerankFallbackDiagnostics(requestedPostRerankContext);
+            if (!postRerankDiagnostics.isEmpty()) {
+                diagnostics.put("postRerank", postRerankDiagnostics);
+            }
+        }
         if (!diagnostics.isEmpty()) {
             constraints.put("retrievalDiagnostics", diagnostics);
         }
@@ -270,6 +534,39 @@ public class UnifiedContextBuilder {
                 .toList());
         }
         return diagnostics;
+    }
+
+    private List<String> postRerankDiagnostics(PostRerankExpandedContext context) {
+        var diagnostics = new ArrayList<String>(context.diagnostics());
+        if (context.knowledgeExpansion().pruned()) {
+            diagnostics.add("knowledge-expansion-pruned");
+        }
+        if (context.memoryExpansion().pruned()) {
+            diagnostics.add("memory-expansion-pruned");
+        }
+        diagnostics.addAll(context.memoryExpansion().pruningReasons());
+        return diagnostics.stream()
+            .filter(StringUtils::hasText)
+            .distinct()
+            .toList();
+    }
+
+    private List<String> postRerankFallbackDiagnostics(PostRerankExpandedContext context) {
+        if (context == null) {
+            return List.of();
+        }
+        var diagnostics = new ArrayList<String>(context.diagnostics());
+        diagnostics.add("post-rerank-expanded-context-fallback");
+        if (!context.hasRerankOutput()) {
+            diagnostics.add("post-rerank-output-missing");
+        }
+        if (!context.hasExpandedMaterial()) {
+            diagnostics.add("post-rerank-expansion-missing");
+        }
+        return diagnostics.stream()
+            .filter(StringUtils::hasText)
+            .distinct()
+            .toList();
     }
 
     private Map<String, Object> routeDiagnosticEvidence(RetrievalRouteDiagnostic diagnostic) {
@@ -346,6 +643,7 @@ public class UnifiedContextBuilder {
             evidence.put("metadata", metadata);
             copySemanticEvidence(evidence, metadata);
             copyFusionEvidence(evidence, metadata);
+            copyPostRerankEvidence(evidence, metadata);
         }
         var matchReasons = entry.matchReasons() == null ? List.<String>of() : List.copyOf(entry.matchReasons());
         if (!matchReasons.isEmpty()) {
@@ -373,6 +671,7 @@ public class UnifiedContextBuilder {
             evidence.put("metadata", metadata);
             copySemanticEvidence(evidence, metadata);
             copyFusionEvidence(evidence, metadata);
+            copyPostRerankEvidence(evidence, metadata);
         }
         if (hit.componentScores() != null && !hit.componentScores().isEmpty()) {
             evidence.put("componentScores", new LinkedHashMap<>(hit.componentScores()));
@@ -424,6 +723,268 @@ public class UnifiedContextBuilder {
         copyMetadataValue(evidence, metadata, "preFusionScore");
         copyMetadataValue(evidence, metadata, "fusedScore");
         copyMetadataValue(evidence, metadata, "fusionExplanation");
+    }
+
+    private void copyPostRerankEvidence(Map<String, Object> evidence, Map<String, Object> metadata) {
+        copyMetadataValue(evidence, metadata, "postRerank");
+        copyMetadataValue(evidence, metadata, "preRerankRank");
+        copyMetadataValue(evidence, metadata, "postRerankRank");
+        copyMetadataValue(evidence, metadata, "rerankScore");
+        copyMetadataValue(evidence, metadata, "scoreExplanation");
+        copyMetadataValue(evidence, metadata, "rerankReasons");
+        copyMetadataValue(evidence, metadata, "rerankPenalties");
+        copyMetadataValue(evidence, metadata, "featureDiagnostics");
+        copyMetadataValue(evidence, metadata, "conflictSignals");
+        copyMetadataValue(evidence, metadata, "smallToBigAnchor");
+        copyMetadataValue(evidence, metadata, "parentIdentity");
+        copyMetadataValue(evidence, metadata, "expansionReason");
+        copyMetadataValue(evidence, metadata, "expansionTokenCost");
+        copyMetadataValue(evidence, metadata, "expandedSources");
+        copyMetadataValue(evidence, metadata, "expandedSourceRefs");
+        copyMetadataValue(evidence, metadata, "expansionCitations");
+        copyMetadataValue(evidence, metadata, "expansionPruningReasons");
+        copyMetadataValue(evidence, metadata, "positiveRecommendationEligible");
+        copyMetadataValue(evidence, metadata, "lowConfidenceReason");
+        copyMetadataValue(evidence, metadata, "evidenceSummaries");
+        copyMetadataValue(evidence, metadata, "sourceRefs");
+        copyMetadataValue(evidence, metadata, "mergedSourceRefs");
+        copyMetadataValue(evidence, metadata, "evidenceCount");
+        copyMetadataValue(evidence, metadata, "identityHints");
+        copyMetadataValue(evidence, metadata, "graphRelation");
+        copyMetadataValue(evidence, metadata, "conflictAudit");
+    }
+
+    private Map<String, Object> postRerankEvidence(RerankOutputItem item) {
+        var evidence = new LinkedHashMap<String, Object>();
+        var routeEvidence = item.candidate().routeEvidence();
+        evidence.put("postRerank", true);
+        evidence.put("preRerankRank", item.beforeRank());
+        evidence.put("postRerankRank", item.afterRank());
+        evidence.put("rerankScore", item.rerankScore());
+        putIfPresent(evidence, "scoreExplanation", item.scoreExplanation());
+        evidence.put("rerankReasons", List.copyOf(item.reasons()));
+        evidence.put("rerankPenalties", List.copyOf(item.penalties()));
+        putIfPresent(evidence, "fusedScore", item.candidate().fusedScore());
+        if (!routeEvidence.queryVariants().isEmpty()) {
+            evidence.put("queryVariantIds", List.copyOf(routeEvidence.queryVariants()));
+        }
+        if (!routeEvidence.matchedRoutes().isEmpty()) {
+            evidence.put("routeEvidence", routeEvidence.matchedRoutes().stream()
+                .map(route -> {
+                    var routeMap = new LinkedHashMap<String, Object>();
+                    routeMap.put("routeName", route.routeName());
+                    routeMap.put("routeRank", route.rank());
+                    routeMap.put("routeScore", route.score());
+                    return Map.copyOf(routeMap);
+                })
+                .toList());
+            evidence.put("routeNames", routeEvidence.matchedRoutes().stream()
+                .map(route -> route.routeName())
+                .distinct()
+                .toList());
+        }
+        if (!routeEvidence.routeRanks().isEmpty()) {
+            evidence.put("routeRanks", routeEvidence.routeRanks());
+        }
+        if (!routeEvidence.routeScores().isEmpty()) {
+            evidence.put("routeScores", routeEvidence.routeScores());
+        }
+        var ledger = item.candidate().featureLedger();
+        if (!ledger.diagnostics().isEmpty()) {
+            evidence.put("featureDiagnostics", ledger.diagnostics().stream()
+                .map(this::featureDiagnosticEvidence)
+                .toList());
+        }
+        if (!ledger.conflictSignals().isEmpty()) {
+            evidence.put("conflictSignals", List.copyOf(ledger.conflictSignals()));
+        }
+        evidence.put("lowConfidence", ledger.lowConfidence());
+        return evidence;
+    }
+
+    private Map<String, Object> featureDiagnosticEvidence(RerankFeatureDiagnostic diagnostic) {
+        var evidence = new LinkedHashMap<String, Object>();
+        putIfPresent(evidence, "code", diagnostic.code());
+        putIfPresent(evidence, "feature", diagnostic.feature());
+        putIfPresent(evidence, "message", diagnostic.message());
+        return Map.copyOf(evidence);
+    }
+
+    private Map<String, Object> knowledgeExpansionEvidence(KnowledgeExpansionContext context) {
+        var evidence = new LinkedHashMap<String, Object>();
+        evidence.put("smallToBigAnchor", context.anchorChunkId());
+        evidence.put("parentIdentity", context.parentIdentity());
+        evidence.put("expansionReason", context.expansionReason().name());
+        evidence.put("sourceRevision", context.sourceRevision());
+        evidence.put("expansionTokenCost", context.tokenCost());
+        evidence.put("expandedSources", context.sources().stream()
+            .map(this::knowledgeExpansionSourceEvidence)
+            .toList());
+        evidence.put("expandedSourceRefs", context.sources().stream()
+            .map(KnowledgeExpansionSource::sourceRef)
+            .filter(StringUtils::hasText)
+            .distinct()
+            .toList());
+        if (!context.citations().isEmpty()) {
+            evidence.put("expansionCitations", context.citations().stream()
+                .map(citation -> {
+                    var citationEvidence = new LinkedHashMap<String, Object>();
+                    citationEvidence.put("sourceChunkId", citation.sourceChunkId());
+                    citationEvidence.put("sourceRevision", citation.sourceRevision());
+                    putIfPresent(citationEvidence, "sourceRef", citation.sourceRef());
+                    citationEvidence.put("role", citation.role().name());
+                    return Map.copyOf(citationEvidence);
+                })
+                .toList());
+        }
+        if (!context.pruningReasons().isEmpty()) {
+            evidence.put("expansionPruningReasons", context.pruningReasons().stream()
+                .map(this::knowledgeExpansionPruningEvidence)
+                .toList());
+        }
+        return evidence;
+    }
+
+    private Map<String, Object> knowledgeExpansionSourceEvidence(KnowledgeExpansionSource source) {
+        var evidence = new LinkedHashMap<String, Object>();
+        evidence.put("chunkId", source.chunkId());
+        evidence.put("documentId", source.documentId());
+        evidence.put("documentRevisionId", source.documentRevisionId());
+        evidence.put("documentType", source.documentType().name());
+        evidence.put("title", source.title());
+        evidence.put("sourceRef", source.sourceRef());
+        evidence.put("parentIdentity", source.parentIdentity());
+        putIfPresent(evidence, "heading", source.heading());
+        putIfPresent(evidence, "entryKey", source.entryKey());
+        putIfPresent(evidence, "businessEntity", source.businessEntity());
+        putIfPresent(evidence, "flowId", source.flowId());
+        evidence.put("tokenCost", source.tokenCost());
+        return Map.copyOf(evidence);
+    }
+
+    private Map<String, Object> knowledgeExpansionPruningEvidence(KnowledgeExpansionPruning pruning) {
+        return Map.of(
+            "sourceChunkId", pruning.sourceChunkId(),
+            "reason", pruning.reason().name()
+        );
+    }
+
+    private Map<String, Object> memoryExpansionEvidence(MemoryEvidenceExpansionItem item) {
+        var evidence = new LinkedHashMap<String, Object>();
+        evidence.put("smallToBigAnchor", item.anchor().memoryAnchor());
+        evidence.put("memoryAnchorType", item.anchor().anchorType().name());
+        evidence.put("factFingerprint", item.anchor().factFingerprint());
+        evidence.put("graphRelationPath", item.anchor().graphRelationPath());
+        evidence.put("expansionTokenCost", item.estimatedTokens());
+        evidence.put("evidenceSummaries", List.copyOf(item.evidenceSummaries()));
+        evidence.put("sourceRefs", List.copyOf(item.sourceRefs()));
+        evidence.put("mergedSourceRefs", List.copyOf(item.mergedSourceRefs()));
+        evidence.put("evidenceCount", item.evidenceCount());
+        evidence.put("identityHints", item.identityHints().asMap());
+        evidence.put("positiveRecommendationEligible", item.positiveRecommendationEligible());
+        evidence.put("lowConfidence", item.lowConfidence());
+        putIfPresent(evidence, "lowConfidenceReason", item.lowConfidenceReason());
+        if (item.graphRelation() != null) {
+            evidence.put("graphRelation", graphRelationEvidence(item.graphRelation()));
+        }
+        if (!item.conflictAudit().isEmpty()) {
+            evidence.put("conflictAudit", item.conflictAudit().stream()
+                .map(this::conflictAuditEvidence)
+                .toList());
+        }
+        if (!item.pruningReasons().isEmpty()) {
+            evidence.put("expansionPruningReasons", List.copyOf(item.pruningReasons()));
+        }
+        if (!item.citations().isEmpty()) {
+            evidence.put("expansionCitations", item.citations().stream()
+                .map(citation -> {
+                    var citationEvidence = new LinkedHashMap<String, Object>();
+                    citationEvidence.put("memoryAnchor", citation.memoryAnchor());
+                    citationEvidence.put("factFingerprint", citation.factFingerprint());
+                    citationEvidence.put("evidenceSource", citation.evidenceSource());
+                    citationEvidence.put("role", citation.role().name());
+                    return Map.copyOf(citationEvidence);
+                })
+                .toList());
+        }
+        return evidence;
+    }
+
+    private Map<String, Object> graphRelationEvidence(MemoryGraphRelationExpansion graphRelation) {
+        var evidence = new LinkedHashMap<String, Object>();
+        evidence.put("relationPath", graphRelation.relationPath());
+        putIfPresent(evidence, "relationConfidence", graphRelation.relationConfidence());
+        evidence.put("sourceMemoryIds", graphRelation.sourceMemoryIds());
+        evidence.put("sourceRefs", graphRelation.sourceRefs());
+        evidence.put("factFingerprints", graphRelation.factFingerprints());
+        putIfPresent(evidence, "graphEvidenceSummary", graphRelation.graphEvidenceSummary());
+        putIfPresent(evidence, "explanation", graphRelation.explanation());
+        return Map.copyOf(evidence);
+    }
+
+    private Map<String, Object> conflictAuditEvidence(MemoryConflictAuditEvidence audit) {
+        var evidence = new LinkedHashMap<String, Object>();
+        evidence.put("role", audit.role().name());
+        putIfPresent(evidence, "summary", audit.summary());
+        evidence.put("sourceRefs", audit.sourceRefs());
+        return Map.copyOf(evidence);
+    }
+
+    private List<String> postRerankMatchReasons(RerankOutputItem item) {
+        var reasons = new ArrayList<String>();
+        reasons.add("post-rerank-expanded");
+        reasons.addAll(item.reasons());
+        if (!item.penalties().isEmpty()) {
+            reasons.addAll(item.penalties().stream()
+                .map(penalty -> "penalty:" + penalty)
+                .toList());
+        }
+        return List.copyOf(reasons);
+    }
+
+    private Map<String, Double> featureScores(RerankFeatureLedger ledger) {
+        var scores = new LinkedHashMap<String, Double>();
+        putScore(scores, "semantic", ledger.semantic());
+        putScore(scores, "metadata", ledger.metadata());
+        putScore(scores, "lexical", ledger.lexical());
+        putScore(scores, "routeAgreement", ledger.routeAgreement());
+        putScore(scores, "exactEntity", ledger.exactEntity());
+        putScore(scores, "stageFit", ledger.stageFit());
+        putScore(scores, "authority", ledger.authority());
+        putScore(scores, "freshness", ledger.freshness());
+        putScore(scores, "memoryConfidence", ledger.memoryConfidence());
+        putScore(scores, "memoryImportance", ledger.memoryImportance());
+        putScore(scores, "memorySuccessContribution", ledger.memorySuccessContribution());
+        putScore(scores, "graphConfidence", ledger.graphConfidence());
+        if (ledger.graphPathLength() != null) {
+            scores.put("graphPathLength", ledger.graphPathLength().doubleValue());
+        }
+        scores.put("tokenCost", (double) ledger.tokenCost());
+        return Map.copyOf(scores);
+    }
+
+    private void putScore(Map<String, Double> scores, String name, Double value) {
+        if (value != null) {
+            scores.put(name, value);
+        }
+    }
+
+    private List<RetrievalRouteEvidence> memoryRouteEvidence(RerankRouteEvidence routeEvidence) {
+        if (routeEvidence == null || routeEvidence.matchedRoutes().isEmpty()) {
+            return List.of();
+        }
+        var queryVariantId = routeEvidence.queryVariants().isEmpty() ? null : routeEvidence.queryVariants().getFirst();
+        return routeEvidence.matchedRoutes().stream()
+            .map(route -> new RetrievalRouteEvidence(
+                route.routeName(),
+                queryVariantId,
+                null,
+                route.rank(),
+                route.score(),
+                "post-rerank matched route",
+                Map.of()
+            ))
+            .toList();
     }
 
     private void copyKnowledgeRouteEvidence(Map<String, Object> evidence, List<KnowledgeRouteEvidence> routeEvidence) {
@@ -656,6 +1217,116 @@ public class UnifiedContextBuilder {
             originalEstimatedTokens,
             originalEstimatedTokens > tokenBudget
         );
+    }
+
+    private PrunedContext prunePostRerankToBudget(
+        int tokenBudget,
+        ApiContextSnapshot apiContext,
+        List<SessionMemoryView> sessionContext,
+        List<TaskMemoryView> taskMemory,
+        KnowledgeRetrievalResult knowledge,
+        LongTermMemoryRetrievalResult longTermMemory
+    ) {
+        var apiTokens = estimateTokens(joinNonBlank(apiContext.summary(), apiContext.description(), apiContext.path(), apiContext.operationId()));
+        var taskMemoryTokens = taskMemory.stream()
+            .mapToInt(memory -> estimateTokens(joinNonBlank(memory.summary(), memory.content())))
+            .sum();
+        var sessionTokens = sessionContext.stream()
+            .mapToInt(memory -> estimateTokens(joinNonBlank(memory.summary(), memory.content())))
+            .sum();
+        var baseTokens = apiTokens + taskMemoryTokens;
+        var originalEstimatedTokens = baseTokens + sessionTokens + knowledge.totalTokens() + longTermMemory.totalTokens();
+        var remaining = Math.max(0, tokenBudget - baseTokens);
+
+        var keptKnowledgeIds = new LinkedHashSet<String>();
+        var keptMemoryIds = new LinkedHashSet<String>();
+        for (var candidate : postBudgetCandidates(knowledge, longTermMemory)) {
+            if (candidate.tokens() <= remaining) {
+                if (candidate.corpusType() == RerankCorpusType.KNOWLEDGE) {
+                    keptKnowledgeIds.add(candidate.sourceId());
+                } else {
+                    keptMemoryIds.add(candidate.sourceId());
+                }
+                remaining -= candidate.tokens();
+            }
+        }
+
+        var keptSession = new ArrayList<SessionMemoryView>();
+        for (var memory : sessionContext) {
+            var tokens = estimateTokens(joinNonBlank(memory.summary(), memory.content()));
+            if (tokens <= remaining) {
+                keptSession.add(memory);
+                remaining -= tokens;
+            }
+        }
+
+        var keptKnowledgeHits = knowledge.hits().stream()
+            .filter(hit -> keptKnowledgeIds.contains(hit.chunkId()))
+            .sorted(Comparator
+                .comparingInt((KnowledgeRetrievalHit hit) -> postRerankRank(hit))
+                .thenComparing(KnowledgeRetrievalHit::chunkId))
+            .toList();
+        var keptMemoryHits = longTermMemory.hits().stream()
+            .filter(hit -> keptMemoryIds.contains(hit.memoryId()))
+            .sorted(Comparator
+                .comparingInt((LongTermMemoryRetrievalHit hit) -> postRerankRank(hit))
+                .thenComparing(LongTermMemoryRetrievalHit::memoryId))
+            .toList();
+        var prunedKnowledge = rebuildKnowledgeResult(knowledge, keptKnowledgeHits);
+        var prunedLongTerm = new LongTermMemoryRetrievalResult(
+            List.copyOf(keptMemoryHits),
+            longTermMemory.totalCandidates(),
+            keptMemoryHits.stream().mapToInt(LongTermMemoryRetrievalHit::tokenCount).sum(),
+            longTermMemory.routeDiagnostics()
+        );
+        return new PrunedContext(
+            List.copyOf(keptSession),
+            taskMemory,
+            prunedKnowledge,
+            prunedLongTerm,
+            originalEstimatedTokens,
+            originalEstimatedTokens > tokenBudget
+        );
+    }
+
+    private List<PostBudgetCandidate> postBudgetCandidates(
+        KnowledgeRetrievalResult knowledge,
+        LongTermMemoryRetrievalResult longTermMemory
+    ) {
+        var candidates = new ArrayList<PostBudgetCandidate>();
+        for (var hit : knowledge.hits()) {
+            candidates.add(new PostBudgetCandidate(
+                RerankCorpusType.KNOWLEDGE,
+                hit.chunkId(),
+                hit.tokenCount(),
+                postRerankRank(hit),
+                hit.score()
+            ));
+        }
+        for (var hit : longTermMemory.hits()) {
+            candidates.add(new PostBudgetCandidate(
+                RerankCorpusType.MEMORY,
+                hit.memoryId(),
+                hit.tokenCount(),
+                postRerankRank(hit),
+                hit.score()
+            ));
+        }
+        return candidates.stream()
+            .sorted(Comparator
+                .comparingInt(PostBudgetCandidate::postRerankRank)
+                .thenComparing(Comparator.comparingDouble(PostBudgetCandidate::score).reversed())
+                .thenComparing(candidate -> candidate.corpusType().name())
+                .thenComparing(PostBudgetCandidate::sourceId))
+            .toList();
+    }
+
+    private int postRerankRank(KnowledgeRetrievalHit hit) {
+        return intValue(hit.metadata().get("postRerankRank"), Integer.MAX_VALUE);
+    }
+
+    private int postRerankRank(LongTermMemoryRetrievalHit hit) {
+        return intValue(hit.metadata().get("postRerankRank"), Integer.MAX_VALUE);
     }
 
     private List<KnowledgeRetrievalHit> sortKnowledgeForBudget(List<KnowledgeRetrievalHit> hits) {
@@ -925,7 +1596,8 @@ public class UnifiedContextBuilder {
             normalizeTags(query.tags()),
             query.tokenBudget() == null ? DEFAULT_TOKEN_BUDGET : query.tokenBudget(),
             query.consumer() == null ? inferConsumer(query.stageProfile()) : query.consumer(),
-            normalizeNullable(query.usageSourceRef())
+            normalizeNullable(query.usageSourceRef()),
+            query.postRerankContext()
         );
     }
 
@@ -963,8 +1635,81 @@ public class UnifiedContextBuilder {
         return StringUtils.hasText(preferred) ? preferred.trim() : normalizeNullable(fallback);
     }
 
+    private String stringMetadata(Map<String, Object> metadata, String key) {
+        var value = metadata == null ? null : metadata.get(key);
+        return value == null ? null : normalizeNullable(String.valueOf(value));
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> listMetadata(Map<String, Object> metadata, String key) {
+        if (metadata == null || !metadata.containsKey(key)) {
+            return List.of();
+        }
+        var value = metadata.get(key);
+        if (value instanceof List<?> values) {
+            return values.stream()
+                .map(String::valueOf)
+                .filter(StringUtils::hasText)
+                .toList();
+        }
+        if (value instanceof String text && StringUtils.hasText(text)) {
+            return List.of(text.trim());
+        }
+        return List.of();
+    }
+
+    private Integer intMetadata(Map<String, Object> metadata, String key) {
+        return metadata == null ? null : intValue(metadata.get(key), null);
+    }
+
+    private int intValue(Object value, int fallback) {
+        var parsed = intValue(value, (Integer) null);
+        return parsed == null ? fallback : parsed;
+    }
+
+    private Integer intValue(Object value, Integer fallback) {
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value instanceof String text && StringUtils.hasText(text)) {
+            try {
+                return Integer.parseInt(text.trim());
+            } catch (NumberFormatException ignored) {
+                return fallback;
+            }
+        }
+        return fallback;
+    }
+
+    private Float asFloat(Double value) {
+        return value == null ? null : value.floatValue();
+    }
+
     private Double asDouble(Float value) {
         return value == null ? null : value.doubleValue();
+    }
+
+    private MemoryScopeType memoryScopeType(RerankCandidate candidate) {
+        var scopeType = stringMetadata(candidate.metadata(), "scopeType");
+        if (!StringUtils.hasText(scopeType)) {
+            scopeType = candidate.sourceIdentity().sourceType();
+        }
+        try {
+            return MemoryScopeType.valueOf(scopeType);
+        } catch (Exception ignored) {
+            return MemoryScopeType.PROJECT_KNOWLEDGE;
+        }
+    }
+
+    private MemorySourceType memorySourceType(RerankCandidate candidate) {
+        var sourceType = stringMetadata(candidate.metadata(), "sourceType");
+        try {
+            return StringUtils.hasText(sourceType)
+                ? MemorySourceType.valueOf(sourceType)
+                : MemorySourceType.MEMORY_REFINERY;
+        } catch (Exception ignored) {
+            return MemorySourceType.MEMORY_REFINERY;
+        }
     }
 
     private String normalizeText(String value) {
@@ -1009,5 +1754,14 @@ public class UnifiedContextBuilder {
     }
 
     private record RouteVariantIntent(String queryVariantId, String queryIntent) {
+    }
+
+    private record PostBudgetCandidate(
+        RerankCorpusType corpusType,
+        String sourceId,
+        int tokens,
+        int postRerankRank,
+        double score
+    ) {
     }
 }

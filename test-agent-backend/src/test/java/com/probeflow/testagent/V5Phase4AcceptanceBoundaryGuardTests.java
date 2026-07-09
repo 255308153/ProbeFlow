@@ -78,18 +78,18 @@ class V5Phase4AcceptanceBoundaryGuardTests {
             + sourceText(BACKEND_ROOT.resolve("src/main/resources"))
             + "\n"
             + sourceText(BACKEND_ROOT.resolve("src/main/java"));
-        var v5_4ReadPathSources = String.join("\n",
+        var v5_4RecallSources = String.join("\n",
             sourceText(BACKEND_ROOT.resolve("src/main/java/com/probeflow/testagent/retrieval")),
             Files.readString(BACKEND_ROOT.resolve(
                 "src/main/java/com/probeflow/testagent/knowledge/KnowledgeRetrievalApplicationService.java"
             )),
             Files.readString(BACKEND_ROOT.resolve(
                 "src/main/java/com/probeflow/testagent/memory/LongTermMemoryRetrievalService.java"
-            )),
-            Files.readString(BACKEND_ROOT.resolve(
-                "src/main/java/com/probeflow/testagent/memory/UnifiedContextBuilder.java"
             ))
         );
+        var unifiedContextBuilder = Files.readString(BACKEND_ROOT.resolve(
+            "src/main/java/com/probeflow/testagent/memory/UnifiedContextBuilder.java"
+        ));
 
         assertThat(presentTerms(productionSurface, List.of(
             "mem0",
@@ -103,7 +103,7 @@ class V5Phase4AcceptanceBoundaryGuardTests {
             "arangodb",
             "tinkerpop"
         ))).isEmpty();
-        assertThat(v5_4ReadPathSources)
+        assertThat(v5_4RecallSources)
             .doesNotContain("com.probeflow.testagent.rerank")
             .doesNotContain("CrossEncoder")
             .doesNotContain("Cross Encoder")
@@ -113,6 +113,12 @@ class V5Phase4AcceptanceBoundaryGuardTests {
             .doesNotContain("Small-to-Big")
             .doesNotContain("ParentChild")
             .doesNotContain("parent-child");
+        assertThat(unifiedContextBuilder)
+            .contains("loadKnowledge(apiSpec, normalized)")
+            .contains("loadLongTermMemory(apiSpec, normalized)")
+            .contains("usePostRerankExpandedContext(normalized)")
+            .contains("prunePostRerankToBudget")
+            .contains("pruneToBudget");
     }
 
     @Test

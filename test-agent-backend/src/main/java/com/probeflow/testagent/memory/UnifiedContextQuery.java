@@ -17,8 +17,44 @@ public record UnifiedContextQuery(
     List<String> tags,
     Integer tokenBudget,
     MemoryUsageConsumer consumer,
-    String usageSourceRef
+    String usageSourceRef,
+    PostRerankExpandedContext postRerankContext
 ) {
+    public UnifiedContextQuery(
+        String taskId,
+        String sessionId,
+        String apiSpecId,
+        ApiSpec apiSpec,
+        String stageProfile,
+        String rawQuery,
+        String systemName,
+        String moduleName,
+        String apiPath,
+        String errorCode,
+        List<String> tags,
+        Integer tokenBudget,
+        MemoryUsageConsumer consumer,
+        String usageSourceRef
+    ) {
+        this(
+            taskId,
+            sessionId,
+            apiSpecId,
+            apiSpec,
+            stageProfile,
+            rawQuery,
+            systemName,
+            moduleName,
+            apiPath,
+            errorCode,
+            tags,
+            tokenBudget,
+            consumer,
+            usageSourceRef,
+            null
+        );
+    }
+
     public UnifiedContextQuery(
         String taskId,
         String sessionId,
@@ -46,6 +82,7 @@ public record UnifiedContextQuery(
             errorCode,
             tags,
             tokenBudget,
+            null,
             null,
             null
         );
