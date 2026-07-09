@@ -357,6 +357,13 @@ public class UnifiedContextBuilder {
         copyMetadataValue(evidence, metadata, "metadataScore");
         copyMetadataValue(evidence, metadata, "parentChunkId");
         copyMetadataValue(evidence, metadata, "lowConfidenceReason");
+        copyMetadataValue(evidence, metadata, "graphMatchReason");
+        copyMetadataValue(evidence, metadata, "graphRelationPath");
+        copyMetadataValue(evidence, metadata, "graphRelationConfidence");
+        copyMetadataValue(evidence, metadata, "graphSourceMemoryIds");
+        copyMetadataValue(evidence, metadata, "graphSourceRefs");
+        copyMetadataValue(evidence, metadata, "graphFactFingerprints");
+        copyMetadataValue(evidence, metadata, "graphEvidenceSummaries");
     }
 
     private void copyMetadataValue(Map<String, Object> evidence, Map<String, Object> metadata, String key) {
