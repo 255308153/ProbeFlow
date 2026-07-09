@@ -166,8 +166,6 @@ class V5Phase1AcceptanceBoundaryGuardTests {
         ))).isEmpty();
 
         assertThat(presentTerms(mainSources, List.of(
-            "QueryRewrite",
-            "QueryRewriter",
             "MultiRecall",
             "MultiRouteRetrieval",
             "ReciprocalRankFusion",

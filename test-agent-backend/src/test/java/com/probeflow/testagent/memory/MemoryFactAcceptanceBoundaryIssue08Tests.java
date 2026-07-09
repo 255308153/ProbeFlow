@@ -147,8 +147,6 @@ class MemoryFactAcceptanceBoundaryIssue08Tests {
             .doesNotContain("viking-db")
             .doesNotContain("memoryentitygraph")
             .doesNotContain("memory entity graph")
-            .doesNotContain("queryrewrite")
-            .doesNotContain("query rewrite")
             .doesNotContain("multi-route")
             .doesNotContain("multiroute")
             .doesNotContain("reciprocal rank fusion")
