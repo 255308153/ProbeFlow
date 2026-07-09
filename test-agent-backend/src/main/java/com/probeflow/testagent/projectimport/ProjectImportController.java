@@ -51,4 +51,15 @@ public class ProjectImportController {
             return ResponseEntity.badRequest().body(exception.error());
         }
     }
+
+    @PostMapping("/{materialId}/reanalyze")
+    public ResponseEntity<?> reanalyzeImport(@PathVariable String materialId) {
+        try {
+            return ResponseEntity.ok(localDirectoryImports.reanalyzeImport(materialId));
+        } catch (ProjectImportNotFoundException exception) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(exception.error());
+        } catch (ProjectImportValidationException exception) {
+            return ResponseEntity.badRequest().body(exception.error());
+        }
+    }
 }

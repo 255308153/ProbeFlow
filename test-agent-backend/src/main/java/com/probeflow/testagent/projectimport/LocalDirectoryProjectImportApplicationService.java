@@ -114,6 +114,15 @@ public class LocalDirectoryProjectImportApplicationService {
         return toProjectImportResponse(result);
     }
 
+    public ProjectImportResponse reanalyzeImport(String materialId) {
+        var material = requireSourceDirectoryMaterial(materialId);
+        var result = apiAnalysis.analyze(ApiAnalysisRequest.existingMaterial(
+            material.getMaterialId(),
+            "project-import-reanalysis"
+        ));
+        return toProjectImportResponse(result);
+    }
+
     private ProjectImportResponse toProjectImportResponse(ApiAnalysisResult result) {
         if (result.succeeded()) {
             return ProjectImportResponse.readySourceDirectory(
