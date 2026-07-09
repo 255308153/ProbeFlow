@@ -7,9 +7,12 @@ import com.probeflow.testagent.knowledge.EmbeddingProfileMetadata;
 import com.probeflow.testagent.knowledge.KnowledgeContext;
 import com.probeflow.testagent.knowledge.KnowledgeContextEntry;
 import com.probeflow.testagent.knowledge.KnowledgeQuery;
+import com.probeflow.testagent.knowledge.KnowledgeRouteEvidence;
 import com.probeflow.testagent.knowledge.KnowledgeRetrievalApplicationService;
 import com.probeflow.testagent.knowledge.KnowledgeRetrievalHit;
 import com.probeflow.testagent.knowledge.KnowledgeRetrievalResult;
+import com.probeflow.testagent.retrieval.RetrievalRouteDiagnostic;
+import com.probeflow.testagent.retrieval.RetrievalRouteEvidence;
 import com.probeflow.testagent.task.Task;
 import com.probeflow.testagent.task.TaskRepository;
 import java.util.ArrayList;
@@ -69,7 +72,7 @@ public class UnifiedContextBuilder {
         var knowledge = loadKnowledge(apiSpec, normalized);
         var longTermMemory = loadLongTermMemory(apiSpec, normalized);
         var pruned = pruneToBudget(normalized.tokenBudget(), apiContext, sessionContext, taskMemory, knowledge, longTermMemory);
-        var constraints = buildConstraints(apiSpec, normalized.stageProfile());
+        var constraints = buildConstraints(apiSpec, normalized.stageProfile(), pruned.knowledge(), pruned.longTermMemory());
         var citations = buildCitations(
             pruned.sessionContext(),
             pruned.taskMemory(),
@@ -236,12 +239,48 @@ public class UnifiedContextBuilder {
         ));
     }
 
-    private Map<String, Object> buildConstraints(ApiSpec apiSpec, String stageProfile) {
+    private Map<String, Object> buildConstraints(
+        ApiSpec apiSpec,
+        String stageProfile,
+        KnowledgeRetrievalResult knowledge,
+        LongTermMemoryRetrievalResult longTermMemory
+    ) {
         var constraints = new LinkedHashMap<String, Object>();
         constraints.put("apiConstraints", new LinkedHashMap<>(apiSpec.getConstraints()));
         constraints.put("apiAuth", new LinkedHashMap<>(apiSpec.getAuth()));
         constraints.put("stageProfile", stageProfile);
+        var diagnostics = retrievalDiagnostics(knowledge, longTermMemory);
+        if (!diagnostics.isEmpty()) {
+            constraints.put("retrievalDiagnostics", diagnostics);
+        }
         return constraints;
+    }
+
+    private Map<String, Object> retrievalDiagnostics(
+        KnowledgeRetrievalResult knowledge,
+        LongTermMemoryRetrievalResult longTermMemory
+    ) {
+        var diagnostics = new LinkedHashMap<String, Object>();
+        if (knowledge != null && !knowledge.diagnostics().isEmpty()) {
+            diagnostics.put("knowledge", List.copyOf(knowledge.diagnostics()));
+        }
+        if (longTermMemory != null && !longTermMemory.routeDiagnostics().isEmpty()) {
+            diagnostics.put("longTermMemory", longTermMemory.routeDiagnostics().stream()
+                .map(this::routeDiagnosticEvidence)
+                .toList());
+        }
+        return diagnostics;
+    }
+
+    private Map<String, Object> routeDiagnosticEvidence(RetrievalRouteDiagnostic diagnostic) {
+        var evidence = new LinkedHashMap<String, Object>();
+        evidence.put("routeName", diagnostic.routeName());
+        putIfPresent(evidence, "queryVariantId", diagnostic.queryVariantId());
+        evidence.put("routeLimit", diagnostic.routeLimit());
+        evidence.put("confidenceGate", diagnostic.confidenceGate());
+        evidence.put("candidateCount", diagnostic.candidateCount());
+        evidence.put("diagnostic", diagnostic.diagnostic());
+        return Map.copyOf(evidence);
     }
 
     private List<ContextCitation> buildCitations(
@@ -306,6 +345,7 @@ public class UnifiedContextBuilder {
         if (!metadata.isEmpty()) {
             evidence.put("metadata", metadata);
             copySemanticEvidence(evidence, metadata);
+            copyFusionEvidence(evidence, metadata);
         }
         var matchReasons = entry.matchReasons() == null ? List.<String>of() : List.copyOf(entry.matchReasons());
         if (!matchReasons.isEmpty()) {
@@ -313,6 +353,9 @@ public class UnifiedContextBuilder {
         }
         if (hit != null && hit.componentScores() != null && !hit.componentScores().isEmpty()) {
             evidence.put("componentScores", new LinkedHashMap<>(hit.componentScores()));
+        }
+        if (hit != null) {
+            copyKnowledgeRouteEvidence(evidence, hit.routeEvidence());
         }
         return evidence;
     }
@@ -329,6 +372,7 @@ public class UnifiedContextBuilder {
         if (!metadata.isEmpty()) {
             evidence.put("metadata", metadata);
             copySemanticEvidence(evidence, metadata);
+            copyFusionEvidence(evidence, metadata);
         }
         if (hit.componentScores() != null && !hit.componentScores().isEmpty()) {
             evidence.put("componentScores", new LinkedHashMap<>(hit.componentScores()));
@@ -337,6 +381,7 @@ public class UnifiedContextBuilder {
         if (!matchReasons.isEmpty()) {
             evidence.put("matchReasons", matchReasons);
         }
+        copyMemoryRouteEvidence(evidence, hit.routeEvidence());
         return evidence;
     }
 
@@ -364,6 +409,142 @@ public class UnifiedContextBuilder {
         copyMetadataValue(evidence, metadata, "graphSourceRefs");
         copyMetadataValue(evidence, metadata, "graphFactFingerprints");
         copyMetadataValue(evidence, metadata, "graphEvidenceSummaries");
+    }
+
+    private void copyFusionEvidence(Map<String, Object> evidence, Map<String, Object> metadata) {
+        copyMetadataValue(evidence, metadata, "routeEvidence");
+        copyMetadataValue(evidence, metadata, "routeNames");
+        copyMetadataValue(evidence, metadata, "retrievalRoutes");
+        copyMetadataValue(evidence, metadata, "queryVariantIds");
+        copyMetadataValue(evidence, metadata, "queryVariantIntents");
+        copyMetadataValue(evidence, metadata, "queryVariantIntentById");
+        copyMetadataValue(evidence, metadata, "preFusionRoute");
+        copyMetadataValue(evidence, metadata, "preFusionRank");
+        copyMetadataValue(evidence, metadata, "preFusionRanks");
+        copyMetadataValue(evidence, metadata, "preFusionScore");
+        copyMetadataValue(evidence, metadata, "fusedScore");
+        copyMetadataValue(evidence, metadata, "fusionExplanation");
+    }
+
+    private void copyKnowledgeRouteEvidence(Map<String, Object> evidence, List<KnowledgeRouteEvidence> routeEvidence) {
+        if (routeEvidence == null || routeEvidence.isEmpty()) {
+            return;
+        }
+        evidence.putIfAbsent("routeEvidence", routeEvidence.stream()
+            .map(this::knowledgeRouteEvidence)
+            .toList());
+        copyRouteEvidenceSummary(
+            evidence,
+            routeEvidence.stream().map(KnowledgeRouteEvidence::routeName).toList(),
+            routeEvidence.stream().map(KnowledgeRouteEvidence::queryVariantId).toList(),
+            routeEvidence.stream().map(KnowledgeRouteEvidence::queryIntent).toList(),
+            routeEvidence.stream().map(KnowledgeRouteEvidence::matchReason).toList(),
+            routeEvidence.stream().collect(java.util.stream.Collectors.toMap(
+                item -> item.routeName() + ":" + item.queryVariantId(),
+                KnowledgeRouteEvidence::routeRank,
+                (left, right) -> left,
+                LinkedHashMap::new
+            ))
+        );
+        putIfAbsentNonEmpty(evidence, "queryVariantIntentById", queryVariantIntentById(routeEvidence.stream()
+            .map(item -> new RouteVariantIntent(item.queryVariantId(), item.queryIntent()))
+            .toList()));
+    }
+
+    private void copyMemoryRouteEvidence(Map<String, Object> evidence, List<RetrievalRouteEvidence> routeEvidence) {
+        if (routeEvidence == null || routeEvidence.isEmpty()) {
+            return;
+        }
+        evidence.putIfAbsent("routeEvidence", routeEvidence.stream()
+            .map(this::memoryRouteEvidence)
+            .toList());
+        copyRouteEvidenceSummary(
+            evidence,
+            routeEvidence.stream().map(RetrievalRouteEvidence::routeName).toList(),
+            routeEvidence.stream().map(RetrievalRouteEvidence::queryVariantId).toList(),
+            routeEvidence.stream().map(RetrievalRouteEvidence::queryIntent).toList(),
+            routeEvidence.stream().map(RetrievalRouteEvidence::matchReason).toList(),
+            routeEvidence.stream().collect(java.util.stream.Collectors.toMap(
+                item -> item.routeName() + ":" + item.queryVariantId(),
+                RetrievalRouteEvidence::routeRank,
+                (left, right) -> left,
+                LinkedHashMap::new
+            ))
+        );
+        putIfAbsentNonEmpty(evidence, "queryVariantIntentById", queryVariantIntentById(routeEvidence.stream()
+            .map(item -> new RouteVariantIntent(item.queryVariantId(), item.queryIntent()))
+            .toList()));
+    }
+
+    private void copyRouteEvidenceSummary(
+        Map<String, Object> evidence,
+        List<String> routeNames,
+        List<String> queryVariantIds,
+        List<String> queryVariantIntents,
+        List<String> matchReasons,
+        Map<String, Integer> routeRanks
+    ) {
+        putIfAbsentNonEmpty(evidence, "routeNames", distinctNonBlank(routeNames));
+        putIfAbsentNonEmpty(evidence, "queryVariantIds", distinctNonBlank(queryVariantIds));
+        putIfAbsentNonEmpty(evidence, "queryVariantIntents", distinctNonBlank(queryVariantIntents));
+        putIfAbsentNonEmpty(evidence, "routeMatchReasons", distinctNonBlank(matchReasons));
+        if (!routeRanks.isEmpty()) {
+            evidence.putIfAbsent("routeRanks", routeRanks);
+        }
+    }
+
+    private Map<String, Object> knowledgeRouteEvidence(KnowledgeRouteEvidence routeEvidence) {
+        var evidence = new LinkedHashMap<String, Object>();
+        evidence.put("routeName", routeEvidence.routeName());
+        evidence.put("queryVariantId", routeEvidence.queryVariantId());
+        putIfPresent(evidence, "queryIntent", routeEvidence.queryIntent());
+        evidence.put("routeRank", routeEvidence.routeRank());
+        evidence.put("routeScore", routeEvidence.routeScore());
+        evidence.put("matchReason", routeEvidence.matchReason());
+        return Map.copyOf(evidence);
+    }
+
+    private Map<String, Object> memoryRouteEvidence(RetrievalRouteEvidence routeEvidence) {
+        var evidence = new LinkedHashMap<String, Object>();
+        evidence.put("routeName", routeEvidence.routeName());
+        putIfPresent(evidence, "queryVariantId", routeEvidence.queryVariantId());
+        putIfPresent(evidence, "queryIntent", routeEvidence.queryIntent());
+        evidence.put("routeRank", routeEvidence.routeRank());
+        evidence.put("routeScore", routeEvidence.routeScore());
+        evidence.put("matchReason", routeEvidence.matchReason());
+        if (!routeEvidence.sourceEvidence().isEmpty()) {
+            evidence.put("sourceEvidence", routeEvidence.sourceEvidence());
+        }
+        return Map.copyOf(evidence);
+    }
+
+    private List<String> distinctNonBlank(List<String> values) {
+        return values.stream()
+            .filter(StringUtils::hasText)
+            .distinct()
+            .toList();
+    }
+
+    private void putIfAbsentNonEmpty(Map<String, Object> evidence, String key, List<String> values) {
+        if (!values.isEmpty()) {
+            evidence.putIfAbsent(key, values);
+        }
+    }
+
+    private void putIfAbsentNonEmpty(Map<String, Object> evidence, String key, Map<String, String> values) {
+        if (!values.isEmpty()) {
+            evidence.putIfAbsent(key, values);
+        }
+    }
+
+    private Map<String, String> queryVariantIntentById(List<RouteVariantIntent> values) {
+        var byId = new LinkedHashMap<String, String>();
+        for (var value : values) {
+            if (StringUtils.hasText(value.queryVariantId()) && StringUtils.hasText(value.queryIntent())) {
+                byId.putIfAbsent(value.queryVariantId(), value.queryIntent());
+            }
+        }
+        return Map.copyOf(byId);
     }
 
     private void copyMetadataValue(Map<String, Object> evidence, Map<String, Object> metadata, String key) {
@@ -463,7 +644,8 @@ public class UnifiedContextBuilder {
         var prunedLongTerm = new LongTermMemoryRetrievalResult(
             List.copyOf(keptLongTermHits),
             longTermMemory.totalCandidates(),
-            keptLongTermHits.stream().mapToInt(LongTermMemoryRetrievalHit::tokenCount).sum()
+            keptLongTermHits.stream().mapToInt(LongTermMemoryRetrievalHit::tokenCount).sum(),
+            longTermMemory.routeDiagnostics()
         );
 
         return new PrunedContext(
@@ -535,7 +717,8 @@ public class UnifiedContextBuilder {
             keptHits.isEmpty() ? 0.0d : original.coverage(),
             original.totalCandidates(),
             keptHits.stream().mapToInt(KnowledgeRetrievalHit::tokenCount).sum(),
-            keptHits.isEmpty() || original.lowConfidence()
+            keptHits.isEmpty() || original.lowConfidence(),
+            original.diagnostics()
         );
     }
 
@@ -823,5 +1006,8 @@ public class UnifiedContextBuilder {
         int originalEstimatedTokens,
         boolean pruned
     ) {
+    }
+
+    private record RouteVariantIntent(String queryVariantId, String queryIntent) {
     }
 }

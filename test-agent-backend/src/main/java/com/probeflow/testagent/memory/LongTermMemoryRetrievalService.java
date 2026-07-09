@@ -723,6 +723,11 @@ public class LongTermMemoryRetrievalService {
             .filter(StringUtils::hasText)
             .distinct()
             .toList();
+        var queryVariantIntents = routeEvidence.stream()
+            .map(RetrievalRouteEvidence::queryIntent)
+            .filter(StringUtils::hasText)
+            .distinct()
+            .toList();
         var fusedScore = fusedScore(routeEvidence);
         var metadata = new LinkedHashMap<>(bestHit.metadata());
         for (var hit : accumulator.hits()) {
@@ -735,6 +740,7 @@ public class LongTermMemoryRetrievalService {
             .orElseGet(() -> fallbackRouteEvidence(bestHit));
         metadata.put("retrievalRoutes", routeNames);
         metadata.put("queryVariantIds", queryVariantIds);
+        metadata.put("queryVariantIntents", queryVariantIntents);
         metadata.put("routeEvidence", routeEvidenceView(routeEvidence));
         metadata.put("preFusionRoute", bestEvidence.routeName());
         metadata.put("preFusionRank", bestEvidence.routeRank());
@@ -870,6 +876,9 @@ public class LongTermMemoryRetrievalService {
                 var value = new LinkedHashMap<String, Object>();
                 value.put("routeName", evidence.routeName());
                 value.put("queryVariantId", evidence.queryVariantId());
+                if (StringUtils.hasText(evidence.queryIntent())) {
+                    value.put("queryIntent", evidence.queryIntent());
+                }
                 value.put("routeRank", evidence.routeRank());
                 value.put("routeScore", evidence.routeScore());
                 value.put("matchReason", evidence.matchReason());
@@ -906,6 +915,7 @@ public class LongTermMemoryRetrievalService {
         return new RetrievalRouteEvidence(
             routeName,
             variant == null ? null : variant.deterministicId(),
+            variant == null || variant.intent() == null ? null : variant.intent().name(),
             routeRank,
             routeScore,
             matchReason,
