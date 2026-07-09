@@ -311,6 +311,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             "BusinessFlowDiscoveryService",
             "ControlledPlannerService",
             "DemoRunApplicationService",
+            "DeterministicQueryRewriteService",
             "EmbeddingService",
             "ExecutableRequestBuilder",
             "FailureAnalysisApplicationService",

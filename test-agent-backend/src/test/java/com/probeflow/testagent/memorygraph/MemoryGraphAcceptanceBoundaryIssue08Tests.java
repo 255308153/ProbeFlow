@@ -55,12 +55,10 @@ class MemoryGraphAcceptanceBoundaryIssue08Tests {
     }
 
     @Test
-    void v5_3DoesNotImplementFutureRetrievalStages() throws Exception {
+    void v5_4QueryRewriteContractDoesNotImplementFutureRetrievalStages() throws Exception {
         var mainSources = sourceText(BACKEND_ROOT.resolve("src/main/java"));
 
         assertThat(presentTerms(mainSources, List.of(
-            "QueryRewrite",
-            "QueryRewriter",
             "MultiRecall",
             "MultiRouteRetrieval",
             "ReciprocalRankFusion",

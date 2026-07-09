@@ -149,8 +149,6 @@ class V4AcceptanceBoundaryGuardTests {
             "BM25",
             "PG full-text",
             "PostgreSQL full-text",
-            "Query Rewrite",
-            "QueryRewrite",
             "multi-recall",
             "MultiRecall",
             "RRF",

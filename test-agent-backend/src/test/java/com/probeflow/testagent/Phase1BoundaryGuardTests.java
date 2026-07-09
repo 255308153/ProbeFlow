@@ -63,6 +63,7 @@ class Phase1BoundaryGuardTests {
             "policyvalidator",
             "replanning",
             "report",
+            "retrieval",
             "sourcematerial",
             "suitedraft",
             "suiteruntime",
