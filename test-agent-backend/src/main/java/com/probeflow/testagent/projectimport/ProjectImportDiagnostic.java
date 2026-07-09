@@ -15,4 +15,13 @@ public record ProjectImportDiagnostic(
     ) {
         return new ProjectImportDiagnostic(code, summary, message, suggestedAction);
     }
+
+    static ProjectImportDiagnostic warning(
+        String code,
+        String summary,
+        String message,
+        String suggestedAction
+    ) {
+        return new ProjectImportDiagnostic(code, summary, message, suggestedAction);
+    }
 }
