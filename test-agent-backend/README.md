@@ -49,6 +49,12 @@ V5-5 keeps Cross Encoder rerank as an explicit adapter contract, not a default d
 
 See [docs/v5-5-cross-encoder-rerank-adapter.md](docs/v5-5-cross-encoder-rerank-adapter.md) for the request / response contract, safe metadata boundary, fallback behavior, and external-service guardrails.
 
+## V5-5 LLM Rerank Manual Profile
+
+V5-5 keeps LLM rerank behind an explicit manual profile. Default configuration disables the provider, automated tests use fake LLM or stub responses, invalid structured output falls back to deterministic rerank, and internal alpha validation must retain a real DeepSeek V4 Pro manual acceptance path.
+
+See [docs/v5-5-llm-rerank-manual-profile.md](docs/v5-5-llm-rerank-manual-profile.md) for safe candidate summaries, JSON output validation, citation guardrails, redacted diagnostics, and DeepSeek policy.
+
 ## V5-1 Real Embedding And pgvector
 
 V5-1 adds a real embedding manual profile, pgvector candidate retrieval for Knowledge RAG and Long-term Memory, embedding profile metadata, reindex guards, and semantic evidence propagation into Unified Context. Fake embedding remains the default for local tests and CI.

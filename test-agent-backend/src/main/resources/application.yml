@@ -60,3 +60,7 @@ probeflow:
     cross-encoder:
       enabled: ${PROBEFLOW_RERANK_CROSS_ENCODER_ENABLED:false}
       provider: ${PROBEFLOW_RERANK_CROSS_ENCODER_PROVIDER:disabled}
+    llm:
+      enabled: ${PROBEFLOW_RERANK_LLM_ENABLED:false}
+      provider: ${PROBEFLOW_RERANK_LLM_PROVIDER:disabled}
+      model: ${PROBEFLOW_RERANK_LLM_MODEL:deepseek-v4-pro}

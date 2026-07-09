@@ -37,3 +37,7 @@ probeflow:
     cross-encoder:
       enabled: false
       provider: disabled
+    llm:
+      enabled: false
+      provider: disabled
+      model: deepseek-v4-pro
