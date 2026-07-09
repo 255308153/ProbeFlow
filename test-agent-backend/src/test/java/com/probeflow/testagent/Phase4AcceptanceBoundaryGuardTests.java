@@ -332,6 +332,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             "PolicyValidatorService",
             "ReplanningApplicationService",
             "ReportGenerationApplicationService",
+            "RerankCandidateContractService",
             "SessionMemoryService",
             "SuiteDraftGenerationService",
             "TaskInitializationService",
