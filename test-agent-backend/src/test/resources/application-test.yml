@@ -33,3 +33,7 @@ probeflow:
       provider: fake
       model: fake-model
       template-id: v5.memory-fact-extraction.v1
+  rerank:
+    cross-encoder:
+      enabled: false
+      provider: disabled

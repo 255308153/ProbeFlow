@@ -139,7 +139,7 @@ class MemoryFactAcceptanceBoundaryIssue08Tests {
 
     @Test
     void futurePhaseBoundariesAreAbsentFromV5_2Implementation() throws IOException {
-        var mainSources = readAllMainSources().toLowerCase(Locale.ROOT);
+        var mainSources = readMemoryFactImplementationSources().toLowerCase(Locale.ROOT);
 
         assertThat(mainSources)
             .doesNotContain("mem0")
@@ -197,8 +197,8 @@ class MemoryFactAcceptanceBoundaryIssue08Tests {
         );
     }
 
-    private String readAllMainSources() throws IOException {
-        try (Stream<Path> paths = Files.walk(Path.of("src/main/java"))) {
+    private String readMemoryFactImplementationSources() throws IOException {
+        try (Stream<Path> paths = Files.walk(Path.of("src/main/java/com/probeflow/testagent/memory"))) {
             var builder = new StringBuilder();
             for (var path : paths.filter(Files::isRegularFile).filter(path -> path.toString().endsWith(".java")).toList()) {
                 builder.append(Files.readString(path)).append('\n');

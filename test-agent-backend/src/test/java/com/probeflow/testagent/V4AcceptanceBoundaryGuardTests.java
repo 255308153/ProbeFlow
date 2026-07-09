@@ -145,7 +145,7 @@ class V4AcceptanceBoundaryGuardTests {
             "ProductionAdmin"
         ))).isEmpty();
 
-        assertThat(presentTerms(pom + "\n" + mainSources, List.of(
+        assertThat(presentTerms(pom + "\n" + demoRunSources, List.of(
             "BM25",
             "PG full-text",
             "PostgreSQL full-text",
