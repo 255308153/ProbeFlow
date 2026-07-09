@@ -29,6 +29,7 @@ public class KnowledgeRetrievalApplicationService {
     private static final int DEFAULT_LIMIT = 8;
     private static final int DEFAULT_TOKEN_BUDGET = 1200;
     private static final int DEFAULT_ROUTE_LIMIT = 4;
+    private static final double FUSION_RANK_CONSTANT = 60.0d;
     private static final Pattern IDENTIFIER = Pattern.compile("\\b[A-Za-z][A-Za-z0-9_]{2,}\\b");
     private static final Set<String> STOP_WORDS = Set.of(
         "the", "and", "for", "with", "from", "that", "this", "into", "must", "have", "when",
@@ -156,7 +157,7 @@ public class KnowledgeRetrievalApplicationService {
             );
         }
 
-        var merged = mergeRouteCandidates(routeCandidates);
+        var merged = mergeRouteCandidates(routeCandidates, diagnostics, normalized.limit());
         var constrained = applyLimitAndTokenBudget(merged, normalized.limit(), normalized.tokenBudget());
         var lowConfidence = constrained.isEmpty() || constrained.getFirst().lowConfidence();
         var coverage = constrained.isEmpty() ? 0.0d : (lowConfidence ? 0.4d : 1.0d);
@@ -227,6 +228,10 @@ public class KnowledgeRetrievalApplicationService {
 
     private int perRouteLimit(int finalLimit) {
         return Math.max(1, Math.min(DEFAULT_ROUTE_LIMIT, finalLimit));
+    }
+
+    private int fusionCandidateLimit(int finalLimit) {
+        return Math.max(finalLimit * 4, 24);
     }
 
     private List<RouteCandidate> runKnowledgeRoute(
@@ -766,6 +771,11 @@ public class KnowledgeRetrievalApplicationService {
         Map<String, Double> componentScores,
         List<String> reasons
     ) {
+        var metadata = new LinkedHashMap<>(hit.metadata());
+        metadata.put("preFusionRoute", evidence.routeName());
+        metadata.put("preFusionRank", evidence.routeRank());
+        metadata.put("preFusionScore", evidence.routeScore());
+        metadata.putIfAbsent("candidateRank", evidence.routeRank());
         return new KnowledgeRetrievalHit(
             hit.chunkId(),
             hit.documentId(),
@@ -780,7 +790,7 @@ public class KnowledgeRetrievalApplicationService {
             hit.bizEntity(),
             hit.tags(),
             hit.applicableStages(),
-            hit.metadata(),
+            metadata,
             hit.tokenCount(),
             score,
             componentScores,
@@ -790,13 +800,29 @@ public class KnowledgeRetrievalApplicationService {
         );
     }
 
-    private List<KnowledgeRetrievalHit> mergeRouteCandidates(List<RouteCandidate> routeCandidates) {
+    private List<KnowledgeRetrievalHit> mergeRouteCandidates(
+        List<RouteCandidate> routeCandidates,
+        List<String> diagnostics,
+        int finalLimit
+    ) {
         var mergedByChunk = new LinkedHashMap<String, MergedRouteHit>();
         for (var candidate : routeCandidates) {
-            mergedByChunk.computeIfAbsent(candidate.hit().chunkId(), ignored -> new MergedRouteHit(candidate.hit()))
-                .add(candidate);
+            var candidateForFusion = candidate;
+            if (candidate.evidence() == null) {
+                diagnostics.add("knowledge-fusion-warning:missing-route-evidence");
+                candidateForFusion = new RouteCandidate(candidate.hit(), fallbackRouteEvidence(candidate.hit()));
+            }
+            var chunkId = candidateForFusion.hit().chunkId();
+            var firstHit = candidateForFusion.hit();
+            mergedByChunk.computeIfAbsent(chunkId, ignored -> new MergedRouteHit(firstHit))
+                .add(candidateForFusion);
         }
-        return mergedByChunk.values().stream()
+        var duplicateRoutes = routeCandidates.size() - mergedByChunk.size();
+        if (duplicateRoutes > 0) {
+            diagnostics.add("knowledge-fusion-deduplicated-routes:" + duplicateRoutes);
+        }
+        var fusionCandidateLimit = fusionCandidateLimit(finalLimit);
+        var fused = mergedByChunk.values().stream()
             .map(MergedRouteHit::toHit)
             .sorted(Comparator
                 .comparingDouble(KnowledgeRetrievalHit::score).reversed()
@@ -804,6 +830,24 @@ public class KnowledgeRetrievalApplicationService {
                 .thenComparing(KnowledgeRetrievalHit::chunkTitle, Comparator.nullsLast(String::compareTo))
                 .thenComparing(KnowledgeRetrievalHit::chunkId))
             .toList();
+        if (fused.size() > fusionCandidateLimit) {
+            diagnostics.add("knowledge-fusion-candidate-limit-applied:" + fusionCandidateLimit);
+        }
+        return fused.stream()
+            .limit(fusionCandidateLimit)
+            .toList();
+    }
+
+    private KnowledgeRouteEvidence fallbackRouteEvidence(KnowledgeRetrievalHit hit) {
+        var metadataRank = hit.metadata().get("candidateRank");
+        var rank = metadataRank instanceof Number number ? Math.max(1, number.intValue()) : 1;
+        return new KnowledgeRouteEvidence(
+            "unknown-route",
+            "qv-unknown",
+            rank,
+            Math.max(0.0d, hit.score()),
+            "missing route evidence fallback"
+        );
     }
 
     private boolean matchesApiPath(KnowledgeChunk chunk, String apiPath) {
@@ -1336,7 +1380,73 @@ public class KnowledgeRetrievalApplicationService {
         metadata.put("routeRank", evidence.routeRank());
         metadata.put("routeScore", evidence.routeScore());
         metadata.put("matchReason", evidence.matchReason());
+        metadata.put("routeWeight", routeWeight(evidence.routeName()));
+        metadata.put("weightedRouteScore", weightedRouteScore(evidence));
+        metadata.put("rankContribution", rankContribution(evidence));
         return metadata;
+    }
+
+    private double fusedScore(List<KnowledgeRouteEvidence> evidence) {
+        var bestWeighted = evidence.stream()
+            .mapToDouble(this::weightedRouteScore)
+            .max()
+            .orElse(0.0d);
+        var rankContributionTotal = evidence.stream()
+            .mapToDouble(this::rankContribution)
+            .sum();
+        var agreementBonus = routeAgreementBonus(evidence);
+        return Math.min(1.0d, bestWeighted + rankContributionTotal + agreementBonus);
+    }
+
+    private double weightedRouteScore(KnowledgeRouteEvidence evidence) {
+        return evidence.routeScore() * routeWeight(evidence.routeName());
+    }
+
+    private double rankContribution(KnowledgeRouteEvidence evidence) {
+        return routeWeight(evidence.routeName()) / (FUSION_RANK_CONSTANT + evidence.routeRank());
+    }
+
+    private double routeAgreementBonus(List<KnowledgeRouteEvidence> evidence) {
+        var routeCount = evidence.stream()
+            .map(KnowledgeRouteEvidence::routeName)
+            .distinct()
+            .count();
+        return Math.min(0.12d, Math.max(0L, routeCount - 1L) * 0.04d);
+    }
+
+    private double routeWeight(String routeName) {
+        return switch (routeName) {
+            case "original-semantic" -> 1.00d;
+            case "rewritten-semantic" -> 0.98d;
+            case "metadata-exact" -> 0.95d;
+            case "lexical-tag" -> 0.90d;
+            case "document-type" -> 0.85d;
+            default -> 0.80d;
+        };
+    }
+
+    private Map<String, Object> fusionExplanation(List<KnowledgeRouteEvidence> evidence, double fusedScore) {
+        var routeWeights = new LinkedHashMap<String, Double>();
+        var rankContributions = new LinkedHashMap<String, Double>();
+        var preFusionRanks = new LinkedHashMap<String, Integer>();
+        for (var item : evidence) {
+            var key = item.routeName() + ":" + item.queryVariantId();
+            routeWeights.putIfAbsent(item.routeName(), routeWeight(item.routeName()));
+            rankContributions.put(key, rankContribution(item));
+            preFusionRanks.put(key, item.routeRank());
+        }
+        var explanation = new LinkedHashMap<String, Object>();
+        explanation.put("formula", "bestWeightedRouteScore + rankContributionTotal + routeAgreementBonus");
+        explanation.put("routeCount", evidence.size());
+        explanation.put("routeNames", evidence.stream().map(KnowledgeRouteEvidence::routeName).distinct().toList());
+        explanation.put("routeWeights", routeWeights);
+        explanation.put("preFusionRanks", preFusionRanks);
+        explanation.put("rankContributions", rankContributions);
+        explanation.put("bestWeightedRouteScore", evidence.stream().mapToDouble(this::weightedRouteScore).max().orElse(0.0d));
+        explanation.put("rankContributionTotal", evidence.stream().mapToDouble(this::rankContribution).sum());
+        explanation.put("routeAgreementBonus", routeAgreementBonus(evidence));
+        explanation.put("fusedScore", fusedScore);
+        return Map.copyOf(explanation);
     }
 
     private record RouteQuery(QueryVariant variant, KnowledgeQuery query, QueryFilters filters) {
@@ -1398,6 +1508,12 @@ public class KnowledgeRetrievalApplicationService {
         }
 
         private KnowledgeRetrievalHit toHit() {
+            var fusedScore = fusedScore(evidence);
+            var bestEvidence = evidence.stream()
+                .min(Comparator
+                    .comparingInt(KnowledgeRouteEvidence::routeRank)
+                    .thenComparing(KnowledgeRouteEvidence::routeName))
+                .orElseGet(() -> fallbackRouteEvidence(baseHit));
             var metadata = new LinkedHashMap<>(baseHit.metadata());
             metadata.put("routeEvidence", evidence.stream()
                 .map(KnowledgeRetrievalApplicationService.this::routeEvidenceMetadata)
@@ -1410,6 +1526,33 @@ public class KnowledgeRetrievalApplicationService {
                 .map(KnowledgeRouteEvidence::queryVariantId)
                 .distinct()
                 .toList());
+            metadata.put("preFusionRoute", bestEvidence.routeName());
+            metadata.put("preFusionRank", bestEvidence.routeRank());
+            metadata.put("preFusionRanks", evidence.stream()
+                .collect(java.util.stream.Collectors.toMap(
+                    item -> item.routeName() + ":" + item.queryVariantId(),
+                    KnowledgeRouteEvidence::routeRank,
+                    (left, right) -> left,
+                    LinkedHashMap::new
+                )));
+            metadata.putIfAbsent("candidateRank", bestEvidence.routeRank());
+            metadata.put("fusedScore", fusedScore);
+            metadata.put("fusionExplanation", fusionExplanation(evidence, fusedScore));
+
+            componentScores.put("routeAgreement", Math.min(1.0d, evidence.stream()
+                .map(KnowledgeRouteEvidence::routeName)
+                .distinct()
+                .count() / 4.0d));
+            componentScores.put("rankContribution", evidence.stream()
+                .mapToDouble(KnowledgeRetrievalApplicationService.this::rankContribution)
+                .sum());
+            for (var item : evidence) {
+                componentScores.merge("route." + item.routeName(), item.routeScore(), Math::max);
+            }
+            matchReasons.add("route-fusion");
+            if (evidence.size() > 1) {
+                matchReasons.add("route-agreement");
+            }
 
             return new KnowledgeRetrievalHit(
                 baseHit.chunkId(),
@@ -1427,10 +1570,10 @@ public class KnowledgeRetrievalApplicationService {
                 baseHit.applicableStages(),
                 metadata,
                 baseHit.tokenCount(),
-                score,
+                fusedScore,
                 componentScores,
                 List.copyOf(matchReasons),
-                score < 0.30d && evidence.size() <= 1,
+                fusedScore < 0.30d,
                 evidence
             );
         }
