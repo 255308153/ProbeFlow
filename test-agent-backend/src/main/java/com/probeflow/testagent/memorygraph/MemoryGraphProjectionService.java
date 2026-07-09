@@ -117,6 +117,8 @@ public class MemoryGraphProjectionService {
         putEntity(entityNodes, MemoryGraphEntityType.DOWNSTREAM_STEP_ID, value(metadata, "downstreamStepId", "consumerStepId"), suiteScope, metadata, evidence, context);
         putEntity(entityNodes, MemoryGraphEntityType.VARIABLE_KEY, value(metadata, "variableKey", "suiteVariableKey", "targetKey"), suiteScope, metadata, evidence, context);
         putEntity(entityNodes, MemoryGraphEntityType.SOURCE_PATH, value(metadata, "sourcePath", "jsonPath", "responsePath"), suiteScope, metadata, evidence, context);
+        putEntity(entityNodes, MemoryGraphEntityType.POLICY_REASON, value(metadata, "policyReason", "policyReasonCode", "reasonCode", "approvalReason"), null, metadata, evidence, context);
+        putEntity(entityNodes, MemoryGraphEntityType.TOOL_NAME, value(metadata, "toolName", "tool", "toolId", "plannerToolName"), null, metadata, evidence, context);
         putEntity(entityNodes, MemoryGraphEntityType.FACT_TYPE, value(metadata, "factType"), null, metadata, evidence, context);
 
         for (var tag : memory.getTags()) {
@@ -148,6 +150,7 @@ public class MemoryGraphProjectionService {
         relate(entityNodes, MemoryGraphEntityType.ROOT_STEP_ID, MemoryGraphEntityType.VARIABLE_KEY, MemoryGraphRelationType.SUITE_STEP_PRODUCES_VARIABLE, evidence, context);
         relate(entityNodes, MemoryGraphEntityType.DOWNSTREAM_STEP_ID, MemoryGraphEntityType.VARIABLE_KEY, MemoryGraphRelationType.SUITE_STEP_CONSUMES_VARIABLE, evidence, context);
         relate(entityNodes, MemoryGraphEntityType.VARIABLE_KEY, MemoryGraphEntityType.SOURCE_PATH, MemoryGraphRelationType.VARIABLE_EXTRACTED_FROM_SOURCE_PATH, evidence, context);
+        relate(entityNodes, MemoryGraphEntityType.POLICY_REASON, MemoryGraphEntityType.TOOL_NAME, MemoryGraphRelationType.POLICY_REASON_APPLIES_TO_TOOL, evidence, context);
         relate(memoryNode, entityNodes.get(MemoryGraphEntityType.FACT_TYPE), MemoryGraphRelationType.FACT_HAS_TYPE, evidence, context);
         for (var tagNode : tagNodes) {
             relate(memoryNode, tagNode, MemoryGraphRelationType.FACT_HAS_TAG, evidence, context);
@@ -313,7 +316,8 @@ public class MemoryGraphProjectionService {
             case API_PATH -> normalizeApiPath(trimmed);
             case HTTP_METHOD -> trimmed.toUpperCase(Locale.ROOT);
             case ERROR_CODE, FAILURE_CLASSIFICATION, POLICY_REASON, FACT_TYPE -> normalizeCode(trimmed);
-            case TAG, TOOL_NAME, SYSTEM, MODULE, BUSINESS_ENTITY, VARIABLE_KEY, SOURCE_PATH, SUITE_ID, CASE_ID,
+            case TOOL_NAME -> normalizeName(trimmed);
+            case TAG, SYSTEM, MODULE, BUSINESS_ENTITY, VARIABLE_KEY, SOURCE_PATH, SUITE_ID, CASE_ID,
                 ROOT_STEP_ID, DOWNSTREAM_STEP_ID, PRECONDITION -> normalizeGeneral(trimmed);
             case MEMORY_FACT -> trimmed;
         };
@@ -328,6 +332,14 @@ public class MemoryGraphProjectionService {
 
     private static String normalizeCode(String value) {
         return value.trim().replace('-', '_').replaceAll("\\s+", "_").toUpperCase(Locale.ROOT);
+    }
+
+    private static String normalizeName(String value) {
+        return value.trim()
+            .replaceAll("([a-z0-9])([A-Z])", "$1 $2")
+            .replaceAll("[-_]+", " ")
+            .replaceAll("\\s+", " ")
+            .toLowerCase(Locale.ROOT);
     }
 
     private static String normalizeApiPath(String value) {
