@@ -22,6 +22,7 @@ import java.util.regex.Pattern;
 import java.util.function.Supplier;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
 
 @Service
 public class KnowledgeRetrievalApplicationService {
@@ -748,6 +749,7 @@ public class KnowledgeRetrievalApplicationService {
             var evidence = new KnowledgeRouteEvidence(
                 routeName,
                 scoredHit.variant().deterministicId(),
+                scoredHit.variant().intent() == null ? null : scoredHit.variant().intent().name(),
                 index + 1,
                 scoredHit.score(),
                 scoredHit.matchReason()
@@ -1377,6 +1379,9 @@ public class KnowledgeRetrievalApplicationService {
         var metadata = new LinkedHashMap<String, Object>();
         metadata.put("routeName", evidence.routeName());
         metadata.put("queryVariantId", evidence.queryVariantId());
+        if (StringUtils.hasText(evidence.queryIntent())) {
+            metadata.put("queryIntent", evidence.queryIntent());
+        }
         metadata.put("routeRank", evidence.routeRank());
         metadata.put("routeScore", evidence.routeScore());
         metadata.put("matchReason", evidence.matchReason());
@@ -1524,6 +1529,11 @@ public class KnowledgeRetrievalApplicationService {
                 .toList());
             metadata.put("queryVariantIds", evidence.stream()
                 .map(KnowledgeRouteEvidence::queryVariantId)
+                .distinct()
+                .toList());
+            metadata.put("queryVariantIntents", evidence.stream()
+                .map(KnowledgeRouteEvidence::queryIntent)
+                .filter(StringUtils::hasText)
                 .distinct()
                 .toList());
             metadata.put("preFusionRoute", bestEvidence.routeName());
