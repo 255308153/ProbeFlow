@@ -146,6 +146,7 @@ public class KnowledgeRetrievalApplicationService {
         ));
 
         if (routeCandidates.isEmpty()) {
+            diagnostics.add("knowledge-low-coverage:all-routes-empty");
             return new KnowledgeRetrievalResult(
                 normalized.rawQuery(),
                 List.of(),
@@ -159,7 +160,13 @@ public class KnowledgeRetrievalApplicationService {
         }
 
         var merged = mergeRouteCandidates(routeCandidates, diagnostics, normalized.limit());
-        var constrained = applyLimitAndTokenBudget(merged, normalized.limit(), normalized.tokenBudget());
+        var confidenceEligible = filterDefaultLowConfidence(merged, diagnostics);
+        var constrained = applyLimitAndTokenBudget(confidenceEligible, normalized.limit(), normalized.tokenBudget());
+        if (constrained.isEmpty()) {
+            diagnostics.add(confidenceEligible.isEmpty()
+                ? "knowledge-low-coverage:all-candidates-filtered"
+                : "knowledge-low-coverage:budget-pruned-all-candidates");
+        }
         var lowConfidence = constrained.isEmpty() || constrained.getFirst().lowConfidence();
         var coverage = constrained.isEmpty() ? 0.0d : (lowConfidence ? 0.4d : 1.0d);
         var context = assembleKnowledgeContext(constrained, coverage, lowConfidence);
@@ -840,6 +847,20 @@ public class KnowledgeRetrievalApplicationService {
             .toList();
     }
 
+    private List<KnowledgeRetrievalHit> filterDefaultLowConfidence(
+        List<KnowledgeRetrievalHit> hits,
+        List<String> diagnostics
+    ) {
+        var eligible = hits.stream()
+            .filter(hit -> !hit.lowConfidence())
+            .toList();
+        var filtered = hits.size() - eligible.size();
+        if (filtered > 0) {
+            diagnostics.add("knowledge-low-confidence-filtered:" + filtered);
+        }
+        return eligible;
+    }
+
     private KnowledgeRouteEvidence fallbackRouteEvidence(KnowledgeRetrievalHit hit) {
         var metadataRank = hit.metadata().get("candidateRank");
         var rank = metadataRank instanceof Number number ? Math.max(1, number.intValue()) : 1;
@@ -1001,8 +1022,8 @@ public class KnowledgeRetrievalApplicationService {
             if (constrained.size() >= limit) {
                 break;
             }
-            if (!constrained.isEmpty() && tokenCount + hit.tokenCount() > tokenBudget) {
-                break;
+            if (tokenCount + hit.tokenCount() > tokenBudget) {
+                continue;
             }
             constrained.add(hit);
             tokenCount += hit.tokenCount();

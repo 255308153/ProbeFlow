@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Supplier;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -124,13 +125,41 @@ public class LongTermMemoryRetrievalService {
         var candidates = new LinkedHashMap<String, MemoryRouteAccumulator>();
         var routeHitCount = 0;
 
-        routeHitCount += collectRouteHits(candidates, semanticRouteHits(normalized, variants, routeLimit, diagnostics), diagnostics);
-        var activeMemories = longTermMemories.findAllByStatusOrderByCreatedAtAscMemoryIdAsc(MemoryStatus.ACTIVE);
-        routeHitCount += collectRouteHits(candidates, metadataRouteHits(normalized, variants, activeMemories, routeLimit, diagnostics), diagnostics);
-        routeHitCount += collectRouteHits(candidates, exactRouteHits(variants, activeMemories, routeLimit, diagnostics), diagnostics);
-        routeHitCount += collectRouteHits(candidates, graphRouteHits(variants, routeLimit, diagnostics), diagnostics);
+        routeHitCount += collectRouteHits(candidates, runMemoryRoute(
+            SEMANTIC_ROUTE,
+            routeLimit,
+            SEMANTIC_CONFIDENCE_GATE,
+            diagnostics,
+            () -> semanticRouteHits(normalized, variants, routeLimit, diagnostics)
+        ), diagnostics);
+        routeHitCount += collectRouteHits(candidates, runMemoryRoute(
+            METADATA_ROUTE,
+            routeLimit,
+            METADATA_CONFIDENCE_GATE,
+            diagnostics,
+            () -> metadataRouteHits(normalized, variants, activeMemories(), routeLimit, diagnostics)
+        ), diagnostics);
+        routeHitCount += collectRouteHits(candidates, runMemoryRoute(
+            EXACT_ROUTE,
+            routeLimit,
+            EXACT_CONFIDENCE_GATE,
+            diagnostics,
+            () -> exactRouteHits(variants, activeMemories(), routeLimit, diagnostics)
+        ), diagnostics);
+        routeHitCount += collectRouteHits(candidates, runMemoryRoute(
+            GRAPH_ROUTE,
+            routeLimit,
+            GRAPH_CONFIDENCE_GATE,
+            diagnostics,
+            () -> graphRouteHits(variants, routeLimit, diagnostics)
+        ), diagnostics);
 
         if (candidates.isEmpty()) {
+            diagnostics.add(fusionDiagnostic(
+                normalized.limit(),
+                0,
+                "low-coverage:all-routes-empty"
+            ));
             return new LongTermMemoryRetrievalResult(List.of(), 0, 0, diagnostics);
         }
         if (routeHitCount > candidates.size()) {
@@ -161,14 +190,50 @@ public class LongTermMemoryRetrievalService {
             .limit(fusionCandidateLimit)
             .toList();
 
-        var selected = applyLimitAndBudget(fused, normalized.limit(), normalized.tokenBudget());
+        var confidenceEligible = filterDefaultLowConfidence(fused, diagnostics, normalized.limit());
+        var selected = applyLimitAndBudget(confidenceEligible, normalized.limit(), normalized.tokenBudget());
+        if (selected.isEmpty()) {
+            diagnostics.add(fusionDiagnostic(
+                normalized.limit(),
+                confidenceEligible.size(),
+                confidenceEligible.isEmpty()
+                    ? "low-coverage:all-candidates-filtered"
+                    : "low-coverage:budget-pruned-all-candidates"
+            ));
+        }
         selected = touchSelected(selected);
         return new LongTermMemoryRetrievalResult(
             selected,
-            fused.size(),
+            confidenceEligible.size(),
             selected.stream().mapToInt(LongTermMemoryRetrievalHit::tokenCount).sum(),
             diagnostics
         );
+    }
+
+    private List<LongTermMemory> activeMemories() {
+        return longTermMemories.findAllByStatusOrderByCreatedAtAscMemoryIdAsc(MemoryStatus.ACTIVE);
+    }
+
+    private List<RouteHit> runMemoryRoute(
+        String routeName,
+        int routeLimit,
+        double confidenceGate,
+        List<RetrievalRouteDiagnostic> diagnostics,
+        Supplier<List<RouteHit>> route
+    ) {
+        try {
+            return route.get();
+        } catch (RuntimeException exception) {
+            diagnostics.add(routeDiagnostic(
+                routeName,
+                null,
+                routeLimit,
+                confidenceGate,
+                0,
+                "route-failed:fallback"
+            ));
+            return List.of();
+        }
     }
 
     private List<QueryVariant> memoryVariants(List<QueryVariant> queryVariants, LongTermMemoryQuery query) {
@@ -489,6 +554,25 @@ public class LongTermMemoryRetrievalService {
                 .add(routeHitForFusion);
         }
         return routeHits.size();
+    }
+
+    private List<LongTermMemoryRetrievalHit> filterDefaultLowConfidence(
+        List<LongTermMemoryRetrievalHit> hits,
+        List<RetrievalRouteDiagnostic> diagnostics,
+        int routeLimit
+    ) {
+        var eligible = hits.stream()
+            .filter(hit -> !hit.lowConfidence())
+            .toList();
+        var filtered = hits.size() - eligible.size();
+        if (filtered > 0) {
+            diagnostics.add(fusionDiagnostic(
+                routeLimit,
+                filtered,
+                "low-confidence-filtered:" + filtered
+            ));
+        }
+        return eligible;
     }
 
     private boolean hasMetadataFilter(LongTermMemoryQuery baseQuery, QueryFilters filters) {
