@@ -68,6 +68,46 @@ public class MemoryGraphQueryService {
         );
     }
 
+    @Transactional(readOnly = true)
+    public List<MemoryGraphAuditRelation> queryAuditRelations(MemoryGraphSeed seed, int limit) {
+        var normalized = normalizeSeed(seed);
+        if (normalized == null) {
+            return List.of();
+        }
+        var seedNodes = StringUtils.hasText(normalized.scope())
+            ? nodes.findByEntityTypeAndNormalizedValueAndScope(normalized.entityType(), normalized.value(), normalized.scope()).stream().toList()
+            : nodes.findAllByEntityTypeAndNormalizedValue(normalized.entityType(), normalized.value());
+        if (seedNodes.isEmpty()) {
+            return List.of();
+        }
+
+        var relations = new LinkedHashMap<String, MemoryGraphAuditRelation>();
+        for (var seedNode : seedNodes) {
+            for (var edge : edges.findAllBySourceNodeIdOrTargetNodeId(seedNode.getNodeId(), seedNode.getNodeId())) {
+                if (edge.getRelationType() != MemoryGraphRelationType.FACT_CONFLICTS_WITH_FACT) {
+                    continue;
+                }
+                relations.putIfAbsent(edge.getEdgeId(), new MemoryGraphAuditRelation(
+                    edge.getRelationType(),
+                    edge.getSourceNodeId(),
+                    edge.getTargetNodeId(),
+                    edge.getConfidence(),
+                    List.copyOf(edge.getSourceMemoryIds()),
+                    List.copyOf(edge.getSourceRefs()),
+                    List.copyOf(edge.getFactFingerprints()),
+                    List.copyOf(edge.getEvidenceSummaries())
+                ));
+            }
+        }
+        return relations.values().stream()
+            .sorted(Comparator
+                .comparingDouble(MemoryGraphAuditRelation::confidence).reversed()
+                .thenComparing(MemoryGraphAuditRelation::sourceNodeId)
+                .thenComparing(MemoryGraphAuditRelation::targetNodeId))
+            .limit(Math.max(1, limit))
+            .toList();
+    }
+
     private void traverse(
         MemoryGraphNode seedNode,
         int maxDepth,
@@ -132,10 +172,13 @@ public class MemoryGraphQueryService {
                 memoryId,
                 memory.getSummary(),
                 memory.getSourceRef(),
+                "graph",
                 matchReason(path),
                 List.copyOf(path),
                 confidence,
                 List.copyOf(edge.getSourceMemoryIds()),
+                List.copyOf(edge.getSourceRefs()),
+                List.copyOf(edge.getFactFingerprints()),
                 List.copyOf(edge.getEvidenceSummaries())
             );
             var existing = relatedMemories.get(memoryId);

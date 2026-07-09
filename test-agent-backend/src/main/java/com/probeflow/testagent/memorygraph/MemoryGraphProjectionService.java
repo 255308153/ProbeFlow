@@ -14,6 +14,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.TreeMap;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -45,6 +46,7 @@ public class MemoryGraphProjectionService {
         for (var memory : activeMemories) {
             project(memory, context);
         }
+        projectFactGovernance(activeMemories, context);
         return new MemoryGraphProjectionSummary(
             context.processedMemoryCount,
             context.createdNodeIds.size(),
@@ -216,7 +218,7 @@ public class MemoryGraphProjectionService {
         node.setFactFingerprints(merge(node.getFactFingerprints(), provenance.factFingerprints()));
         node.setEvidenceSummaries(merge(node.getEvidenceSummaries(), provenance.evidenceSummaries()));
         node.setOccurrenceCount(node.getSourceMemoryIds().size());
-        node.setConfidence(Math.max(node.getConfidence(), provenance.confidence()));
+        node.setConfidence(governedConfidence(Math.max(node.getConfidence(), provenance.confidence()), node.getOccurrenceCount()));
         node.setLastSeenAt(provenance.lastSeenAt());
         return nodes.save(node);
     }
@@ -247,9 +249,136 @@ public class MemoryGraphProjectionService {
         edge.setFactFingerprints(merge(edge.getFactFingerprints(), provenance.factFingerprints()));
         edge.setEvidenceSummaries(merge(edge.getEvidenceSummaries(), provenance.evidenceSummaries()));
         edge.setOccurrenceCount(edge.getSourceMemoryIds().size());
-        edge.setConfidence(Math.max(edge.getConfidence(), provenance.confidence()));
+        edge.setConfidence(governedConfidence(Math.max(edge.getConfidence(), provenance.confidence()), edge.getOccurrenceCount()));
         edge.setUpdatedAt(provenance.lastSeenAt());
         return edges.save(edge);
+    }
+
+    private void projectFactGovernance(List<LongTermMemory> memories, ProjectionContext context) {
+        for (var pair : reinforcingPairs(memories)) {
+            var source = memoryNode(pair.left());
+            var target = memoryNode(pair.right());
+            if (source != null && target != null) {
+                upsertEdge(
+                    source,
+                    target,
+                    MemoryGraphRelationType.FACT_REINFORCES_FACT,
+                    MemoryGraphProvenance.combine(pair.left(), pair.right(), "shared fact identity reinforces both long-term memories"),
+                    context
+                );
+            }
+        }
+        for (var memory : memories) {
+            for (var targetMemoryId : conflictTargetMemoryIds(memory)) {
+                var source = memoryNode(memory);
+                var target = nodes.findById(nodeId(MemoryGraphEntityType.MEMORY_FACT, targetMemoryId, null)).orElse(null);
+                if (source != null && target != null && !source.getNodeId().equals(target.getNodeId())) {
+                    upsertEdge(
+                        source,
+                        target,
+                        MemoryGraphRelationType.FACT_CONFLICTS_WITH_FACT,
+                        MemoryGraphProvenance.from(memory).withEvidence("identity conflict audit points to " + targetMemoryId),
+                        context
+                    );
+                }
+            }
+        }
+    }
+
+    private List<MemoryPair> reinforcingPairs(List<LongTermMemory> memories) {
+        var pairs = new LinkedHashMap<String, MemoryPair>();
+        for (int leftIndex = 0; leftIndex < memories.size(); leftIndex++) {
+            for (int rightIndex = leftIndex + 1; rightIndex < memories.size(); rightIndex++) {
+                var left = memories.get(leftIndex);
+                var right = memories.get(rightIndex);
+                if (reinforces(left, right)) {
+                    var orderedLeft = left.getMemoryId().compareTo(right.getMemoryId()) <= 0 ? left : right;
+                    var orderedRight = orderedLeft == left ? right : left;
+                    pairs.putIfAbsent(orderedLeft.getMemoryId() + "|" + orderedRight.getMemoryId(), new MemoryPair(orderedLeft, orderedRight));
+                }
+            }
+        }
+        return List.copyOf(pairs.values());
+    }
+
+    private boolean reinforces(LongTermMemory left, LongTermMemory right) {
+        var leftMetadata = metadata(left);
+        var rightMetadata = metadata(right);
+        return intersects(values(leftMetadata.get("factFingerprint"), leftMetadata.get("mergedFactFingerprints")), values(rightMetadata.get("factFingerprint"), rightMetadata.get("mergedFactFingerprints")))
+            || intersects(values(leftMetadata.get("sourceRef"), leftMetadata.get("mergedSourceRefs"), left.getSourceRef()), values(rightMetadata.get("sourceRef"), rightMetadata.get("mergedSourceRefs"), right.getSourceRef()))
+            || identitySignature(leftMetadata).equals(identitySignature(rightMetadata)) && !identitySignature(leftMetadata).isEmpty();
+    }
+
+    private List<String> conflictTargetMemoryIds(LongTermMemory memory) {
+        var metadata = metadata(memory);
+        var targets = new LinkedHashSet<String>();
+        collectValue(targets, metadata.get("conflictsWithMemoryId"));
+        collectValue(targets, metadata.get("conflictingMemoryId"));
+        collectValue(targets, metadata.get("conflictMemoryIds"));
+        collectConflictAuditTargets(targets, metadata.get("identityConflictAudit"));
+        collectConflictAuditTargets(targets, metadata.get("conflictAudit"));
+        targets.remove(memory.getMemoryId());
+        return List.copyOf(targets);
+    }
+
+    private void collectConflictAuditTargets(LinkedHashSet<String> targets, Object raw) {
+        if (raw instanceof Map<?, ?> audit) {
+            collectValue(targets, audit.get("existingMemoryId"));
+            collectValue(targets, audit.get("conflictingMemoryId"));
+            collectValue(targets, audit.get("conflictsWithMemoryId"));
+            collectValue(targets, audit.get("memoryId"));
+        } else if (raw instanceof List<?> list) {
+            for (var item : list) {
+                collectConflictAuditTargets(targets, item);
+            }
+        }
+    }
+
+    private MemoryGraphNode memoryNode(LongTermMemory memory) {
+        return nodes.findById(nodeId(MemoryGraphEntityType.MEMORY_FACT, memory.getMemoryId(), null)).orElse(null);
+    }
+
+    private List<String> values(Object... rawValues) {
+        var values = new LinkedHashSet<String>();
+        for (var raw : rawValues) {
+            collectValue(values, raw);
+        }
+        return List.copyOf(values);
+    }
+
+    private void collectValue(LinkedHashSet<String> values, Object raw) {
+        if (raw instanceof List<?> list) {
+            for (var item : list) {
+                collectValue(values, item);
+            }
+            return;
+        }
+        if (raw != null && StringUtils.hasText(raw.toString())) {
+            values.add(raw.toString().trim());
+        }
+    }
+
+    private boolean intersects(List<String> left, List<String> right) {
+        var normalizedLeft = left.stream().map(MemoryGraphProjectionService::normalizeGeneral).collect(java.util.stream.Collectors.toSet());
+        return right.stream().map(MemoryGraphProjectionService::normalizeGeneral).anyMatch(normalizedLeft::contains);
+    }
+
+    private String identitySignature(Map<String, Object> metadata) {
+        var identityHints = metadata.get("identityHints");
+        if (!(identityHints instanceof Map<?, ?> hints) || hints.isEmpty()) {
+            return "";
+        }
+        var normalized = new TreeMap<String, String>();
+        for (var entry : hints.entrySet()) {
+            if (entry.getKey() != null && entry.getValue() != null && StringUtils.hasText(entry.getValue().toString())) {
+                normalized.put(entry.getKey().toString(), normalizeGeneral(entry.getValue().toString()));
+            }
+        }
+        return normalized.toString();
+    }
+
+    private double governedConfidence(double baseConfidence, int occurrenceCount) {
+        return Math.min(0.98d, baseConfidence + Math.min(0.08d, Math.max(0, occurrenceCount - 1) * 0.02d));
     }
 
     private void relate(
@@ -399,6 +528,9 @@ public class MemoryGraphProjectionService {
         private final List<String> warnings = new ArrayList<>();
     }
 
+    private record MemoryPair(LongTermMemory left, LongTermMemory right) {
+    }
+
     private record MemoryGraphProvenance(
         List<String> sourceMemoryIds,
         List<String> sourceRefs,
@@ -421,6 +553,7 @@ public class MemoryGraphProjectionService {
             var evidenceSummaries = new LinkedHashSet<String>();
             collect(evidenceSummaries, metadata.get("evidenceSummary"));
             collect(evidenceSummaries, metadata.get("evidenceSummaries"));
+            collectEvidenceLedger(evidenceSummaries, metadata.get("evidenceLedger"));
             if (evidenceSummaries.isEmpty()) {
                 collect(evidenceSummaries, memory.getSummary());
             }
@@ -430,15 +563,48 @@ public class MemoryGraphProjectionService {
                 List.copyOf(sourceRefs),
                 List.copyOf(factFingerprints),
                 List.copyOf(evidenceSummaries),
-                confidence(memory),
+                confidence(memory, evidenceSummaries.size()),
                 memory.getUpdatedAt() == null ? Instant.now() : memory.getUpdatedAt()
             );
         }
 
-        private static double confidence(LongTermMemory memory) {
+        private static MemoryGraphProvenance combine(LongTermMemory left, LongTermMemory right, String evidenceSummary) {
+            return from(left).merge(from(right)).withEvidence(evidenceSummary);
+        }
+
+        private MemoryGraphProvenance merge(MemoryGraphProvenance other) {
+            return new MemoryGraphProvenance(
+                mergeLists(sourceMemoryIds, other.sourceMemoryIds),
+                mergeLists(sourceRefs, other.sourceRefs),
+                mergeLists(factFingerprints, other.factFingerprints),
+                mergeLists(evidenceSummaries, other.evidenceSummaries),
+                Math.max(confidence, other.confidence),
+                lastSeenAt.isAfter(other.lastSeenAt) ? lastSeenAt : other.lastSeenAt
+            );
+        }
+
+        private MemoryGraphProvenance withEvidence(String evidenceSummary) {
+            var summaries = new LinkedHashSet<>(evidenceSummaries);
+            if (StringUtils.hasText(evidenceSummary)) {
+                summaries.add(evidenceSummary);
+            }
+            return new MemoryGraphProvenance(
+                sourceMemoryIds,
+                sourceRefs,
+                factFingerprints,
+                List.copyOf(summaries),
+                confidence,
+                lastSeenAt
+            );
+        }
+
+        private static double confidence(LongTermMemory memory, int evidenceCount) {
             var memoryConfidence = memory.getConfidence() == null ? 0.55d : memory.getConfidence();
             var importance = memory.getImportance() == null ? 0.50d : memory.getImportance();
-            return Math.min(0.98d, (memoryConfidence * 0.70d) + (importance * 0.20d) + 0.10d);
+            var metadata = memory.getMetadata() == null ? Map.<String, Object>of() : memory.getMetadata();
+            var humanConfirmed = humanConfirmed(memory, metadata) ? 0.05d : 0.0d;
+            var evidenceBonus = Math.min(0.08d, Math.max(0, evidenceCount - 1) * 0.02d);
+            return Math.min(0.98d, (memoryConfidence * 0.65d) + (importance * 0.20d) + 0.07d + evidenceBonus + humanConfirmed);
         }
 
         private static void collect(LinkedHashSet<String> values, Object raw) {
@@ -451,6 +617,35 @@ public class MemoryGraphProjectionService {
             if (raw != null && StringUtils.hasText(raw.toString())) {
                 values.add(raw.toString().trim());
             }
+        }
+
+        private static void collectEvidenceLedger(LinkedHashSet<String> values, Object raw) {
+            if (raw instanceof List<?> list) {
+                for (var item : list) {
+                    collectEvidenceLedger(values, item);
+                }
+                return;
+            }
+            if (raw instanceof Map<?, ?> evidence) {
+                collect(values, evidence.get("summary"));
+                collect(values, evidence.get("evidenceSummary"));
+                collect(values, evidence.get("sourceRef"));
+            }
+        }
+
+        private static boolean humanConfirmed(LongTermMemory memory, Map<String, Object> metadata) {
+            return memory.getTags().stream()
+                .map(tag -> tag.toLowerCase(Locale.ROOT))
+                .anyMatch(tag -> tag.equals("human-feedback") || tag.equals("human-approved") || tag.equals("human-confirmed"))
+                || Boolean.TRUE.equals(metadata.get("humanConfirmed"))
+                || "approved".equalsIgnoreCase(String.valueOf(metadata.get("humanDecision")));
+        }
+
+        private static List<String> mergeLists(List<String> left, List<String> right) {
+            var merged = new LinkedHashSet<String>();
+            merged.addAll(left);
+            merged.addAll(right);
+            return List.copyOf(merged);
         }
     }
 }
