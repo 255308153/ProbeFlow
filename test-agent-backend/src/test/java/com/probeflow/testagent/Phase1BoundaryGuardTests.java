@@ -62,6 +62,7 @@ class Phase1BoundaryGuardTests {
             "orchestration",
             "policyvalidator",
             "replanning",
+            "rerank",
             "report",
             "sourcematerial",
             "suitedraft",
