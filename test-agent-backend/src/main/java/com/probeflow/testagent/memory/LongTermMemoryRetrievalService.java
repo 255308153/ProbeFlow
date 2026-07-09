@@ -33,6 +33,7 @@ public class LongTermMemoryRetrievalService {
     private static final int DEFAULT_LIMIT = 6;
     private static final int DEFAULT_TOKEN_BUDGET = 800;
     private static final int DEFAULT_ROUTE_LIMIT = 6;
+    private static final double FUSION_RANK_CONSTANT = 60.0d;
     private static final double SEMANTIC_CONFIDENCE_GATE = 0.55d;
     private static final double METADATA_CONFIDENCE_GATE = 0.55d;
     private static final double EXACT_CONFIDENCE_GATE = 0.65d;
@@ -121,25 +122,43 @@ public class LongTermMemoryRetrievalService {
         var routeLimit = routeLimit(normalized.limit());
         var diagnostics = new ArrayList<RetrievalRouteDiagnostic>();
         var candidates = new LinkedHashMap<String, MemoryRouteAccumulator>();
+        var routeHitCount = 0;
 
-        collectRouteHits(candidates, semanticRouteHits(normalized, variants, routeLimit, diagnostics));
+        routeHitCount += collectRouteHits(candidates, semanticRouteHits(normalized, variants, routeLimit, diagnostics), diagnostics);
         var activeMemories = longTermMemories.findAllByStatusOrderByCreatedAtAscMemoryIdAsc(MemoryStatus.ACTIVE);
-        collectRouteHits(candidates, metadataRouteHits(normalized, variants, activeMemories, routeLimit, diagnostics));
-        collectRouteHits(candidates, exactRouteHits(variants, activeMemories, routeLimit, diagnostics));
-        collectRouteHits(candidates, graphRouteHits(variants, routeLimit, diagnostics));
+        routeHitCount += collectRouteHits(candidates, metadataRouteHits(normalized, variants, activeMemories, routeLimit, diagnostics), diagnostics);
+        routeHitCount += collectRouteHits(candidates, exactRouteHits(variants, activeMemories, routeLimit, diagnostics), diagnostics);
+        routeHitCount += collectRouteHits(candidates, graphRouteHits(variants, routeLimit, diagnostics), diagnostics);
 
         if (candidates.isEmpty()) {
             return new LongTermMemoryRetrievalResult(List.of(), 0, 0, diagnostics);
         }
+        if (routeHitCount > candidates.size()) {
+            diagnostics.add(fusionDiagnostic(
+                normalized.limit(),
+                candidates.size(),
+                "deduplicated-routes:" + (routeHitCount - candidates.size())
+            ));
+        }
 
-        var fused = candidates.values().stream()
+        var fusionCandidateLimit = fusionCandidateLimit(normalized.limit());
+        var fusedCandidates = candidates.values().stream()
             .map(this::fusedHit)
             .sorted(Comparator
                 .comparingDouble(LongTermMemoryRetrievalHit::score).reversed()
                 .thenComparing(hit -> hit.routeEvidence().size(), Comparator.reverseOrder())
                 .thenComparing(LongTermMemoryRetrievalHit::summary)
                 .thenComparing(LongTermMemoryRetrievalHit::memoryId))
-            .limit(Math.max(normalized.limit() * 4, 24))
+            .toList();
+        if (fusedCandidates.size() > fusionCandidateLimit) {
+            diagnostics.add(fusionDiagnostic(
+                fusionCandidateLimit,
+                fusedCandidates.size(),
+                "candidate-limit-applied:" + fusionCandidateLimit
+            ));
+        }
+        var fused = fusedCandidates.stream()
+            .limit(fusionCandidateLimit)
             .toList();
 
         var selected = applyLimitAndBudget(fused, normalized.limit(), normalized.tokenBudget());
@@ -443,17 +462,33 @@ public class LongTermMemoryRetrievalService {
         return Math.max(1, Math.min(Math.max(requestedLimit, DEFAULT_ROUTE_LIMIT), DEFAULT_ROUTE_LIMIT));
     }
 
+    private int fusionCandidateLimit(int finalLimit) {
+        return Math.max(finalLimit * 4, 24);
+    }
+
     private boolean usableMemory(LongTermMemory memory, double confidenceGate) {
         return memory.getStatus() == MemoryStatus.ACTIVE
             && (memory.getConfidence() == null || memory.getConfidence() >= confidenceGate);
     }
 
-    private void collectRouteHits(Map<String, MemoryRouteAccumulator> candidates, List<RouteHit> routeHits) {
+    private int collectRouteHits(
+        Map<String, MemoryRouteAccumulator> candidates,
+        List<RouteHit> routeHits,
+        List<RetrievalRouteDiagnostic> diagnostics
+    ) {
         for (var routeHit : routeHits) {
+            var routeHitForFusion = routeHit;
+            if (routeHit.evidence() == null) {
+                diagnostics.add(fusionDiagnostic(1, 0, "missing-route-evidence"));
+                routeHitForFusion = new RouteHit(routeHit.hit(), fallbackRouteEvidence(routeHit.hit()));
+            }
+            var memoryId = routeHitForFusion.hit().memoryId();
+            var firstHit = routeHitForFusion.hit();
             candidates
-                .computeIfAbsent(routeHit.hit().memoryId(), ignored -> new MemoryRouteAccumulator(routeHit.hit()))
-                .add(routeHit);
+                .computeIfAbsent(memoryId, ignored -> new MemoryRouteAccumulator(firstHit))
+                .add(routeHitForFusion);
         }
+        return routeHits.size();
     }
 
     private boolean hasMetadataFilter(LongTermMemoryQuery baseQuery, QueryFilters filters) {
@@ -693,16 +728,40 @@ public class LongTermMemoryRetrievalService {
         for (var hit : accumulator.hits()) {
             copyGraphMetadata(metadata, hit.metadata());
         }
+        var bestEvidence = routeEvidence.stream()
+            .min(Comparator
+                .comparingInt(RetrievalRouteEvidence::routeRank)
+                .thenComparing(RetrievalRouteEvidence::routeName))
+            .orElseGet(() -> fallbackRouteEvidence(bestHit));
         metadata.put("retrievalRoutes", routeNames);
         metadata.put("queryVariantIds", queryVariantIds);
         metadata.put("routeEvidence", routeEvidenceView(routeEvidence));
+        metadata.put("preFusionRoute", bestEvidence.routeName());
+        metadata.put("preFusionRank", bestEvidence.routeRank());
+        metadata.put("preFusionRanks", routeEvidence.stream()
+            .collect(java.util.stream.Collectors.toMap(
+                item -> item.routeName() + ":" + item.queryVariantId(),
+                RetrievalRouteEvidence::routeRank,
+                (left, right) -> left,
+                LinkedHashMap::new
+            )));
+        metadata.putIfAbsent("candidateRank", bestEvidence.routeRank());
         metadata.put("fusedScore", fusedScore);
+        metadata.put("fusionExplanation", fusionExplanation(routeEvidence, fusedScore));
 
         var componentScores = new LinkedHashMap<>(bestHit.componentScores());
         for (var evidence : routeEvidence) {
-            componentScores.put("route." + evidence.routeName(), evidence.routeScore());
+            componentScores.merge("route." + evidence.routeName(), evidence.routeScore(), Math::max);
         }
         componentScores.put("routeAgreement", Math.min(1.0d, routeNames.size() / 4.0d));
+        componentScores.put("rankContribution", routeEvidence.stream()
+            .mapToDouble(this::rankContribution)
+            .sum());
+        var matchReasons = new LinkedHashSet<>(accumulator.matchReasons());
+        matchReasons.add("route-fusion");
+        if (routeEvidence.size() > 1) {
+            matchReasons.add("route-agreement");
+        }
 
         return new LongTermMemoryRetrievalHit(
             bestHit.memoryId(),
@@ -722,19 +781,37 @@ public class LongTermMemoryRetrievalService {
             bestHit.tokenCount(),
             fusedScore,
             Map.copyOf(componentScores),
-            List.copyOf(accumulator.matchReasons()),
-            bestHit.lowConfidence() || fusedScore < 0.35d,
+            List.copyOf(matchReasons),
+            fusedScore < 0.35d,
             routeEvidence
         );
     }
 
     private double fusedScore(List<RetrievalRouteEvidence> routeEvidence) {
-        var best = routeEvidence.stream()
-            .mapToDouble(evidence -> evidence.routeScore() * routeWeight(evidence.routeName()))
+        var bestWeighted = routeEvidence.stream()
+            .mapToDouble(this::weightedRouteScore)
             .max()
             .orElse(0.0d);
-        var agreementBonus = Math.min(0.15d, Math.max(0, routeEvidence.size() - 1) * 0.05d);
-        return best + agreementBonus;
+        var rankContributionTotal = routeEvidence.stream()
+            .mapToDouble(this::rankContribution)
+            .sum();
+        return Math.min(1.0d, bestWeighted + rankContributionTotal + routeAgreementBonus(routeEvidence));
+    }
+
+    private double weightedRouteScore(RetrievalRouteEvidence evidence) {
+        return evidence.routeScore() * routeWeight(evidence.routeName());
+    }
+
+    private double rankContribution(RetrievalRouteEvidence evidence) {
+        return routeWeight(evidence.routeName()) / (FUSION_RANK_CONSTANT + evidence.routeRank());
+    }
+
+    private double routeAgreementBonus(List<RetrievalRouteEvidence> routeEvidence) {
+        var routeCount = routeEvidence.stream()
+            .map(RetrievalRouteEvidence::routeName)
+            .distinct()
+            .count();
+        return Math.min(0.15d, Math.max(0L, routeCount - 1L) * 0.05d);
     }
 
     private double routeWeight(String routeName) {
@@ -745,6 +822,30 @@ public class LongTermMemoryRetrievalService {
             case GRAPH_ROUTE -> 0.85d;
             default -> 0.80d;
         };
+    }
+
+    private Map<String, Object> fusionExplanation(List<RetrievalRouteEvidence> routeEvidence, double fusedScore) {
+        var routeWeights = new LinkedHashMap<String, Double>();
+        var rankContributions = new LinkedHashMap<String, Double>();
+        var preFusionRanks = new LinkedHashMap<String, Integer>();
+        for (var evidence : routeEvidence) {
+            var key = evidence.routeName() + ":" + evidence.queryVariantId();
+            routeWeights.putIfAbsent(evidence.routeName(), routeWeight(evidence.routeName()));
+            rankContributions.put(key, rankContribution(evidence));
+            preFusionRanks.put(key, evidence.routeRank());
+        }
+        var explanation = new LinkedHashMap<String, Object>();
+        explanation.put("formula", "bestWeightedRouteScore + rankContributionTotal + routeAgreementBonus");
+        explanation.put("routeCount", routeEvidence.size());
+        explanation.put("routeNames", routeEvidence.stream().map(RetrievalRouteEvidence::routeName).distinct().toList());
+        explanation.put("routeWeights", routeWeights);
+        explanation.put("preFusionRanks", preFusionRanks);
+        explanation.put("rankContributions", rankContributions);
+        explanation.put("bestWeightedRouteScore", routeEvidence.stream().mapToDouble(this::weightedRouteScore).max().orElse(0.0d));
+        explanation.put("rankContributionTotal", routeEvidence.stream().mapToDouble(this::rankContribution).sum());
+        explanation.put("routeAgreementBonus", routeAgreementBonus(routeEvidence));
+        explanation.put("fusedScore", fusedScore);
+        return Map.copyOf(explanation);
     }
 
     private void copyGraphMetadata(Map<String, Object> target, Map<String, Object> source) {
@@ -772,10 +873,26 @@ public class LongTermMemoryRetrievalService {
                 value.put("routeRank", evidence.routeRank());
                 value.put("routeScore", evidence.routeScore());
                 value.put("matchReason", evidence.matchReason());
+                value.put("routeWeight", routeWeight(evidence.routeName()));
+                value.put("weightedRouteScore", weightedRouteScore(evidence));
+                value.put("rankContribution", rankContribution(evidence));
                 value.put("sourceEvidence", evidence.sourceEvidence());
                 return Map.copyOf(value);
             })
             .toList();
+    }
+
+    private RetrievalRouteEvidence fallbackRouteEvidence(LongTermMemoryRetrievalHit hit) {
+        var metadataRank = hit.metadata().get("candidateRank");
+        var rank = metadataRank instanceof Number number ? Math.max(1, number.intValue()) : 1;
+        return new RetrievalRouteEvidence(
+            "unknown_memory_route",
+            "qv-unknown",
+            rank,
+            Math.max(0.0d, hit.score()),
+            "missing route evidence fallback",
+            Map.of("memoryId", hit.memoryId())
+        );
     }
 
     private RetrievalRouteEvidence routeEvidence(
@@ -809,6 +926,21 @@ public class LongTermMemoryRetrievalService {
             variant == null ? null : variant.deterministicId(),
             routeLimit,
             confidenceGate,
+            candidateCount,
+            diagnostic
+        );
+    }
+
+    private RetrievalRouteDiagnostic fusionDiagnostic(
+        int routeLimit,
+        int candidateCount,
+        String diagnostic
+    ) {
+        return new RetrievalRouteDiagnostic(
+            "route_fusion",
+            null,
+            routeLimit,
+            0.0d,
             candidateCount,
             diagnostic
         );
