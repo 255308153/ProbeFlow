@@ -3,6 +3,10 @@ package com.probeflow.testagent.memory;
 import com.probeflow.testagent.knowledge.EmbeddingService;
 import com.probeflow.testagent.knowledge.EmbeddingProfileMetadata;
 import com.probeflow.testagent.knowledge.EmbeddingValidation;
+import com.probeflow.testagent.memorygraph.MemoryGraphEntityType;
+import com.probeflow.testagent.memorygraph.MemoryGraphQueryService;
+import com.probeflow.testagent.memorygraph.MemoryGraphRelatedMemory;
+import com.probeflow.testagent.memorygraph.MemoryGraphSeed;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -12,6 +16,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -24,6 +29,18 @@ public class LongTermMemoryRetrievalService {
 
     private final LongTermMemoryRepository longTermMemories;
     private final EmbeddingService embeddingService;
+    private final MemoryGraphQueryService graphQueryService;
+
+    @Autowired
+    public LongTermMemoryRetrievalService(
+        LongTermMemoryRepository longTermMemories,
+        EmbeddingService embeddingService,
+        MemoryGraphQueryService graphQueryService
+    ) {
+        this.longTermMemories = longTermMemories;
+        this.embeddingService = embeddingService;
+        this.graphQueryService = graphQueryService;
+    }
 
     public LongTermMemoryRetrievalService(
         LongTermMemoryRepository longTermMemories,
@@ -31,6 +48,7 @@ public class LongTermMemoryRetrievalService {
     ) {
         this.longTermMemories = longTermMemories;
         this.embeddingService = embeddingService;
+        this.graphQueryService = null;
     }
 
     @Transactional
@@ -67,13 +85,143 @@ public class LongTermMemoryRetrievalService {
                 .thenComparing(LongTermMemoryRetrievalHit::memoryId))
             .toList();
 
-        var selected = applyLimitAndBudget(ranked, normalized.limit(), normalized.tokenBudget());
+        var expanded = appendGraphExpandedHits(ranked, normalized);
+        var selected = applyLimitAndBudget(expanded, normalized.limit(), normalized.tokenBudget());
         selected = touchSelected(selected);
         return new LongTermMemoryRetrievalResult(
             selected,
-            ranked.size(),
+            expanded.size(),
             selected.stream().mapToInt(LongTermMemoryRetrievalHit::tokenCount).sum()
         );
+    }
+
+    private List<LongTermMemoryRetrievalHit> appendGraphExpandedHits(List<LongTermMemoryRetrievalHit> ranked, LongTermMemoryQuery query) {
+        if (graphQueryService == null || ranked.isEmpty()) {
+            return ranked;
+        }
+        var existingMemoryIds = ranked.stream()
+            .map(LongTermMemoryRetrievalHit::memoryId)
+            .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+        var graphHits = new LinkedHashMap<String, LongTermMemoryRetrievalHit>();
+        var seedHits = ranked.stream().limit(Math.max(1, Math.min(query.limit(), 8))).toList();
+        for (var seedHit : seedHits) {
+            for (var seed : graphSeeds(seedHit)) {
+                var graphResult = graphQueryService.queryRelated(seed, 2, Math.max(query.limit() * 3, 12));
+                for (var related : graphResult.relatedMemories()) {
+                    if (existingMemoryIds.contains(related.memoryId()) || graphHits.containsKey(related.memoryId())) {
+                        continue;
+                    }
+                    longTermMemories.findById(related.memoryId())
+                        .filter(memory -> memory.getStatus() == MemoryStatus.ACTIVE)
+                        .map(memory -> graphHit(memory, related))
+                        .ifPresent(hit -> graphHits.put(hit.memoryId(), hit));
+                }
+            }
+        }
+        if (graphHits.isEmpty()) {
+            return ranked;
+        }
+        var combined = new ArrayList<LongTermMemoryRetrievalHit>(ranked);
+        combined.addAll(graphHits.values().stream()
+            .sorted(Comparator
+                .comparingDouble(LongTermMemoryRetrievalHit::score).reversed()
+                .thenComparing(LongTermMemoryRetrievalHit::summary)
+                .thenComparing(LongTermMemoryRetrievalHit::memoryId))
+            .toList());
+        return List.copyOf(combined);
+    }
+
+    private LongTermMemoryRetrievalHit graphHit(LongTermMemory memory, MemoryGraphRelatedMemory related) {
+        var metadata = new LinkedHashMap<>(memory.getMetadata());
+        metadata.put("retrievalChannel", "graph");
+        metadata.put("graphMatchReason", related.matchReason());
+        metadata.put("graphRelationPath", related.relationPath());
+        metadata.put("graphRelationConfidence", related.confidence());
+        metadata.put("graphSourceMemoryIds", related.sourceMemoryIds());
+        metadata.put("graphSourceRefs", related.sourceRefs());
+        metadata.put("graphFactFingerprints", related.factFingerprints());
+        metadata.put("graphEvidenceSummaries", related.evidenceSummaries());
+        var pathScore = 1.0d / Math.max(1, related.relationPath().size());
+        var memoryConfidence = memory.getConfidence() == null ? 0.55d : memory.getConfidence();
+        var importance = memory.getImportance() == null ? 0.50d : memory.getImportance();
+        var success = memory.getSuccessContribution() == null ? 0.50d : memory.getSuccessContribution();
+        var componentScores = new LinkedHashMap<String, Double>();
+        componentScores.put("graphRelation", related.confidence() * 0.50d);
+        componentScores.put("graphPath", pathScore * 0.15d);
+        componentScores.put("confidence", memoryConfidence * 0.15d);
+        componentScores.put("importance", importance * 0.10d);
+        componentScores.put("successContribution", success * 0.10d);
+        var score = componentScores.values().stream().mapToDouble(Double::doubleValue).sum();
+        return new LongTermMemoryRetrievalHit(
+            memory.getMemoryId(),
+            memory.getScopeType(),
+            memory.getSummary(),
+            memory.getContent(),
+            memory.getFullContent(),
+            List.copyOf(memory.getTags()),
+            memory.getSourceType(),
+            memory.getSourceRef(),
+            memory.getConfidence(),
+            memory.getImportance(),
+            memory.getSuccessContribution(),
+            memory.getHitCount(),
+            memory.getLastUsedAt(),
+            Map.copyOf(metadata),
+            estimateTokens(memory),
+            score,
+            Map.copyOf(componentScores),
+            List.of(related.matchReason()),
+            related.confidence() < MemoryGraphQueryService.DEFAULT_CONFIDENCE_GATE || score < 0.35d
+        );
+    }
+
+    private List<MemoryGraphSeed> graphSeeds(LongTermMemoryRetrievalHit hit) {
+        var seeds = new ArrayList<MemoryGraphSeed>();
+        var metadata = hit.metadata();
+        addSeed(seeds, MemoryGraphEntityType.ERROR_CODE, metadataValue(metadata, "errorCode", "error", "code"), null);
+        addSeed(seeds, MemoryGraphEntityType.API_PATH, metadataValue(metadata, "apiPath", "path", "endpoint"), null);
+        addSeed(seeds, MemoryGraphEntityType.BUSINESS_ENTITY, metadataValue(metadata, "businessEntity", "businessObject", "entity", "entityName", "resource"), null);
+        var suiteScope = suiteScope(metadata);
+        addSeed(seeds, MemoryGraphEntityType.VARIABLE_KEY, metadataValue(metadata, "variableKey", "suiteVariableKey", "targetKey"), suiteScope);
+        addSeed(seeds, MemoryGraphEntityType.POLICY_REASON, metadataValue(metadata, "policyReason", "policyReasonCode", "reasonCode", "approvalReason"), null);
+        for (var tag : hit.tags()) {
+            addSeed(seeds, MemoryGraphEntityType.TAG, tag, null);
+        }
+        return List.copyOf(seeds);
+    }
+
+    private void addSeed(List<MemoryGraphSeed> seeds, MemoryGraphEntityType entityType, String value, String scope) {
+        if (!StringUtils.hasText(value)) {
+            return;
+        }
+        var seed = new MemoryGraphSeed(entityType, value, scope);
+        if (!seeds.contains(seed)) {
+            seeds.add(seed);
+        }
+    }
+
+    private String metadataValue(Map<String, Object> metadata, String... keys) {
+        for (var key : keys) {
+            var value = metadata.get(key);
+            if (value != null && StringUtils.hasText(value.toString())) {
+                return value.toString();
+            }
+        }
+        var identityHints = metadata.get("identityHints");
+        if (identityHints instanceof Map<?, ?> hints) {
+            for (var key : keys) {
+                var value = hints.get(key);
+                if (value != null && StringUtils.hasText(value.toString())) {
+                    return value.toString();
+                }
+            }
+        }
+        return null;
+    }
+
+    private String suiteScope(Map<String, Object> metadata) {
+        var suiteId = metadataValue(metadata, "suiteId", "suite");
+        return StringUtils.hasText(suiteId) ? "suite:" + suiteId.trim().toLowerCase(Locale.ROOT) : null;
     }
 
     private LongTermMemoryRetrievalHit score(
