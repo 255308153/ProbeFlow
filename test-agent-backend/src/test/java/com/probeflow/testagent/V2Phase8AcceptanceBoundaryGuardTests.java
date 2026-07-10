@@ -290,6 +290,7 @@ class V2Phase8AcceptanceBoundaryGuardTests {
             .filter(Files::isRegularFile)
             .filter(path -> path.toString().endsWith(".java"))
             .filter(path -> !path.toString().contains("/demorun/"))
+            .filter(path -> !path.toString().contains("/projectimport/"))
             .map(this::readUnchecked)
             .collect(Collectors.joining("\n"));
     }

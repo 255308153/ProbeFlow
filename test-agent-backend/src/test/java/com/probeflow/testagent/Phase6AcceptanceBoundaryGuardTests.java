@@ -20,7 +20,8 @@ class Phase6AcceptanceBoundaryGuardTests {
         "/demorun/",
         "ManualRealLlm",
         "/orchestration/",
-        "/report/"
+        "/report/",
+        "/projectimport/"
     );
 
     @Test

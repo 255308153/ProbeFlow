@@ -18,7 +18,8 @@ class Phase8AcceptanceBoundaryGuardTests {
         "/manualsuiteagent/",
         "/demorun/",
         "ManualRealLlm",
-        "/orchestration/"
+        "/orchestration/",
+        "/projectimport/"
     );
 
     @Test

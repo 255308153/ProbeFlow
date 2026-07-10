@@ -61,6 +61,12 @@ V5-5 closes the V5 read path by comparing V5-4 fused rank with post-rerank rank,
 
 See [docs/v5-5-rerank-small-to-big-completion.md](docs/v5-5-rerank-small-to-big-completion.md) for Chinese V5 completion notes, offline rerank evaluation fixture scope, deterministic default boundaries, DeepSeek V4 Pro manual validation policy, and the V6-1 local project import boundary.
 
+## V6-1 Local Folder Project Import
+
+V6-1 adds a server-side local directory project import entry over existing `SourceMaterial`, `Task`, `ApiAnalysis`, and `ApiSpec`. It validates absolute paths against configured allowed roots, analyzes Spring controllers, exposes import detail and API specs, and reanalyzes while preserving historical interfaces.
+
+See [docs/v6-1-local-folder-project-import.md](docs/v6-1-local-folder-project-import.md) for Chinese manual verification commands, allowed-root configuration, failure and multi-module blockers, scan ignore rules, DeepSeek V4 Pro internal alpha gate, and V6-1 out-of-scope boundaries.
+
 ## V5-1 Real Embedding And pgvector
 
 V5-1 adds a real embedding manual profile, pgvector candidate retrieval for Knowledge RAG and Long-term Memory, embedding profile metadata, reindex guards, and semantic evidence propagation into Unified Context. Fake embedding remains the default for local tests and CI.

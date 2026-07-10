@@ -26,6 +26,7 @@ class V4AcceptanceBoundaryGuardTests {
         var controllers = Files.walk(PROJECT_ROOT.resolve("src/main/java"))
             .filter(Files::isRegularFile)
             .filter(path -> path.getFileName().toString().endsWith("Controller.java"))
+            .filter(path -> !path.toString().contains("/projectimport/"))
             .map(path -> path.getFileName().toString())
             .sorted()
             .toList();

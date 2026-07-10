@@ -17,7 +17,8 @@ class Phase9AcceptanceBoundaryGuardTests {
         "/agentevaluation/",
         "/manualsuiteagent/",
         "/demorun/",
-        "ManualRealLlm"
+        "ManualRealLlm",
+        "/projectimport/"
     );
 
     @Test
