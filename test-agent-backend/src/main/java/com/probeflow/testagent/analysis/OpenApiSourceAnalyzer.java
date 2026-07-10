@@ -306,6 +306,8 @@ class OpenApiSourceAnalyzer {
     /**
      * Map OpenAPI security scheme definitions into the auth shape expected by
      * {@code ExecutableRequestBuilder} (type=bearer + tokenVariable).
+     * Only pure-Bearer scheme sets are mapped as executable; mixed Bearer + apiKey/basic/oauth2
+     * must not set type=bearer (that would fail-open incomplete auth injection).
      */
     private void applyExecutableAuthMapping(Map<String, Object> auth, OpenAPI openApi, List<String> schemeNames) {
         var securitySchemes = openApi.getComponents() == null
@@ -315,50 +317,63 @@ class OpenApiSourceAnalyzer {
             securitySchemes = Map.of();
         }
 
+        String firstBearerSchemeName = null;
+        var anyBearer = false;
+        var anyNonBearer = false;
         for (var schemeName : schemeNames) {
-            var scheme = securitySchemes.get(schemeName);
-            if (scheme == null) {
-                continue;
-            }
-            if (isHttpBearer(scheme)) {
-                auth.put("type", "bearer");
-                auth.put("header", "Authorization");
-                auth.put("tokenVariable", "authToken");
-                auth.put("schemeName", schemeName);
-                return;
+            if (isBearerSchemeName(schemeName, securitySchemes)) {
+                anyBearer = true;
+                if (firstBearerSchemeName == null) {
+                    firstBearerSchemeName = schemeName;
+                }
+            } else {
+                anyNonBearer = true;
             }
         }
 
-        // Fallback when components are missing but the scheme name is conventional.
-        for (var schemeName : schemeNames) {
-            if (schemeName != null && schemeName.toLowerCase(Locale.ROOT).contains("bearer")) {
-                auth.put("type", "bearer");
-                auth.put("header", "Authorization");
-                auth.put("tokenVariable", "authToken");
-                auth.put("schemeName", schemeName);
-                return;
-            }
+        if (anyBearer && !anyNonBearer) {
+            auth.put("type", "bearer");
+            auth.put("header", "Authorization");
+            auth.put("tokenVariable", "authToken");
+            auth.put("schemeName", firstBearerSchemeName);
+            return;
         }
 
-        // Leave non-bearer schemes unmapped so contract smoke fails closed instead of
-        // pretending auth is executable. Preserve OpenAPI scheme types for diagnostics.
+        // Mixed or pure non-bearer: leave unmapped so contract smoke fails closed instead of
+        // injecting only Bearer for an incompletely authenticated request.
+        auth.put("executable", false);
+        if (firstBearerSchemeName != null) {
+            auth.put("schemeName", firstBearerSchemeName);
+        } else if (!schemeNames.isEmpty()) {
+            auth.put("schemeName", schemeNames.getFirst());
+        }
         for (var schemeName : schemeNames) {
             var scheme = securitySchemes.get(schemeName);
             if (scheme == null || scheme.getType() == null) {
                 continue;
             }
-            auth.put("openApiSchemeType", scheme.getType().name());
-            if (scheme.getScheme() != null) {
-                auth.put("openApiHttpScheme", scheme.getScheme());
+            if (!isHttpBearer(scheme)) {
+                auth.put("openApiSchemeType", scheme.getType().name());
+                if (scheme.getScheme() != null) {
+                    auth.put("openApiHttpScheme", scheme.getScheme());
+                }
+                break;
             }
-            auth.put("schemeName", schemeName);
-            auth.put("executable", false);
-            return;
         }
-        if (!schemeNames.isEmpty()) {
-            auth.put("schemeName", schemeNames.getFirst());
-            auth.put("executable", false);
+    }
+
+    private boolean isBearerSchemeName(String schemeName, Map<String, SecurityScheme> securitySchemes) {
+        if (schemeName == null) {
+            return false;
         }
+        var scheme = securitySchemes.get(schemeName);
+        if (scheme != null) {
+            // Prefer OpenAPI scheme definition over name heuristics once components exist.
+            // Names like BearerApiKey / OAuth2Bearer must not be treated as HTTP Bearer.
+            return isHttpBearer(scheme);
+        }
+        // Fallback only when the scheme definition is missing.
+        return schemeName.toLowerCase(Locale.ROOT).contains("bearer");
     }
 
     private boolean isHttpBearer(SecurityScheme scheme) {

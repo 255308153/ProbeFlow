@@ -301,8 +301,8 @@ class ContractEligibilityEvaluator {
 
     /**
      * Smoke execution currently injects only HTTP Bearer tokens via ExecutableRequestBuilder.
-     * Any required non-bearer scheme must fail closed as UNSUPPORTED instead of sending
-     * unauthenticated traffic.
+     * Any required non-bearer scheme - alone or mixed with Bearer - must fail closed as
+     * UNSUPPORTED instead of sending incompletely authenticated traffic.
      */
     private ContractSmokeDiagnostic unsupportedAuthDiagnostic(ApiSpec apiSpec) {
         if (!authRequired(apiSpec)) {
@@ -322,39 +322,56 @@ class ContractEligibilityEvaluator {
     }
 
     private boolean supportsExecutableBearerAuth(Map<String, Object> auth) {
+        // Analyzer marks non-executable / mixed auth with executable=false — honor that hard gate.
+        if (Boolean.FALSE.equals(auth.get("executable"))) {
+            return false;
+        }
+        var openApiSchemeType = stringValue(auth.get("openApiSchemeType"));
+        if (openApiSchemeType != null && !"HTTP".equalsIgnoreCase(openApiSchemeType)) {
+            return false;
+        }
+        var openApiHttpScheme = stringValue(auth.get("openApiHttpScheme"));
+        if (openApiHttpScheme != null && !"bearer".equalsIgnoreCase(openApiHttpScheme.trim())) {
+            return false;
+        }
+
         var type = stringValue(auth.get("type"));
         if (type != null) {
-            if ("bearer".equalsIgnoreCase(type)) {
-                return true;
-            }
             if ("none".equalsIgnoreCase(type)) {
                 return true;
             }
-            // Explicit non-bearer types fail closed.
-            return false;
+            if (!"bearer".equalsIgnoreCase(type)) {
+                // Explicit non-bearer types fail closed.
+                return false;
+            }
+            // type=bearer is not sufficient alone: schemes/requirements may still mix apiKey/basic/oauth2.
         }
 
         var schemeNames = schemeNames(auth);
         if (schemeNames.isEmpty()) {
-            // required=true without type/schemes is incomplete and unsafe to execute.
-            return false;
+            // Pure type=bearer without scheme list is executable; required without metadata is not.
+            return type != null && "bearer".equalsIgnoreCase(type);
         }
+        // Only allow when every declared scheme is bearer-like. Mixed Bearer+apiKey/oauth/basic fails closed.
+        return allSchemesAreBearerLike(schemeNames);
+    }
+
+    private boolean allSchemesAreBearerLike(List<String> schemeNames) {
         var hasBearerLike = false;
-        var hasNonBearer = false;
         for (var schemeName : schemeNames) {
             var normalized = schemeName.toLowerCase(Locale.ROOT);
+            // Names like oauth2Bearer / BearerApiKey must not pass just because they contain "bearer".
+            if (looksLikeUnsupportedAuthScheme(normalized)) {
+                return false;
+            }
             if (normalized.contains("bearer")) {
                 hasBearerLike = true;
-            } else if (looksLikeUnsupportedAuthScheme(normalized)) {
-                hasNonBearer = true;
             } else {
-                // Unknown scheme name without bearer token is not executable.
-                hasNonBearer = true;
+                // Non-bearer or unknown scheme names are not fully injectable.
+                return false;
             }
         }
-        // Only allow when every declared scheme is bearer-like (or at least one bearer and no
-        // clearly non-bearer schemes). Mixed oauth+bearer still fails closed.
-        return hasBearerLike && !hasNonBearer;
+        return hasBearerLike;
     }
 
     private boolean looksLikeUnsupportedAuthScheme(String normalizedSchemeName) {
@@ -384,7 +401,25 @@ class ContractEligibilityEvaluator {
                 }
             }
         }
+        // OpenAPI security requirements may list additional schemes not present in schemes/type alone.
+        collectRequirementSchemeNames(auth.get("requirements"), names);
         return names;
+    }
+
+    private void collectRequirementSchemeNames(Object requirement, List<String> names) {
+        if (requirement instanceof List<?> list) {
+            for (var item : list) {
+                collectRequirementSchemeNames(item, names);
+            }
+        } else if (requirement instanceof Map<?, ?> map) {
+            for (var key : map.keySet()) {
+                if (key != null && StringUtils.hasText(String.valueOf(key))) {
+                    names.add(String.valueOf(key));
+                }
+            }
+        } else if (requirement != null && StringUtils.hasText(String.valueOf(requirement))) {
+            names.add(String.valueOf(requirement));
+        }
     }
 
     private String authSchemeSummary(Map<String, Object> auth) {

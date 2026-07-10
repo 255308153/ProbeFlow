@@ -275,6 +275,86 @@ class OpenApiContractSmokeRunIssue01Tests {
     }
 
     @Test
+    void mixedBearerAndNonBearerAuthFailsClosedWithoutDraftOrHttp() {
+        // type=bearer alone previously fail-opened even when schemes/requirements mixed apiKey.
+        for (var auth : List.of(
+            Map.<String, Object>of(
+                "required", true,
+                "type", "bearer",
+                "header", "Authorization",
+                "tokenVariable", "authToken",
+                "schemes", List.of("bearerAuth", "apiKeyAuth")
+            ),
+            Map.<String, Object>of(
+                "required", true,
+                "type", "bearer",
+                "header", "Authorization",
+                "tokenVariable", "authToken",
+                "schemes", List.of("bearerAuth"),
+                "requirements", List.of(List.of("bearerAuth", "apiKeyAuth"))
+            ),
+            Map.<String, Object>of(
+                "required", true,
+                "schemes", List.of("bearerAuth", "apiKeyAuth")
+            ),
+            Map.<String, Object>of(
+                "required", true,
+                "requirements", List.of(List.of("bearerAuth", "apiKeyAuth"))
+            ),
+            Map.<String, Object>of(
+                "required", true,
+                "type", "bearer",
+                "requirements", Map.of("bearerAuth", List.of(), "apiKeyAuth", List.of())
+            ),
+            Map.<String, Object>of(
+                "required", true,
+                "type", "bearer",
+                "schemes", List.of("bearerAuth", "basicAuth")
+            ),
+            Map.<String, Object>of(
+                "required", true,
+                "type", "bearer",
+                "schemes", List.of("bearerAuth", "oauth2")
+            ),
+            // Name contains "bearer" but is not pure HTTP Bearer — must not fail-open.
+            Map.<String, Object>of(
+                "required", true,
+                "type", "bearer",
+                "schemes", List.of("bearerAuth", "oauth2Bearer")
+            ),
+            Map.<String, Object>of(
+                "required", true,
+                "type", "bearer",
+                "tokenVariable", "authToken",
+                "executable", false
+            ),
+            Map.<String, Object>of(
+                "required", true,
+                "type", "bearer",
+                "openApiSchemeType", "APIKEY",
+                "schemes", List.of("bearerApiKey")
+            )
+        )) {
+            fakeHttpClient.reset();
+            var apiSpec = openApiCreateOrderSpec();
+            apiSpec.setAuth(auth);
+            apiSpec = apiSpecs.save(apiSpec);
+            var draftCountBefore = drafts.count();
+
+            var result = smokeRun.run(request(apiSpec.getApiSpecId()));
+
+            assertThat(result.outcome()).as(auth.toString()).isEqualTo(ContractSmokeOutcome.UNSUPPORTED);
+            assertThat(result.diagnostics()).anySatisfy(diagnostic ->
+                assertThat(diagnostic.code()).isEqualTo("CONTRACT_AUTH_SCHEME_UNSUPPORTED")
+            );
+            assertThat(fakeHttpClient.requests()).as(auth.toString()).isEmpty();
+            assertThat(result.draftId()).as(auth.toString()).isNull();
+            assertThat(result.executionRecordId()).as(auth.toString()).isNull();
+            assertThat(drafts.count()).as(auth.toString()).isEqualTo(draftCountBefore);
+        }
+    }
+
+    @Test
     void missingBaseUrlBlocksExecutionEnvironmentWithoutHttp() {
         var apiSpec = apiSpecs.save(openApiCreateOrderSpec());
 
