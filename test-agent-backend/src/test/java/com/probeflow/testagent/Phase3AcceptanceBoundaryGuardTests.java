@@ -250,6 +250,7 @@ class Phase3AcceptanceBoundaryGuardTests {
                 "KnowledgeRetrievalApplicationService",
                 "LlmApplicationService",
                 "LocalDirectoryProjectImportApplicationService",
+                "OpenApiContractSmokeRunApplicationService",
                 "ReplanningApplicationService",
                 "ReportGenerationApplicationService",
                 "TaskOrchestrationApplicationService",

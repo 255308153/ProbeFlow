@@ -332,6 +332,7 @@ class Phase4AcceptanceBoundaryGuardTests {
             "MemoryRefineryService",
             "MemoryUsageRecordingService",
             "MemoryUsefulnessFeedbackService",
+            "OpenApiContractSmokeRunApplicationService",
             "PlannerSafeToolCatalogService",
             "PolicyValidatorService",
             "ReplanningApplicationService",

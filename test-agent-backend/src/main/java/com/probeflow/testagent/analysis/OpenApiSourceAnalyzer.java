@@ -10,7 +10,6 @@ import io.swagger.v3.oas.models.security.SecurityRequirement;
 import io.swagger.v3.parser.OpenAPIV3Parser;
 import io.swagger.v3.parser.core.models.ParseOptions;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -148,7 +147,7 @@ class OpenApiSourceAnalyzer {
 
         var body = new LinkedHashMap<String, Object>();
         body.put("required", Boolean.TRUE.equals(operation.getRequestBody().getRequired()));
-        body.put("content", contentShape(operation.getRequestBody().getContent().values()));
+        body.put("content", contentShape(operation.getRequestBody().getContent()));
         parameters.put("requestBody", body);
         operation.getRequestBody().getContent().values().stream()
             .filter(Objects::nonNull)
@@ -170,7 +169,7 @@ class OpenApiSourceAnalyzer {
             var responseShape = new LinkedHashMap<String, Object>();
             responseShape.put("description", response.getDescription());
             if (response.getContent() != null) {
-                responseShape.put("content", contentShape(response.getContent().values()));
+                responseShape.put("content", contentShape(response.getContent()));
                 response.getContent().values().stream()
                     .filter(Objects::nonNull)
                     .map(mediaType -> mediaType.getSchema())
@@ -181,12 +180,16 @@ class OpenApiSourceAnalyzer {
         parameters.put("responses", responses);
     }
 
-    private List<Map<String, Object>> contentShape(Collection<io.swagger.v3.oas.models.media.MediaType> mediaTypes) {
-        return mediaTypes.stream()
-            .filter(Objects::nonNull)
-            .<Map<String, Object>>map(mediaType -> {
+    private List<Map<String, Object>> contentShape(Map<String, io.swagger.v3.oas.models.media.MediaType> content) {
+        if (content == null || content.isEmpty()) {
+            return List.of();
+        }
+        return content.entrySet().stream()
+            .filter(entry -> entry.getValue() != null)
+            .<Map<String, Object>>map(entry -> {
                 var shape = new LinkedHashMap<String, Object>();
-                shape.put("schema", schemaShape(mediaType.getSchema()));
+                shape.put("mediaType", entry.getKey());
+                shape.put("schema", schemaShape(entry.getValue().getSchema()));
                 return shape;
             })
             .toList();

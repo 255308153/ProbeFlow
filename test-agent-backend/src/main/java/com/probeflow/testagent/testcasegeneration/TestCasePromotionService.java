@@ -108,6 +108,12 @@ public class TestCasePromotionService {
         detail.put("constraintSource", content.get("constraintSource"));
         detail.put("contextCitations", content.getOrDefault("contextCitations", List.of()));
         detail.put("generationMetadata", content.getOrDefault("generationMetadata", Map.of()));
+        if (content.containsKey("assertions")) {
+            detail.put("assertions", content.get("assertions"));
+        }
+        if (content.containsKey("contractOrigin")) {
+            detail.put("contractOrigin", content.get("contractOrigin"));
+        }
         return detail;
     }
 

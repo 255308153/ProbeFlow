@@ -47,6 +47,7 @@ class Phase1BoundaryGuardTests {
             "apispec",
             "businessflowdiscovery",
             "changelog",
+            "contractsmoke",
             "controlledplanner",
             "demorun",
             "executionrecord",
