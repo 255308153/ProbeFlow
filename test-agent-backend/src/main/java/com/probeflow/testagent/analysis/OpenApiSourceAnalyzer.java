@@ -339,6 +339,26 @@ class OpenApiSourceAnalyzer {
                 return;
             }
         }
+
+        // Leave non-bearer schemes unmapped so contract smoke fails closed instead of
+        // pretending auth is executable. Preserve OpenAPI scheme types for diagnostics.
+        for (var schemeName : schemeNames) {
+            var scheme = securitySchemes.get(schemeName);
+            if (scheme == null || scheme.getType() == null) {
+                continue;
+            }
+            auth.put("openApiSchemeType", scheme.getType().name());
+            if (scheme.getScheme() != null) {
+                auth.put("openApiHttpScheme", scheme.getScheme());
+            }
+            auth.put("schemeName", schemeName);
+            auth.put("executable", false);
+            return;
+        }
+        if (!schemeNames.isEmpty()) {
+            auth.put("schemeName", schemeNames.getFirst());
+            auth.put("executable", false);
+        }
     }
 
     private boolean isHttpBearer(SecurityScheme scheme) {

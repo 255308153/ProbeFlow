@@ -212,11 +212,66 @@ class OpenApiContractSmokeRunIssue01Tests {
         var result = smokeRun.run(request(apiSpec.getApiSpecId()));
 
         assertThat(result.outcome()).isEqualTo(ContractSmokeOutcome.BLOCKED);
-        assertThat(result.diagnostics()).anySatisfy(diagnostic ->
-            assertThat(diagnostic.code()).isEqualTo("CONTRACT_READINESS_BLOCKED")
-        );
+        assertThat(result.diagnostics()).anySatisfy(diagnostic -> {
+            assertThat(diagnostic.code()).isEqualTo("CONTRACT_READINESS_BLOCKED");
+            assertThat(diagnostic.message()).contains("routeReady");
+        });
         assertThat(fakeHttpClient.requests()).isEmpty();
         assertThat(result.draftId()).isNull();
+    }
+
+    @Test
+    void partialAnalysisReadinessFlagsBlockDraftAndHttp() {
+        for (var incomplete : List.of("dtoExpanded", "validationReady", "authReady")) {
+            fakeHttpClient.reset();
+            var apiSpec = openApiCreateOrderSpec();
+            switch (incomplete) {
+                case "dtoExpanded" -> apiSpec.setDtoExpanded(false);
+                case "validationReady" -> apiSpec.setValidationReady(false);
+                case "authReady" -> apiSpec.setAuthReady(false);
+                default -> throw new IllegalStateException(incomplete);
+            }
+            apiSpec = apiSpecs.save(apiSpec);
+            var draftCountBefore = drafts.count();
+
+            var result = smokeRun.run(request(apiSpec.getApiSpecId()));
+
+            assertThat(result.outcome()).as(incomplete).isEqualTo(ContractSmokeOutcome.BLOCKED);
+            assertThat(result.diagnostics()).anySatisfy(diagnostic -> {
+                assertThat(diagnostic.code()).isEqualTo("CONTRACT_READINESS_BLOCKED");
+                assertThat(diagnostic.message()).contains(incomplete);
+            });
+            assertThat(fakeHttpClient.requests()).as(incomplete).isEmpty();
+            assertThat(result.draftId()).as(incomplete).isNull();
+            assertThat(drafts.count()).as(incomplete).isEqualTo(draftCountBefore);
+        }
+    }
+
+    @Test
+    void nonBearerAuthSchemesFailClosedWithoutSendingHttp() {
+        for (var auth : List.of(
+            Map.<String, Object>of("required", true, "type", "oauth2"),
+            Map.<String, Object>of("required", true, "type", "basic"),
+            Map.<String, Object>of("required", true, "type", "apiKey"),
+            Map.<String, Object>of("required", true, "schemes", List.of("oauth2")),
+            Map.<String, Object>of("required", true, "schemes", List.of("apiKeyAuth")),
+            Map.<String, Object>of("required", true, "schemes", List.of("basicAuth"))
+        )) {
+            fakeHttpClient.reset();
+            var apiSpec = openApiCreateOrderSpec();
+            apiSpec.setAuth(auth);
+            apiSpec = apiSpecs.save(apiSpec);
+
+            var result = smokeRun.run(request(apiSpec.getApiSpecId()));
+
+            assertThat(result.outcome()).as(auth.toString()).isEqualTo(ContractSmokeOutcome.UNSUPPORTED);
+            assertThat(result.diagnostics()).anySatisfy(diagnostic ->
+                assertThat(diagnostic.code()).isEqualTo("CONTRACT_AUTH_SCHEME_UNSUPPORTED")
+            );
+            assertThat(fakeHttpClient.requests()).as(auth.toString()).isEmpty();
+            assertThat(result.draftId()).as(auth.toString()).isNull();
+            assertThat(result.executionRecordId()).as(auth.toString()).isNull();
+        }
     }
 
     @Test

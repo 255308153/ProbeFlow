@@ -25,14 +25,17 @@ class ContractEligibilityEvaluator {
                 )
             );
         }
-        if (!apiSpec.isRouteReady() || !apiSpec.isBasicParamReady()) {
+        var incompleteReadiness = incompleteReadinessFlags(apiSpec);
+        if (!incompleteReadiness.isEmpty()) {
             return ContractEligibilityDecision.terminal(
                 ContractSmokeOutcome.BLOCKED,
                 origin,
                 ContractSmokeDiagnostic.blocked(
                     "CONTRACT_READINESS_BLOCKED",
-                    "ApiSpec readiness is incomplete for contract smoke (routeReady/basicParamReady).",
-                    "Re-analyze the source material until route and basic parameter readiness are true."
+                    "ApiSpec readiness is incomplete for contract smoke: missing "
+                        + String.join(", ", incompleteReadiness) + ".",
+                    "Re-analyze the source material until routeReady, basicParamReady, dtoExpanded, "
+                        + "validationReady and authReady are all true."
                 )
             );
         }
@@ -72,6 +75,15 @@ class ContractEligibilityEvaluator {
             );
         }
 
+        var unsupportedAuth = unsupportedAuthDiagnostic(apiSpec);
+        if (unsupportedAuth != null) {
+            return ContractEligibilityDecision.terminal(
+                ContractSmokeOutcome.UNSUPPORTED,
+                origin,
+                unsupportedAuth
+            );
+        }
+
         if (!hasBaseUrl(request)) {
             return ContractEligibilityDecision.terminal(
                 ContractSmokeOutcome.BLOCKED,
@@ -101,6 +113,26 @@ class ContractEligibilityEvaluator {
             expectedContentType(responses, expectedStatus),
             origin
         );
+    }
+
+    private List<String> incompleteReadinessFlags(ApiSpec apiSpec) {
+        var missing = new ArrayList<String>();
+        if (!apiSpec.isRouteReady()) {
+            missing.add("routeReady");
+        }
+        if (!apiSpec.isBasicParamReady()) {
+            missing.add("basicParamReady");
+        }
+        if (!apiSpec.isDtoExpanded()) {
+            missing.add("dtoExpanded");
+        }
+        if (!apiSpec.isValidationReady()) {
+            missing.add("validationReady");
+        }
+        if (!apiSpec.isAuthReady()) {
+            missing.add("authReady");
+        }
+        return missing;
     }
 
     private Map<String, Object> contractOrigin(ApiSpec apiSpec) {
@@ -253,15 +285,121 @@ class ContractEligibilityEvaluator {
         if (auth == null || auth.isEmpty()) {
             return false;
         }
+        var type = stringValue(auth.get("type"));
+        if (type != null && "none".equalsIgnoreCase(type)) {
+            return false;
+        }
         if (Boolean.TRUE.equals(auth.get("required"))) {
             return true;
         }
-        var type = auth.get("type");
-        if (type != null && !"none".equalsIgnoreCase(String.valueOf(type))) {
+        if (type != null && !type.isBlank()) {
             return true;
         }
         var schemes = auth.get("schemes");
         return schemes instanceof List<?> list && !list.isEmpty();
+    }
+
+    /**
+     * Smoke execution currently injects only HTTP Bearer tokens via ExecutableRequestBuilder.
+     * Any required non-bearer scheme must fail closed as UNSUPPORTED instead of sending
+     * unauthenticated traffic.
+     */
+    private ContractSmokeDiagnostic unsupportedAuthDiagnostic(ApiSpec apiSpec) {
+        if (!authRequired(apiSpec)) {
+            return null;
+        }
+        var auth = apiSpec.getAuth() == null ? Map.<String, Object>of() : apiSpec.getAuth();
+        if (supportsExecutableBearerAuth(auth)) {
+            return null;
+        }
+        var detail = authSchemeSummary(auth);
+        return ContractSmokeDiagnostic.unsupported(
+            "CONTRACT_AUTH_SCHEME_UNSUPPORTED",
+            "Contract smoke only supports HTTP Bearer authentication; this ApiSpec requires unsupported auth"
+                + (detail.isBlank() ? "." : ": " + detail + "."),
+            "Use a Bearer-authenticated ApiSpec, or extend execution auth support before running smoke."
+        );
+    }
+
+    private boolean supportsExecutableBearerAuth(Map<String, Object> auth) {
+        var type = stringValue(auth.get("type"));
+        if (type != null) {
+            if ("bearer".equalsIgnoreCase(type)) {
+                return true;
+            }
+            if ("none".equalsIgnoreCase(type)) {
+                return true;
+            }
+            // Explicit non-bearer types fail closed.
+            return false;
+        }
+
+        var schemeNames = schemeNames(auth);
+        if (schemeNames.isEmpty()) {
+            // required=true without type/schemes is incomplete and unsafe to execute.
+            return false;
+        }
+        var hasBearerLike = false;
+        var hasNonBearer = false;
+        for (var schemeName : schemeNames) {
+            var normalized = schemeName.toLowerCase(Locale.ROOT);
+            if (normalized.contains("bearer")) {
+                hasBearerLike = true;
+            } else if (looksLikeUnsupportedAuthScheme(normalized)) {
+                hasNonBearer = true;
+            } else {
+                // Unknown scheme name without bearer token is not executable.
+                hasNonBearer = true;
+            }
+        }
+        // Only allow when every declared scheme is bearer-like (or at least one bearer and no
+        // clearly non-bearer schemes). Mixed oauth+bearer still fails closed.
+        return hasBearerLike && !hasNonBearer;
+    }
+
+    private boolean looksLikeUnsupportedAuthScheme(String normalizedSchemeName) {
+        return normalizedSchemeName.contains("oauth")
+            || normalizedSchemeName.contains("openid")
+            || normalizedSchemeName.contains("oidc")
+            || normalizedSchemeName.contains("basic")
+            || normalizedSchemeName.contains("apikey")
+            || normalizedSchemeName.contains("api_key")
+            || normalizedSchemeName.contains("api-key")
+            || normalizedSchemeName.contains("digest")
+            || normalizedSchemeName.contains("cookie")
+            || normalizedSchemeName.contains("mutual")
+            || normalizedSchemeName.contains("mtls");
+    }
+
+    private List<String> schemeNames(Map<String, Object> auth) {
+        var names = new ArrayList<String>();
+        var schemeName = stringValue(auth.get("schemeName"));
+        if (StringUtils.hasText(schemeName)) {
+            names.add(schemeName);
+        }
+        if (auth.get("schemes") instanceof List<?> schemes) {
+            for (var scheme : schemes) {
+                if (scheme != null && StringUtils.hasText(String.valueOf(scheme))) {
+                    names.add(String.valueOf(scheme));
+                }
+            }
+        }
+        return names;
+    }
+
+    private String authSchemeSummary(Map<String, Object> auth) {
+        var type = stringValue(auth.get("type"));
+        var schemes = schemeNames(auth);
+        if (StringUtils.hasText(type) && !schemes.isEmpty()) {
+            return "type=" + type + ", schemes=" + schemes;
+        }
+        if (StringUtils.hasText(type)) {
+            return "type=" + type;
+        }
+        if (!schemes.isEmpty()) {
+            return "schemes=" + schemes;
+        }
+        return "required without executable scheme metadata";
     }
 
     private boolean hasAuthCredentials(ApiSpec apiSpec, OpenApiContractSmokeRunRequest request) {
@@ -276,6 +414,10 @@ class ContractEligibilityEvaluator {
         return request.authVariables().containsKey("authToken")
             && request.authVariables().get("authToken") != null
             && StringUtils.hasText(String.valueOf(request.authVariables().get("authToken")));
+    }
+
+    private String stringValue(Object value) {
+        return value == null ? null : String.valueOf(value);
     }
 
     private Object firstPresent(Map<String, Object> values, String... keys) {
