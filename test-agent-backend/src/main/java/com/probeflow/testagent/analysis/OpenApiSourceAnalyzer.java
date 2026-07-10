@@ -7,11 +7,13 @@ import io.swagger.v3.oas.models.PathItem;
 import io.swagger.v3.oas.models.media.Schema;
 import io.swagger.v3.oas.models.parameters.Parameter;
 import io.swagger.v3.oas.models.security.SecurityRequirement;
+import io.swagger.v3.oas.models.security.SecurityScheme;
 import io.swagger.v3.parser.OpenAPIV3Parser;
 import io.swagger.v3.parser.core.models.ParseOptions;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import org.springframework.stereotype.Component;
@@ -132,7 +134,8 @@ class OpenApiSourceAnalyzer {
             if (Boolean.TRUE.equals(parameter.getRequired())) {
                 requiredList(constraints).add(parameter.getIn() + "." + parameter.getName());
             }
-            collectSchemaConstraints(parameter.getName(), parameter.getSchema(), constraints);
+            // Keep constraint keys aligned with section.name so request generators can resolve them.
+            collectSchemaConstraints(parameter.getIn() + "." + parameter.getName(), parameter.getSchema(), constraints);
         }
     }
 
@@ -221,6 +224,16 @@ class OpenApiSourceAnalyzer {
         if (schema.getRequired() != null && !schema.getRequired().isEmpty()) {
             shape.put("required", schema.getRequired());
         }
+        putIfPresent(shape, "minimum", schema.getMinimum());
+        putIfPresent(shape, "maximum", schema.getMaximum());
+        putIfPresent(shape, "minLength", schema.getMinLength());
+        putIfPresent(shape, "maxLength", schema.getMaxLength());
+        putIfPresent(shape, "pattern", schema.getPattern());
+        putIfPresent(shape, "minItems", schema.getMinItems());
+        putIfPresent(shape, "maxItems", schema.getMaxItems());
+        if (schema.getItems() != null) {
+            shape.put("items", schemaShape(schema.getItems()));
+        }
         if (schema.getProperties() != null && !schema.getProperties().isEmpty()) {
             var properties = new LinkedHashMap<String, Object>();
             schema.getProperties().forEach((name, propertySchema) -> properties.put(name, schemaShape((Schema<?>) propertySchema)));
@@ -276,14 +289,64 @@ class OpenApiSourceAnalyzer {
 
         var auth = new LinkedHashMap<String, Object>();
         auth.put("required", requirements != null && !requirements.isEmpty());
-        if (requirements != null && !requirements.isEmpty()) {
-            auth.put("schemes", requirements.stream()
-                .flatMap(requirement -> requirement.keySet().stream())
-                .distinct()
-                .toList());
-            auth.put("requirements", requirements.stream().map(SecurityRequirement::keySet).map(List::copyOf).toList());
+        if (requirements == null || requirements.isEmpty()) {
+            return auth;
         }
+
+        var schemeNames = requirements.stream()
+            .flatMap(requirement -> requirement.keySet().stream())
+            .distinct()
+            .toList();
+        auth.put("schemes", schemeNames);
+        auth.put("requirements", requirements.stream().map(SecurityRequirement::keySet).map(List::copyOf).toList());
+        applyExecutableAuthMapping(auth, openApi, schemeNames);
         return auth;
+    }
+
+    /**
+     * Map OpenAPI security scheme definitions into the auth shape expected by
+     * {@code ExecutableRequestBuilder} (type=bearer + tokenVariable).
+     */
+    private void applyExecutableAuthMapping(Map<String, Object> auth, OpenAPI openApi, List<String> schemeNames) {
+        var securitySchemes = openApi.getComponents() == null
+            ? Map.<String, SecurityScheme>of()
+            : openApi.getComponents().getSecuritySchemes();
+        if (securitySchemes == null) {
+            securitySchemes = Map.of();
+        }
+
+        for (var schemeName : schemeNames) {
+            var scheme = securitySchemes.get(schemeName);
+            if (scheme == null) {
+                continue;
+            }
+            if (isHttpBearer(scheme)) {
+                auth.put("type", "bearer");
+                auth.put("header", "Authorization");
+                auth.put("tokenVariable", "authToken");
+                auth.put("schemeName", schemeName);
+                return;
+            }
+        }
+
+        // Fallback when components are missing but the scheme name is conventional.
+        for (var schemeName : schemeNames) {
+            if (schemeName != null && schemeName.toLowerCase(Locale.ROOT).contains("bearer")) {
+                auth.put("type", "bearer");
+                auth.put("header", "Authorization");
+                auth.put("tokenVariable", "authToken");
+                auth.put("schemeName", schemeName);
+                return;
+            }
+        }
+    }
+
+    private boolean isHttpBearer(SecurityScheme scheme) {
+        if (scheme.getType() != SecurityScheme.Type.HTTP) {
+            return false;
+        }
+        var httpScheme = scheme.getScheme();
+        return httpScheme != null && "bearer".equalsIgnoreCase(httpScheme.trim());
     }
 
     private void putIfPresent(Map<String, Object> map, String key, Object value) {

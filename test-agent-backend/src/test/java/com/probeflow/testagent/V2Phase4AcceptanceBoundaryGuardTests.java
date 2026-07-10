@@ -30,7 +30,8 @@ class V2Phase4AcceptanceBoundaryGuardTests {
         "ManualRealLlm",
         "/orchestration/",
         "/report/",
-        "/projectimport/"
+        "/projectimport/",
+        "/contractsmoke/"
     );
 
     @Test

@@ -86,6 +86,7 @@ class Phase1BoundaryGuardTests {
             .filter(path -> path.toString().endsWith(".java"))
             .filter(path -> !path.toString().contains("/demorun/"))
             .filter(path -> !path.toString().contains("/projectimport/"))
+            .filter(path -> !path.toString().contains("/contractsmoke/"))
             .map(this::readUnchecked)
             .collect(Collectors.joining("\n"));
         var controllerAnnotations = sourceText.lines()

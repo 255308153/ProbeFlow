@@ -104,8 +104,7 @@ public class ExecutableRequestBuilder {
         if (auth == null || auth.isEmpty()) {
             return;
         }
-        var type = stringValue(auth.get("type"));
-        if (!"bearer".equalsIgnoreCase(type)) {
+        if (!usesBearerAuth(auth)) {
             return;
         }
         var headerName = stringValue(auth.getOrDefault("header", "Authorization"));
@@ -119,6 +118,24 @@ public class ExecutableRequestBuilder {
             return;
         }
         headers.put(headerName, "Bearer " + token);
+    }
+
+    private boolean usesBearerAuth(Map<String, Object> auth) {
+        var type = stringValue(auth.get("type"));
+        if ("bearer".equalsIgnoreCase(type)) {
+            return true;
+        }
+        // Compatibility for OpenAPI imports that only recorded scheme names before type mapping.
+        var schemes = auth.get("schemes");
+        if (schemes instanceof List<?> schemeList) {
+            for (var scheme : schemeList) {
+                if (scheme != null && String.valueOf(scheme).toLowerCase(Locale.ROOT).contains("bearer")) {
+                    return true;
+                }
+            }
+        }
+        var schemeName = stringValue(auth.get("schemeName"));
+        return schemeName != null && schemeName.toLowerCase(Locale.ROOT).contains("bearer");
     }
 
     private String buildUrl(String baseUrl, String path, Map<String, Object> queryParams) {

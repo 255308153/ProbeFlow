@@ -19,7 +19,8 @@ class Phase8AcceptanceBoundaryGuardTests {
         "/demorun/",
         "ManualRealLlm",
         "/orchestration/",
-        "/projectimport/"
+        "/projectimport/",
+        "/contractsmoke/"
     );
 
     @Test

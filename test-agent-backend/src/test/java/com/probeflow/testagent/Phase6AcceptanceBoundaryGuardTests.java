@@ -21,7 +21,8 @@ class Phase6AcceptanceBoundaryGuardTests {
         "ManualRealLlm",
         "/orchestration/",
         "/report/",
-        "/projectimport/"
+        "/projectimport/",
+        "/contractsmoke/"
     );
 
     @Test

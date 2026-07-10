@@ -164,8 +164,9 @@ class DeterministicContractRequestGenerator {
         if (schema == null || schema.isEmpty()) {
             return scalarFallback(path, profile);
         }
-        if (schema.get("enum") instanceof List<?> enums && !enums.isEmpty()) {
-            return enums.getFirst();
+        var enumValues = enumValues(path, schema, apiSpec);
+        if (!enumValues.isEmpty()) {
+            return enumValues.getFirst();
         }
         var type = stringValue(schema.get("type"));
         if (!StringUtils.hasText(type) && schema.get("properties") instanceof Map<?, ?>) {
@@ -217,43 +218,53 @@ class DeterministicContractRequestGenerator {
 
     private Object integerValue(String path, Map<String, Object> schema, ApiSpec apiSpec) {
         var validation = validationFor(path, apiSpec, schema);
-        if (validation.get("minimum") instanceof Number minimum) {
-            return minimum.intValue();
+        var minimum = numberConstraint(validation, "minimum", "min");
+        var maximum = numberConstraint(validation, "maximum", "max");
+        long value = minimum != null ? minimum.longValue() : 1L;
+        if (maximum != null && value > maximum.longValue()) {
+            value = maximum.longValue();
         }
-        if (validation.get("min") instanceof Number minimum) {
-            return minimum.intValue();
+        if (minimum != null && value < minimum.longValue()) {
+            value = minimum.longValue();
         }
-        return 1;
+        return Math.toIntExact(value);
     }
 
     private Object numberValue(String path, Map<String, Object> schema, ApiSpec apiSpec) {
         var validation = validationFor(path, apiSpec, schema);
-        if (validation.get("minimum") instanceof Number minimum) {
-            return minimum.doubleValue();
+        var minimum = numberConstraint(validation, "minimum", "min");
+        var maximum = numberConstraint(validation, "maximum", "max");
+        double value = minimum != null ? minimum.doubleValue() : 1.0d;
+        if (maximum != null && value > maximum.doubleValue()) {
+            value = maximum.doubleValue();
         }
-        if (validation.get("min") instanceof Number minimum) {
-            return minimum.doubleValue();
+        if (minimum != null && value < minimum.doubleValue()) {
+            value = minimum.doubleValue();
         }
-        return 1.0d;
+        return value;
     }
 
     private String stringValueFor(String path, Map<String, Object> schema, String profile, ApiSpec apiSpec) {
         var validation = validationFor(path, apiSpec, schema);
+        var maxLength = numberConstraint(validation, "maxLength");
+        if (maxLength != null && maxLength.intValue() <= 0) {
+            return "";
+        }
+
         var base = "sample-" + leafName(path);
-        if (validation.get("minLength") instanceof Number minLength && base.length() < minLength.intValue()) {
+        if (!OpenApiContractSmokeRunRequest.DEFAULT_PROFILE.equals(profile)) {
+            base = profile + "-" + base;
+        }
+        var minLength = numberConstraint(validation, "minLength");
+        if (minLength != null && base.length() < minLength.intValue()) {
             base = base + "x".repeat(Math.max(0, minLength.intValue() - base.length()));
         }
-        if (validation.get("maxLength") instanceof Number maxLength && base.length() > maxLength.intValue()) {
-            base = base.substring(0, Math.max(1, maxLength.intValue()));
-        }
-        // profile participates in determinism without randomness
-        if (!OpenApiContractSmokeRunRequest.DEFAULT_PROFILE.equals(profile)) {
-            return profile + "-" + base;
+        if (maxLength != null && base.length() > maxLength.intValue()) {
+            base = base.substring(0, maxLength.intValue());
         }
         return base;
     }
 
-    @SuppressWarnings("unchecked")
     private Map<String, Object> validationFor(String path, ApiSpec apiSpec, Map<String, Object> schema) {
         var merged = new LinkedHashMap<String, Object>();
         putIfNumber(merged, "minimum", schema.get("minimum"));
@@ -264,21 +275,80 @@ class DeterministicContractRequestGenerator {
         putIfNumber(merged, "maxLength", schema.get("maxLength"));
         var constraints = apiSpec.getConstraints();
         if (constraints != null && constraints.get("validations") instanceof Map<?, ?> validations) {
-            var validation = validations.get(path);
-            if (validation instanceof Map<?, ?> validationMap) {
-                validationMap.forEach((key, value) -> {
-                    if (key != null) {
-                        merged.put(String.valueOf(key), value);
-                    }
-                });
+            for (var key : validationLookupKeys(path)) {
+                var validation = validations.get(key);
+                if (validation instanceof Map<?, ?> validationMap) {
+                    validationMap.forEach((validationKey, value) -> {
+                        if (validationKey != null) {
+                            merged.putIfAbsent(String.valueOf(validationKey), value);
+                        }
+                    });
+                }
             }
         }
         return merged;
     }
 
+    private List<Object> enumValues(String path, Map<String, Object> schema, ApiSpec apiSpec) {
+        if (schema.get("enum") instanceof List<?> schemaEnums && !schemaEnums.isEmpty()) {
+            return new ArrayList<>(schemaEnums);
+        }
+        var constraints = apiSpec.getConstraints();
+        if (constraints != null && constraints.get("enums") instanceof Map<?, ?> enums) {
+            for (var key : validationLookupKeys(path)) {
+                if (enums.get(key) instanceof List<?> listed && !listed.isEmpty()) {
+                    return new ArrayList<>(listed);
+                }
+            }
+        }
+        return List.of();
+    }
+
+    private List<String> validationLookupKeys(String path) {
+        var keys = new ArrayList<String>();
+        if (!StringUtils.hasText(path)) {
+            return keys;
+        }
+        keys.add(path);
+        var leaf = leafName(path);
+        if (StringUtils.hasText(leaf) && !keys.contains(leaf)) {
+            keys.add(leaf);
+        }
+        if (!path.contains(".")) {
+            keys.add("path." + path);
+            keys.add("query." + path);
+            keys.add("header." + path);
+            keys.add("requestBody." + path);
+        }
+        return keys;
+    }
+
+    private Number numberConstraint(Map<String, Object> validation, String... keys) {
+        for (var key : keys) {
+            var value = validation.get(key);
+            if (value instanceof Number number) {
+                return number;
+            }
+            if (value != null) {
+                try {
+                    return Double.valueOf(String.valueOf(value));
+                } catch (NumberFormatException ignored) {
+                    // continue
+                }
+            }
+        }
+        return null;
+    }
+
     private void putIfNumber(Map<String, Object> target, String key, Object value) {
         if (value instanceof Number) {
             target.put(key, value);
+        } else if (value != null) {
+            try {
+                target.put(key, Double.valueOf(String.valueOf(value)));
+            } catch (NumberFormatException ignored) {
+                // ignore non-numeric constraint values
+            }
         }
     }
 

@@ -215,7 +215,24 @@ class ApiAnalysisApplicationServiceTests {
             assertThat(spec.getOperationId()).isEqualTo("createOrder");
             assertThat(spec.getParameters()).containsKeys("requestBody", "responses");
             assertThat(spec.getConstraints()).containsKeys("required", "enums");
-            assertThat(spec.getAuth()).containsEntry("required", true);
+            assertThat(spec.getAuth())
+                .containsEntry("required", true)
+                .containsEntry("type", "bearer")
+                .containsEntry("tokenVariable", "authToken")
+                .containsEntry("header", "Authorization");
+            @SuppressWarnings("unchecked")
+            var requestBody = (java.util.Map<String, Object>) spec.getParameters().get("requestBody");
+            @SuppressWarnings("unchecked")
+            var content = (java.util.List<java.util.Map<String, Object>>) requestBody.get("content");
+            assertThat(content.getFirst()).containsEntry("mediaType", "application/json");
+            @SuppressWarnings("unchecked")
+            var schema = (java.util.Map<String, Object>) content.getFirst().get("schema");
+            @SuppressWarnings("unchecked")
+            var properties = (java.util.Map<String, Object>) schema.get("properties");
+            @SuppressWarnings("unchecked")
+            var quantity = (java.util.Map<String, Object>) properties.get("quantity");
+            assertThat(((Number) quantity.get("minimum")).intValue()).isEqualTo(1);
+            assertThat(((Number) quantity.get("maximum")).intValue()).isEqualTo(99);
         });
 
         var task = tasks.findById(result.taskId()).orElseThrow();

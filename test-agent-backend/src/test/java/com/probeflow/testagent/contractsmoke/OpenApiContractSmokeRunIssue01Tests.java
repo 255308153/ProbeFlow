@@ -1,7 +1,11 @@
 package com.probeflow.testagent.contractsmoke;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.probeflow.testagent.apispec.ApiSpec;
 import com.probeflow.testagent.apispec.ApiSpecRepository;
 import com.probeflow.testagent.apispec.ApiSpecSourceType;
@@ -18,14 +22,18 @@ import java.util.Map;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
+import org.springframework.http.MediaType;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.transaction.annotation.Transactional;
 
 @SpringBootTest
+@AutoConfigureMockMvc
 @ActiveProfiles("test")
 @Transactional
 class OpenApiContractSmokeRunIssue01Tests {
@@ -47,6 +55,12 @@ class OpenApiContractSmokeRunIssue01Tests {
 
     @Autowired
     private ExecutionRecordRepository executionRecords;
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @Autowired
+    private ObjectMapper objectMapper;
 
     @BeforeEach
     void resetGateway() {
@@ -100,6 +114,8 @@ class OpenApiContractSmokeRunIssue01Tests {
         assertThat(second.generatedRequest()).isEqualTo(first.generatedRequest());
         assertThat(fakeHttpClient.requests()).hasSize(2);
         assertThat(fakeHttpClient.requests().getFirst().body()).isEqualTo(body);
+        assertThat(fakeHttpClient.requests().getFirst().headers())
+            .containsEntry("Authorization", "Bearer token-abc");
 
         var draft = drafts.findById(first.draftId()).orElseThrow();
         assertThat(draft.getStatus()).isEqualTo(DraftStatus.PROMOTED);
@@ -268,6 +284,155 @@ class OpenApiContractSmokeRunIssue01Tests {
         assertThat(result.diagnostics()).anySatisfy(diagnostic ->
             assertThat(diagnostic.code()).isEqualTo("CONTRACT_CONTENT_TYPE_MISMATCH")
         );
+    }
+
+    @Test
+    void openApiSchemeOnlyAuthStillInjectsBearerHeaderOnExecutedRequest() {
+        var apiSpec = openApiCreateOrderSpec();
+        // Legacy OpenAPI auth shape before type mapping was added.
+        apiSpec.setAuth(Map.of(
+            "required", true,
+            "schemes", List.of("bearerAuth"),
+            "requirements", List.of(List.of("bearerAuth"))
+        ));
+        apiSpec = apiSpecs.save(apiSpec);
+        fakeHttpClient.respondWith(new HttpClientResponse(
+            201,
+            Map.of("Content-Type", "application/json"),
+            Map.of("orderId", "order-1"),
+            5L
+        ));
+
+        var result = smokeRun.run(request(apiSpec.getApiSpecId()));
+
+        assertThat(result.outcome()).isEqualTo(ContractSmokeOutcome.PASSED);
+        assertThat(fakeHttpClient.requests()).singleElement()
+            .satisfies(httpRequest -> assertThat(httpRequest.headers())
+                .containsEntry("Authorization", "Bearer token-abc"));
+    }
+
+    @Test
+    void generatedValuesRespectMaximumAndZeroMaxLengthConstraints() {
+        var apiSpec = baseSpec(HttpMethod.POST, "/api/widgets/{code}");
+        apiSpec.setAuth(Map.of());
+        apiSpec.setParameters(Map.of(
+            "path", List.of(Map.of(
+                "name", "code",
+                "required", true,
+                "schema", Map.of("type", "string", "maxLength", 0)
+            )),
+            "query", List.of(Map.of(
+                "name", "limit",
+                "required", true,
+                "schema", Map.of("type", "integer", "maximum", 0)
+            )),
+            "requestBody", Map.of(
+                "required", true,
+                "content", List.of(Map.of(
+                    "mediaType", "application/json",
+                    "schema", Map.of(
+                        "type", "object",
+                        "required", List.of("quantity", "label"),
+                        "properties", Map.of(
+                            "quantity", Map.of("type", "integer", "minimum", 5, "maximum", 5),
+                            "label", Map.of("type", "string", "maxLength", 3)
+                        )
+                    )
+                ))
+            ),
+            "responses", Map.of(
+                "200", Map.of(
+                    "description", "OK",
+                    "content", List.of(Map.of("mediaType", "application/json", "schema", Map.of("type", "object")))
+                )
+            )
+        ));
+        apiSpec.setConstraints(Map.of(
+            "required", List.of("path.code", "query.limit", "requestBody.quantity", "requestBody.label"),
+            "validations", Map.of(
+                "path.code", Map.of("maxLength", 0),
+                "query.limit", Map.of("maximum", 0),
+                "requestBody.quantity", Map.of("minimum", 5, "maximum", 5),
+                "requestBody.label", Map.of("maxLength", 3)
+            )
+        ));
+        apiSpec = apiSpecs.save(apiSpec);
+        fakeHttpClient.respondWith(new HttpClientResponse(
+            200,
+            Map.of("Content-Type", "application/json"),
+            Map.of("ok", true),
+            3L
+        ));
+
+        var result = smokeRun.run(new OpenApiContractSmokeRunRequest(
+            apiSpec.getApiSpecId(),
+            null,
+            "test",
+            OpenApiContractSmokeRunRequest.DEFAULT_PROFILE,
+            Map.of("baseUrl", "https://api.example.test"),
+            Map.of(),
+            "tester"
+        ));
+
+        assertThat(result.outcome()).isEqualTo(ContractSmokeOutcome.PASSED);
+        assertThat(result.generatedRequest().get("path")).isEqualTo("/api/widgets/");
+        assertThat(result.generatedRequest().get("queryParams")).isEqualTo(Map.of("limit", 0));
+        @SuppressWarnings("unchecked")
+        var body = (Map<String, Object>) result.generatedRequest().get("body");
+        assertThat(body).containsEntry("quantity", 5);
+        assertThat(String.valueOf(body.get("label")).length()).isLessThanOrEqualTo(3);
+        assertThat(fakeHttpClient.requests()).singleElement()
+            .satisfies(httpRequest -> {
+                assertThat(httpRequest.path()).isEqualTo("/api/widgets/");
+                assertThat(httpRequest.queryParams()).containsEntry("limit", 0);
+            });
+    }
+
+    @Test
+    void httpEntryPointRunsContractSmokeAndReturnsTraceableResult() throws Exception {
+        var apiSpec = apiSpecs.save(openApiCreateOrderSpec());
+        fakeHttpClient.respondWith(new HttpClientResponse(
+            201,
+            Map.of("Content-Type", "application/json"),
+            Map.of("orderId", "order-http"),
+            6L
+        ));
+
+        mockMvc.perform(post("/api/contract-smoke-runs")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(Map.of(
+                    "apiSpecId", apiSpec.getApiSpecId(),
+                    "environment", "test",
+                    "profile", "smoke-valid",
+                    "environmentVariables", Map.of("baseUrl", "https://api.example.test"),
+                    "authVariables", Map.of("authToken", "token-abc"),
+                    "requestedBy", "trial-user"
+                ))))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.outcome").value("PASSED"))
+            .andExpect(jsonPath("$.apiSpecId").value(apiSpec.getApiSpecId()))
+            .andExpect(jsonPath("$.draftId").isNotEmpty())
+            .andExpect(jsonPath("$.caseId").isNotEmpty())
+            .andExpect(jsonPath("$.executionRecordId").isNotEmpty())
+            .andExpect(jsonPath("$.expectedStatus").value(201))
+            .andExpect(jsonPath("$.statusCodeMatches").value(true))
+            .andExpect(jsonPath("$.contractOrigin.contractSource").value("API_SPEC"));
+
+        assertThat(fakeHttpClient.requests()).hasSize(1);
+    }
+
+    @Test
+    void httpEntryPointReturnsNotFoundForMissingApiSpec() throws Exception {
+        mockMvc.perform(post("/api/contract-smoke-runs")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(Map.of(
+                    "apiSpecId", "missing-api-spec",
+                    "environmentVariables", Map.of("baseUrl", "https://api.example.test")
+                ))))
+            .andExpect(status().isNotFound())
+            .andExpect(jsonPath("$.code").value("CONTRACT_SMOKE_NOT_FOUND"))
+            .andExpect(jsonPath("$.field").value("apiSpecId"));
+        assertThat(fakeHttpClient.requests()).isEmpty();
     }
 
     private OpenApiContractSmokeRunRequest request(String apiSpecId) {
