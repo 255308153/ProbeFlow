@@ -39,6 +39,12 @@ public record ProjectImportDiagnostic(
                 "Java source files were found, but no Spring HTTP routes were detected.",
                 "Add a Spring @RestController with HTTP request mappings, then rerun analysis."
             );
+            case "MULTI_MODULE_SOURCE_ROOTS_AMBIGUOUS" -> blocker(
+                code,
+                "Multiple source modules require selection",
+                "Multiple src/main/java source roots were found, so ProbeFlow cannot safely choose one module to analyze.",
+                "Import a single module directory or configure a specific source module, then rerun analysis."
+            );
             default -> blocker(
                 code,
                 "Local directory analysis failed",

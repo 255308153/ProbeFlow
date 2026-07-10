@@ -27,7 +27,8 @@ public record ProjectImportResponse(
     static ProjectImportResponse readySourceDirectory(
         String materialId,
         String taskId,
-        int apiSpecCount
+        int apiSpecCount,
+        List<ProjectImportDiagnostic> warnings
     ) {
         return new ProjectImportResponse(
             materialId,
@@ -35,7 +36,7 @@ public record ProjectImportResponse(
             "READY",
             "SOURCE_DIRECTORY",
             apiSpecCount,
-            List.of(),
+            List.copyOf(warnings),
             List.of()
         );
     }
@@ -43,7 +44,8 @@ public record ProjectImportResponse(
     static ProjectImportResponse failedSourceDirectory(
         String materialId,
         String taskId,
-        ProjectImportDiagnostic blocker
+        ProjectImportDiagnostic blocker,
+        List<ProjectImportDiagnostic> warnings
     ) {
         return new ProjectImportResponse(
             materialId,
@@ -51,7 +53,7 @@ public record ProjectImportResponse(
             "FAILED",
             "SOURCE_DIRECTORY",
             0,
-            List.of(),
+            List.copyOf(warnings),
             List.of(blocker)
         );
     }

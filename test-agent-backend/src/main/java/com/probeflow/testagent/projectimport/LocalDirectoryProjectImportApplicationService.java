@@ -116,6 +116,7 @@ public class LocalDirectoryProjectImportApplicationService {
 
     public ProjectImportResponse reanalyzeImport(String materialId) {
         var material = requireSourceDirectoryMaterial(materialId);
+        pathValidator.validate(material.getStoragePath());
         var result = apiAnalysis.analyze(ApiAnalysisRequest.existingMaterial(
             material.getMaterialId(),
             "project-import-reanalysis"
@@ -128,14 +129,16 @@ public class LocalDirectoryProjectImportApplicationService {
             return ProjectImportResponse.readySourceDirectory(
                 result.materialId(),
                 result.taskId(),
-                result.apiSpecIds().size()
+                result.apiSpecIds().size(),
+                warnings(result.taskId())
             );
         }
 
         return ProjectImportResponse.failedSourceDirectory(
             result.materialId(),
             result.taskId(),
-            ProjectImportDiagnostic.analysisBlocker(result.errorCode(), result.errorMessage())
+            ProjectImportDiagnostic.analysisBlocker(result.errorCode(), result.errorMessage()),
+            warnings(result.taskId())
         );
     }
 
@@ -228,6 +231,13 @@ public class LocalDirectoryProjectImportApplicationService {
                 "Review the source project and rerun analysis if needed."
             ))
             .toList();
+    }
+
+    private List<ProjectImportDiagnostic> warnings(String taskId) {
+        if (tasks == null || taskId == null || taskId.isBlank()) {
+            return List.of();
+        }
+        return warnings(tasks.findById(taskId).orElse(null));
     }
 
     private List<ProjectImportDiagnostic> blockers(SourceMaterial material, Task task) {

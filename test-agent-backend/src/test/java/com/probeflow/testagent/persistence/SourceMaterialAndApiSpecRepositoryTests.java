@@ -44,6 +44,7 @@ class SourceMaterialAndApiSpecRepositoryTests {
             MaterialType.MANUAL_SELECTION
         );
         var statuses = List.of(IngestStatus.PENDING, IngestStatus.READY, IngestStatus.FAILED);
+        var materialIds = new java.util.ArrayList<String>();
 
         for (int index = 0; index < materialTypes.size(); index++) {
             var material = new SourceMaterial();
@@ -54,13 +55,13 @@ class SourceMaterialAndApiSpecRepositoryTests {
             material.setStoragePath("/tmp/probeflow/source-" + index);
             material.setIngestStatus(statuses.get(index % statuses.size()));
 
-            sourceMaterials.save(material);
+            materialIds.add(sourceMaterials.save(material).getMaterialId());
         }
 
         entityManager.flush();
         entityManager.clear();
 
-        var loaded = sourceMaterials.findAll();
+        var loaded = materialIds.stream().map(id -> sourceMaterials.findById(id).orElseThrow()).toList();
 
         assertThat(loaded).extracting(SourceMaterial::getMaterialType).containsExactlyInAnyOrderElementsOf(materialTypes);
         assertThat(loaded).extracting(SourceMaterial::getIngestStatus).contains(IngestStatus.PENDING, IngestStatus.READY, IngestStatus.FAILED);

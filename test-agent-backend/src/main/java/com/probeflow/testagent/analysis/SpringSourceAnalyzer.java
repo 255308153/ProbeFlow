@@ -16,30 +16,57 @@ import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
 import com.probeflow.testagent.apispec.HttpMethod;
 import com.probeflow.testagent.sourcematerial.SourceMaterial;
 import java.io.IOException;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import org.springframework.stereotype.Component;
 
 @Component
 class SpringSourceAnalyzer {
+
+    private static final Set<String> IGNORED_DIRECTORY_NAMES = Set.of("target", "build", "out", "node_modules");
 
     SpringSourceParseOutcome analyze(SourceMaterial material, Path sourceRoot) {
         var parser = new JavaParser(new ParserConfiguration());
         var operations = new ArrayList<ParsedSpringOperation>();
         var javaFiles = new ArrayList<ParsedJavaFile>();
         var errors = new ArrayList<String>();
-        List<Path> sourceFiles;
+        var sourceRoots = sourceRoots(sourceRoot);
+        if (sourceRoots.size() > 1) {
+            return SpringSourceParseOutcome.failure(
+                "MULTI_MODULE_SOURCE_ROOTS_AMBIGUOUS",
+                "Multiple src/main/java source roots were found."
+            );
+        }
+        var scanRoot = sourceRoots.isEmpty() ? sourceRoot : sourceRoots.getFirst();
+        var sourceFiles = new ArrayList<Path>();
 
-        try (var paths = Files.walk(sourceRoot)) {
-            sourceFiles = paths
-                .filter(path -> Files.isRegularFile(path) && path.toString().endsWith(".java"))
-                .sorted()
-                .toList();
+        try {
+            Files.walkFileTree(scanRoot, new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attributes) {
+                    return ignoredDirectory(scanRoot, directory)
+                        ? FileVisitResult.SKIP_SUBTREE
+                        : FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) {
+                    if (attributes.isRegularFile() && file.toString().endsWith(".java")) {
+                        sourceFiles.add(file);
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+            sourceFiles.sort(Path::compareTo);
 
             for (var javaFile : sourceFiles) {
                 var parseResult = parser.parse(javaFile);
@@ -74,6 +101,47 @@ class SpringSourceAnalyzer {
         }
 
         return SpringSourceParseOutcome.success(systemNameForSource(material), operations, errors);
+    }
+
+    private List<Path> sourceRoots(Path sourceRoot) {
+        var roots = new ArrayList<Path>();
+        try {
+            Files.walkFileTree(sourceRoot, new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attributes) {
+                    if (ignoredDirectory(sourceRoot, directory)) {
+                        return FileVisitResult.SKIP_SUBTREE;
+                    }
+                    if (isSourceRoot(directory)) {
+                        roots.add(directory);
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        } catch (IOException ignored) {
+            return List.of();
+        }
+        roots.sort(Path::compareTo);
+        return roots;
+    }
+
+    private boolean isSourceRoot(Path directory) {
+        var mainDirectory = directory.getParent();
+        var srcDirectory = mainDirectory == null ? null : mainDirectory.getParent();
+        return directory.getFileName() != null
+            && "java".equals(directory.getFileName().toString())
+            && mainDirectory != null
+            && "main".equals(mainDirectory.getFileName().toString())
+            && srcDirectory != null
+            && "src".equals(srcDirectory.getFileName().toString());
+    }
+
+    private boolean ignoredDirectory(Path root, Path directory) {
+        if (root.equals(directory)) {
+            return false;
+        }
+        var name = directory.getFileName();
+        return name != null && (name.toString().startsWith(".") || IGNORED_DIRECTORY_NAMES.contains(name.toString()));
     }
 
     private List<ParsedSpringOperation> extractSpringOperations(

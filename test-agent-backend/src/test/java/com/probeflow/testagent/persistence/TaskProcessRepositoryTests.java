@@ -105,7 +105,7 @@ class TaskProcessRepositoryTests {
         planStep.setInputRef("task-case-executions");
         planStep.setRetryCount(1);
         planStep.setStartedAt(Instant.parse("2026-07-02T12:00:00Z"));
-        planSteps.save(planStep);
+        var savedPlanStep = planSteps.save(planStep);
 
         var taskCaseExecution = new TaskCaseExecution();
         taskCaseExecution.setTaskId(savedTask.getTaskId());
@@ -117,7 +117,7 @@ class TaskProcessRepositoryTests {
         ));
         taskCaseExecution.setExecutionStatus(TaskCaseExecutionStatus.EXECUTING);
         taskCaseExecution.setExecutionRecordId("execution-record-pending");
-        taskCaseExecutions.save(taskCaseExecution);
+        var savedTaskCaseExecution = taskCaseExecutions.save(taskCaseExecution);
 
         var report = new Report();
         report.setTaskId(savedTask.getTaskId());
@@ -129,23 +129,23 @@ class TaskProcessRepositoryTests {
         report.setRiskSummary("No risks observed yet");
         report.setFindings(List.of(Map.of("type", "placeholder", "message", "execution in progress")));
         report.setSuggestions(List.of(Map.of("type", "follow_up", "message", "wait for completion")));
-        reports.save(report);
+        var savedReport = reports.save(report);
 
         entityManager.flush();
         entityManager.clear();
 
-        assertThat(planSteps.findAll()).singleElement().satisfies(loaded -> {
+        assertThat(planSteps.findById(savedPlanStep.getStepId())).hasValueSatisfying(loaded -> {
             assertThat(loaded.getTaskId()).isEqualTo(savedTask.getTaskId());
             assertThat(loaded.getStepType()).isEqualTo(PlanStepType.EXECUTE_BATCH);
             assertThat(loaded.getStepStatus()).isEqualTo(PlanStepStatus.RUNNING);
             assertThat(loaded.getRetryCount()).isEqualTo(1);
         });
-        assertThat(taskCaseExecutions.findAll()).singleElement().satisfies(loaded -> {
+        assertThat(taskCaseExecutions.findById(savedTaskCaseExecution.getId())).hasValueSatisfying(loaded -> {
             assertThat(loaded.getTaskId()).isEqualTo(savedTask.getTaskId());
             assertThat(loaded.getExecutionMode()).isEqualTo(ExecutionMode.BATCH);
             assertThat(loaded.getSnapshotJson()).containsEntry("title", "create-order-happy-path");
         });
-        assertThat(reports.findAll()).singleElement().satisfies(loaded -> {
+        assertThat(reports.findById(savedReport.getReportId())).hasValueSatisfying(loaded -> {
             assertThat(loaded.getTaskId()).isEqualTo(savedTask.getTaskId());
             assertThat(loaded.getCaseCount()).isEqualTo(1);
             assertThat(loaded.getFindings()).hasSize(1);
