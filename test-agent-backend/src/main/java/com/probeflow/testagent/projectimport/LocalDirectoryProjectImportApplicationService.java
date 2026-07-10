@@ -135,12 +135,7 @@ public class LocalDirectoryProjectImportApplicationService {
         return ProjectImportResponse.failedSourceDirectory(
             result.materialId(),
             result.taskId(),
-            ProjectImportDiagnostic.blocker(
-                result.errorCode(),
-                "Local directory analysis failed",
-                result.errorMessage(),
-                "Check that the directory contains analyzable Spring @RestController source code."
-            )
+            ProjectImportDiagnostic.analysisBlocker(result.errorCode(), result.errorMessage())
         );
     }
 
@@ -242,12 +237,7 @@ public class LocalDirectoryProjectImportApplicationService {
         var metadata = task == null || task.getMetadata() == null ? Map.<String, Object>of() : task.getMetadata();
         var errorCode = text(metadata.get("errorCode"), "LOCAL_DIRECTORY_IMPORT_FAILED");
         var errorMessage = text(metadata.get("errorMessage"), "Local directory import failed.");
-        return List.of(ProjectImportDiagnostic.blocker(
-            errorCode,
-            "Local directory analysis failed",
-            errorMessage,
-            "Check that the directory contains analyzable Spring @RestController source code."
-        ));
+        return List.of(ProjectImportDiagnostic.analysisBlocker(errorCode, errorMessage));
     }
 
     private ProjectImportApiSpecResponse toApiSpecResponse(ApiSpec apiSpec) {

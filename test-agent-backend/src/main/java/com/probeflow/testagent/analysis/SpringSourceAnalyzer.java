@@ -33,9 +33,10 @@ class SpringSourceAnalyzer {
         var operations = new ArrayList<ParsedSpringOperation>();
         var javaFiles = new ArrayList<ParsedJavaFile>();
         var errors = new ArrayList<String>();
+        List<Path> sourceFiles;
 
         try (var paths = Files.walk(sourceRoot)) {
-            var sourceFiles = paths
+            sourceFiles = paths
                 .filter(path -> Files.isRegularFile(path) && path.toString().endsWith(".java"))
                 .sorted()
                 .toList();
@@ -60,10 +61,16 @@ class SpringSourceAnalyzer {
         }
 
         if (operations.isEmpty()) {
-            var message = errors.isEmpty()
-                ? "No Spring @RestController routes were found"
-                : "No Spring @RestController routes were found; parse errors: " + String.join("; ", errors);
-            return SpringSourceParseOutcome.failure("NO_APIS_FOUND", message);
+            if (sourceFiles.isEmpty()) {
+                return SpringSourceParseOutcome.failure(
+                    "NO_APIS_FOUND",
+                    "No Java source files were found in the local directory."
+                );
+            }
+            return SpringSourceParseOutcome.failure(
+                "NO_HTTP_APIS_FOUND",
+                "Java source files were found, but no Spring HTTP routes were detected."
+            );
         }
 
         return SpringSourceParseOutcome.success(systemNameForSource(material), operations, errors);

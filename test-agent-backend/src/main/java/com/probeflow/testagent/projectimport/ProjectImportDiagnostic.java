@@ -24,4 +24,27 @@ public record ProjectImportDiagnostic(
     ) {
         return new ProjectImportDiagnostic(code, summary, message, suggestedAction);
     }
+
+    static ProjectImportDiagnostic analysisBlocker(String code, String fallbackMessage) {
+        return switch (code) {
+            case "NO_APIS_FOUND" -> blocker(
+                code,
+                "No analyzable source code found",
+                "No Java source files were found in the local directory.",
+                "Add Java source files to the selected directory, then rerun analysis."
+            );
+            case "NO_HTTP_APIS_FOUND" -> blocker(
+                code,
+                "No HTTP interfaces found",
+                "Java source files were found, but no Spring HTTP routes were detected.",
+                "Add a Spring @RestController with HTTP request mappings, then rerun analysis."
+            );
+            default -> blocker(
+                code,
+                "Local directory analysis failed",
+                fallbackMessage,
+                "Check that the directory contains analyzable Spring @RestController source code."
+            );
+        };
+    }
 }
