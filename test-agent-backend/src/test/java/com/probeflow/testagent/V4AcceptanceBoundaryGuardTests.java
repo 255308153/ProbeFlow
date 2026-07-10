@@ -27,6 +27,7 @@ class V4AcceptanceBoundaryGuardTests {
             .filter(Files::isRegularFile)
             .filter(path -> path.getFileName().toString().endsWith("Controller.java"))
             .filter(path -> !path.toString().contains("/projectimport/"))
+            .filter(path -> !path.toString().contains("/contractsmoke/"))
             .map(path -> path.getFileName().toString())
             .sorted()
             .toList();

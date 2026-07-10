@@ -215,7 +215,24 @@ class ApiAnalysisApplicationServiceTests {
             assertThat(spec.getOperationId()).isEqualTo("createOrder");
             assertThat(spec.getParameters()).containsKeys("requestBody", "responses");
             assertThat(spec.getConstraints()).containsKeys("required", "enums");
-            assertThat(spec.getAuth()).containsEntry("required", true);
+            assertThat(spec.getAuth())
+                .containsEntry("required", true)
+                .containsEntry("type", "bearer")
+                .containsEntry("tokenVariable", "authToken")
+                .containsEntry("header", "Authorization");
+            @SuppressWarnings("unchecked")
+            var requestBody = (java.util.Map<String, Object>) spec.getParameters().get("requestBody");
+            @SuppressWarnings("unchecked")
+            var content = (java.util.List<java.util.Map<String, Object>>) requestBody.get("content");
+            assertThat(content.getFirst()).containsEntry("mediaType", "application/json");
+            @SuppressWarnings("unchecked")
+            var schema = (java.util.Map<String, Object>) content.getFirst().get("schema");
+            @SuppressWarnings("unchecked")
+            var properties = (java.util.Map<String, Object>) schema.get("properties");
+            @SuppressWarnings("unchecked")
+            var quantity = (java.util.Map<String, Object>) properties.get("quantity");
+            assertThat(((Number) quantity.get("minimum")).intValue()).isEqualTo(1);
+            assertThat(((Number) quantity.get("maximum")).intValue()).isEqualTo(99);
         });
 
         var task = tasks.findById(result.taskId()).orElseThrow();
@@ -224,6 +241,101 @@ class ApiAnalysisApplicationServiceTests {
         assertThat(planSteps.findByTaskIdOrderByStepOrderAsc(result.taskId()))
             .extracting(step -> step.getStepStatus())
             .containsOnly(PlanStepStatus.SUCCESS);
+    }
+
+    @Test
+    void openApiMixedBearerAndApiKeyDoesNotMapAsExecutableBearer() throws Exception {
+        var openApiFile = tempDir.resolve("mixed-auth-openapi.yaml");
+        Files.writeString(openApiFile, """
+            openapi: 3.0.3
+            info:
+              title: Mixed Auth API
+              version: 1.0.0
+            components:
+              securitySchemes:
+                bearerAuth:
+                  type: http
+                  scheme: bearer
+                apiKeyAuth:
+                  type: apiKey
+                  in: header
+                  name: X-API-Key
+            paths:
+              /api/secure:
+                get:
+                  operationId: getSecure
+                  security:
+                    - bearerAuth: []
+                      apiKeyAuth: []
+                  responses:
+                    "200":
+                      description: OK
+            """);
+
+        var result = apiAnalysis.analyze(ApiAnalysisRequest.createMaterial(
+            MaterialType.OPENAPI_FILE,
+            "mixed-auth-openapi.yaml",
+            openApiFile.toString(),
+            openApiFile.toString(),
+            "tester"
+        ));
+
+        assertThat(result.succeeded()).isTrue();
+        assertThat(result.apiSpecIds()).hasSize(1);
+
+        var spec = apiSpecs.findById(result.apiSpecIds().getFirst()).orElseThrow();
+        assertThat(spec.getAuth())
+            .containsEntry("required", true)
+            .containsEntry("executable", false)
+            .doesNotContainEntry("type", "bearer");
+        assertThat(spec.getAuth().get("schemes")).asList()
+            .contains("bearerAuth", "apiKeyAuth");
+        assertThat(spec.getAuth().get("requirements")).asList().isNotEmpty();
+    }
+
+    @Test
+    void openApiSchemeNameContainingBearerButDefinedAsApiKeyIsNotExecutableBearer() throws Exception {
+        var openApiFile = tempDir.resolve("bearer-named-apikey-openapi.yaml");
+        Files.writeString(openApiFile, """
+            openapi: 3.0.3
+            info:
+              title: Bearer Named ApiKey API
+              version: 1.0.0
+            components:
+              securitySchemes:
+                bearerAuth:
+                  type: http
+                  scheme: bearer
+                BearerApiKey:
+                  type: apiKey
+                  in: header
+                  name: X-API-Key
+            paths:
+              /api/secure:
+                get:
+                  operationId: getSecure
+                  security:
+                    - bearerAuth: []
+                      BearerApiKey: []
+                  responses:
+                    "200":
+                      description: OK
+            """);
+
+        var result = apiAnalysis.analyze(ApiAnalysisRequest.createMaterial(
+            MaterialType.OPENAPI_FILE,
+            "bearer-named-apikey-openapi.yaml",
+            openApiFile.toString(),
+            openApiFile.toString(),
+            "tester"
+        ));
+
+        assertThat(result.succeeded()).isTrue();
+        var spec = apiSpecs.findById(result.apiSpecIds().getFirst()).orElseThrow();
+        assertThat(spec.getAuth())
+            .containsEntry("required", true)
+            .containsEntry("executable", false)
+            .doesNotContainEntry("type", "bearer");
     }
 
     @Test

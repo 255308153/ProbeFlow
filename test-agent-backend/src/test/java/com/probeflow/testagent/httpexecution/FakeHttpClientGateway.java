@@ -7,7 +7,7 @@ import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 
-class FakeHttpClientGateway implements HttpClientGateway {
+public class FakeHttpClientGateway implements HttpClientGateway {
 
     private final List<HttpClientRequest> requests = new ArrayList<>();
     private final Deque<Object> outcomes = new ArrayDeque<>();
@@ -30,28 +30,28 @@ class FakeHttpClientGateway implements HttpClientGateway {
         return response;
     }
 
-    void respondWith(HttpClientResponse response) {
+    public void respondWith(HttpClientResponse response) {
         this.response = response;
         this.failure = null;
         this.outcomes.clear();
     }
 
-    void respondWithSequence(HttpClientResponse... responses) {
+    public void respondWithSequence(HttpClientResponse... responses) {
         outcomes.clear();
         failure = null;
         outcomes.addAll(Arrays.asList(responses));
     }
 
-    void failWith(RuntimeException failure) {
+    public void failWith(RuntimeException failure) {
         this.failure = failure;
         this.outcomes.clear();
     }
 
-    List<HttpClientRequest> requests() {
+    public List<HttpClientRequest> requests() {
         return List.copyOf(requests);
     }
 
-    void reset() {
+    public void reset() {
         requests.clear();
         outcomes.clear();
         response = new HttpClientResponse(200, Map.of(), Map.of("ok", true), 1L);

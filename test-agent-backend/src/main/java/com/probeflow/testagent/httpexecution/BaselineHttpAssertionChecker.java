@@ -60,6 +60,8 @@ public class BaselineHttpAssertionChecker {
             switch (type) {
                 case "STATUS_CODE", "EXPECTED_STATUS", "HTTP_STATUS" ->
                     results.add(statusCodeResult(integerValue(expectedValue(definition)), response.statusCode(), definition));
+                case "CONTENT_TYPE", "RESPONSE_CONTENT_TYPE", "MEDIA_TYPE" ->
+                    results.add(contentTypeResult(definition, response.headers()));
                 case "BODY_PRESENT", "RESPONSE_BODY_PRESENT" ->
                     results.add(bodyPresenceResult(definition, response.body()));
                 case "JSON_FIELD_EXISTS", "JSON_PATH_EXISTS" ->
@@ -131,6 +133,26 @@ public class BaselineHttpAssertionChecker {
         return result;
     }
 
+    private Map<String, Object> contentTypeResult(Map<String, Object> definition, Map<String, Object> headers) {
+        var expected = stringValue(expectedValue(definition));
+        var actual = headerValue(headers, "Content-Type", "content-type");
+        var result = baseResult(
+            assertionName(definition, "response content type"),
+            "CONTENT_TYPE",
+            expected,
+            actual,
+            critical(definition)
+        );
+        var passed = StringUtils.hasText(expected)
+            && StringUtils.hasText(actual)
+            && contentTypeCompatible(expected, actual);
+        result.put("status", passed ? PASSED : FAILED);
+        if (!passed) {
+            result.put("message", "Expected Content-Type compatible with " + expected + " but got " + actual);
+        }
+        return result;
+    }
+
     private Map<String, Object> bodyPresenceResult(Map<String, Object> definition, Object body) {
         var expected = booleanValue(expectedValue(definition), true);
         var actual = bodyPresent(body);
@@ -141,6 +163,38 @@ public class BaselineHttpAssertionChecker {
             result.put("message", expected ? "Expected response body to be present" : "Expected response body to be absent");
         }
         return result;
+    }
+
+    private boolean contentTypeCompatible(String expected, String actual) {
+        var expectedBase = mediaTypeBase(expected);
+        var actualBase = mediaTypeBase(actual);
+        return expectedBase.equalsIgnoreCase(actualBase);
+    }
+
+    private String mediaTypeBase(String value) {
+        if (!StringUtils.hasText(value)) {
+            return "";
+        }
+        var semicolon = value.indexOf(';');
+        return (semicolon < 0 ? value : value.substring(0, semicolon)).trim().toLowerCase(Locale.ROOT);
+    }
+
+    private String headerValue(Map<String, Object> headers, String... names) {
+        if (headers == null || headers.isEmpty()) {
+            return null;
+        }
+        for (var name : names) {
+            for (var entry : headers.entrySet()) {
+                if (entry.getKey() != null && entry.getKey().equalsIgnoreCase(name) && entry.getValue() != null) {
+                    return String.valueOf(entry.getValue());
+                }
+            }
+        }
+        return null;
+    }
+
+    private String stringValue(Object value) {
+        return value == null ? null : String.valueOf(value);
     }
 
     private Map<String, Object> jsonFieldExistsResult(Map<String, Object> definition, Object body) {

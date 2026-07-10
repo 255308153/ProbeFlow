@@ -32,7 +32,8 @@ class V2Phase2AcceptanceBoundaryGuardTests {
         "ManualRealLlm",
         "/orchestration/",
         "/report/",
-        "/projectimport/"
+        "/projectimport/",
+        "/contractsmoke/"
     );
 
     private final ToolContractRegistry registry = new ToolContractRegistry();
